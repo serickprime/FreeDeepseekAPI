@@ -1,0 +1,4 @@
+#!/usr/bin/env node
+'use strict';
+const { loadAuth, headers }=require('../client');
+(async()=>{let a;try{a=loadAuth();console.log('✓ deepseek-auth.json: valid token and cookie fields');}catch(e){console.error(`✗ ${e.message}`);process.exitCode=2;return;} try{const r=await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge',{method:'POST',headers:headers(a),body:JSON.stringify({target_path:'/api/v0/chat/completion'}),signal:AbortSignal.timeout(20000)});if(!r.ok)throw new Error(`HTTP ${r.status}`);const b=await r.json();if(!b?.data?.biz_data?.challenge)throw new Error('challenge missing');console.log('✓ DeepSeek Web session and PoW endpoint are reachable');}catch(e){console.error(`✗ DeepSeek Web check failed: ${e.message}. Run npm run auth, then retry.`);process.exitCode=1;}})();

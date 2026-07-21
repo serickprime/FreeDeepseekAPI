@@ -1,0 +1,18 @@
+{
+  "name": "deepseek-web-local-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local OpenAI/Anthropic-compatible proxy for an owner-controlled DeepSeek Web session",
+  "type": "commonjs",
+  "main": "server.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js",
+    "auth": "node scripts/auth.js",
+    "auth:import": "node scripts/auth_import.js",
+    "doctor": "node scripts/doctor.js",
+    "test": "node --test tests/unit.test.js",
+    "test:live": "node scripts/live_agentic_smoke_tests.mjs"
+  },
+  "license": "MIT"
+}

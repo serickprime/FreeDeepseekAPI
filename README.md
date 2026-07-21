@@ -1,0 +1,62 @@
+# Локальный прокси DeepSeek Web
+
+Локальный API-прокси для **собственной** сессии DeepSeek Web. Предоставляет OpenAI Chat Completions, OpenAI Responses и Anthropic Messages на `http://127.0.0.1:9655` для OpenCode, Claude Code, Open WebUI и LiteLLM.
+
+> Важно: это не официальный DeepSeek API. Он использует внутренние веб-эндпоинты, которые DeepSeek может изменить, ограничить или отключить. `deepseek-auth.json` даёт доступ к аккаунту: не публикуйте, не пересылайте и не коммитьте его.
+
+## Windows 10/11: установка и запуск
+
+1. Установите Node.js 20+ и Google Chrome.
+2. В PowerShell из папки проекта запустите `npm test`.
+3. Запустите `npm run auth`. В открытом отдельном профиле Chrome войдите в `https://chat.deepseek.com`, самостоятельно пройдите все проверки и отправьте `ok`. Вернитесь в PowerShell и нажмите Enter.
+4. Убедитесь в состоянии: `npm run doctor`.
+5. Запустите прокси: `npm start`.
+6. Проверьте: `Invoke-RestMethod http://127.0.0.1:9655/health`.
+
+Авторизация не получает логин или пароль, не обходит CAPTCHA/2FA и не печатает cookie/token. Профиль хранится в `.chrome-profile-deepseek`; он также исключён из Git.
+
+## API
+
+- `GET /health`, `GET /readyz`
+- `GET /v1/models`, `GET /v1/model-capabilities`, `GET /v1/sessions`
+- `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`
+- `POST /reset-session`
+
+`stream: true` передаёт upstream delta в реальном времени в формате OpenAI, Responses или Anthropic. Если запрос содержит tools, служебный markup буферизуется до строгой проверки полного tool call; прокси никогда не выполняет инструмент самостоятельно. Сессия выбирается по заголовку `x-agent-session` (либо `metadata.user_id`) и создаётся заново по TTL. Upstream 429/5xx и timeout ограниченно повторяются с учётом `Retry-After`; при 401/403 повторите `npm run auth`.
+
+Поддерживаемые aliases: `deepseek-chat`, `deepseek-reasoner`, `deepseek-chat-search`, `deepseek-reasoner-search`, `deepseek-expert`, `deepseek-v4-pro`. `GET /v1/model-capabilities` показывает фактически запрошенный режим. `deepseek-v4-pro` — совместимый alias Expert/thinking: Web API не всегда сообщает точное имя модели, поэтому это не утверждение, что запущен официальный API-модельный ID V4 Pro.
+
+## Инструменты
+
+OpenAI tools, Anthropic tools и Responses function tools преобразуются в инструкцию для модели. Прокси принимает tool call только в единственной полной обёртке:
+
+```text
+<tool_call>{"name":"tool_name","arguments":{}}</tool_call>
+```
+
+Он проверяет имя, JSON и размер, затем возвращает вызов агенту. Ничего не запускается самим прокси; обычный пример JSON не считается вызовом инструмента.
+
+## OpenCode
+
+Скопируйте [opencode.json](opencode.json) в конфигурацию OpenCode. Base URL уже задан: `http://127.0.0.1:9655/v1`.
+
+## Claude Code
+
+В PowerShell, когда прокси запущен:
+
+```powershell
+$env:ANTHROPIC_BASE_URL="http://127.0.0.1:9655"
+$env:ANTHROPIC_AUTH_TOKEN="local-key"
+$env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="1"
+claude --model deepseek-reasoner
+```
+
+Claude Code выполняет чтение/изменение файлов и инструменты сам; прокси лишь возвращает model-request. Реальный smoke-тест подтвердил цикл `Read → tool_result → Write` с `deepseek-reasoner`. Режим `deepseek-chat` подходит для обычных ответов, но в текущем DeepSeek Web иногда завершает агентный ход текстом о намерении вместо tool call, поэтому для Claude Code и OpenCode по умолчанию выбран reasoner.
+
+## Безопасность
+
+Сервер слушает только `127.0.0.1`. Внешний `HOST` заблокирован без `PROXY_API_KEY` длиной от 24 символов. CORS разрешён только для localhost и адресов `PROXY_CORS_ORIGINS`; вход ограничен `REQUEST_MAX_BYTES`, upstream имеет таймаут. Телеметрии нет. Не используйте внешний bind без защищённой сети и отдельного ключа.
+
+## Проверки
+
+`npm test` не обращается к DeepSeek. После авторизации и запуска сервера выполните `npm run test:live`: строгий набор проверяет auth/session, обычный ответ, сборку OpenAI SSE delta, reasoning, валидированный tool call, Responses API, Anthropic Messages и web search.

@@ -1,0 +1,16 @@
+node_modules/
+.env
+deepseek-auth.json
+.chrome-profile-deepseek/
+*.log
+coverage/
+
+# Local development/agent continuity files; never publish with the program.
+AGENTS.md
+DECISIONS.md
+NEXT_STEP_PROMPT.md
+PLAN.md
+PROJECT_BRIEF.md
+PROJECT_PLAN.md
+PROJECT_STATUS.md
+TESTING.md
