@@ -1,6 +1,7 @@
 'use strict';
 
 let setupToken = '';
+let modelCatalog = [];
 const byId = id => document.getElementById(id);
 
 function toast(message, error = false) {
@@ -16,7 +17,33 @@ function setState(node, text, type) {
   node.className = `state ${type}`;
 }
 
+function renderModels(models) {
+  modelCatalog = models || [];
+  const select = byId('modelSelect');
+  const previous = select.value || localStorage.getItem('deepseek-bridge-model') || 'deepseek-reasoner';
+  select.replaceChildren();
+  for (const model of modelCatalog) {
+    const option = document.createElement('option');
+    option.value = model.id;
+    option.disabled = !model.available;
+    option.textContent = `${model.displayName}${model.recommended ? ' — рекомендуется' : ''}${model.available ? '' : ' — недоступно'}`;
+    select.append(option);
+  }
+  const preferred = modelCatalog.find(model => model.id === previous && model.available)
+    || modelCatalog.find(model => model.recommended && model.available)
+    || modelCatalog.find(model => model.available);
+  if (preferred) select.value = preferred.id;
+  updateModelDescription();
+}
+
+function updateModelDescription() {
+  const selected = modelCatalog.find(model => model.id === byId('modelSelect').value);
+  byId('modelDescription').textContent = selected ? selected.description : 'Нет доступных режимов.';
+  if (selected) localStorage.setItem('deepseek-bridge-model', selected.id);
+}
+
 function render(status) {
+  renderModels(status.models);
   const ready = status.auth.valid;
   byId('apiBadge').textContent = ready ? 'API готов' : 'Нужен вход';
   byId('apiBadge').className = `badge ${ready ? 'ready' : 'error'}`;
@@ -43,7 +70,7 @@ async function action(name) {
   const response = await fetch('/api/setup/action', {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-setup-token': setupToken },
-    body: JSON.stringify({ action: name }),
+    body: JSON.stringify({ action: name, model: byId('modelSelect').value }),
   });
   const data = await response.json();
   if (!response.ok || !data.ok) throw new Error(data.message || 'Действие завершилось с ошибкой.');
@@ -75,6 +102,8 @@ document.querySelectorAll('.launch').forEach(button => button.addEventListener('
   try { const result = await action(button.dataset.action); toast(result.message); }
   catch (error) { toast(error.message, true); }
 }));
+
+byId('modelSelect').addEventListener('change', updateModelDescription);
 
 byId('copyUrl').addEventListener('click', async event => {
   await navigator.clipboard.writeText(event.currentTarget.dataset.value);

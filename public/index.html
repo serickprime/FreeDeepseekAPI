@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>DeepSeek Bridge</title>
   <link rel="stylesheet" href="/setup/styles.css">
+  <link rel="stylesheet" href="/setup/model-picker.css">
 </head>
 <body>
   <main class="shell">
@@ -49,7 +50,12 @@
     </section>
 
     <section class="agents-section">
-      <div class="section-title"><p class="number">Шаг 3</p><h2>Выберите CLI-агента</h2><p>Для инструментов используется проверенный режим <strong>deepseek-reasoner</strong>.</p></div>
+      <div class="section-title"><p class="number">Шаг 3</p><h2>Выберите модель и CLI-агента</h2><p>Для сложных задач и инструментов рекомендуется <strong>deepseek-reasoner</strong>.</p></div>
+      <div class="model-picker">
+        <label for="modelSelect">Модель DeepSeek Web</label>
+        <select id="modelSelect" aria-describedby="modelDescription"></select>
+        <p id="modelDescription">Загрузка доступных режимов…</p>
+      </div>
       <div class="agents">
         <article class="agent-card recommended">
           <span class="tag">Рекомендуется</span>

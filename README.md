@@ -15,7 +15,7 @@
 
 ### Простой запуск с интерфейсом
 
-Дважды нажмите `START_DEEPSEEK.cmd` или выполните `npm run ui`. Лаунчер запустит прокси при необходимости и откроет мастер по адресу `http://127.0.0.1:9655/setup`. В нём можно войти в DeepSeek, запустить диагностику и открыть Claude Code или OpenCode с готовыми настройками.
+Дважды нажмите `START_DEEPSEEK.cmd` или выполните `npm run ui`. Лаунчер запустит прокси при необходимости и откроет мастер по адресу `http://127.0.0.1:9655/setup`. В нём можно войти в DeepSeek, запустить диагностику, выбрать доступную модель и открыть Claude Code или OpenCode с готовыми настройками.
 
 Авторизация не получает логин или пароль, не обходит CAPTCHA/2FA и не печатает cookie/token. Профиль хранится в `.chrome-profile-deepseek`; он также исключён из Git.
 
@@ -28,7 +28,7 @@
 
 `stream: true` передаёт upstream delta в реальном времени в формате OpenAI, Responses или Anthropic. Если запрос содержит tools, служебный markup буферизуется до строгой проверки полного tool call; прокси никогда не выполняет инструмент самостоятельно. Сессия выбирается по заголовку `x-agent-session` (либо `metadata.user_id`) и создаётся заново по TTL. Upstream 429/5xx и timeout ограниченно повторяются с учётом `Retry-After`; при 401/403 повторите `npm run auth`.
 
-Поддерживаемые aliases: `deepseek-chat`, `deepseek-reasoner`, `deepseek-chat-search`, `deepseek-reasoner-search`, `deepseek-expert`, `deepseek-v4-pro`. `GET /v1/model-capabilities` показывает фактически запрошенный режим. `deepseek-v4-pro` — совместимый alias Expert/thinking: Web API не всегда сообщает точное имя модели, поэтому это не утверждение, что запущен официальный API-модельный ID V4 Pro.
+Последняя live-проверка подтвердила четыре режима: `deepseek-chat`, `deepseek-reasoner`, `deepseek-chat-search`, `deepseek-reasoner-search`. Они доступны в `GET /v1/models` и в мастере запуска. Aliases `deepseek-expert` и `deepseek-v4-pro` сохранены в `GET /v1/model-capabilities`, но помечены как недоступные: текущий Web API возвращает для них пустой ответ. `deepseek-v4-pro` не является утверждением о запуске официального API-модельного ID V4 Pro.
 
 ## Инструменты
 

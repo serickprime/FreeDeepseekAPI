@@ -148,7 +148,7 @@ test('setup UI is served with CSP and actions require the in-memory setup token'
     bootstrap:()=>({token:'setup-test-token',status:{auth:{valid:true}}}),
     status:()=>({auth:{valid:true}}),
     authorized:value=>value==='setup-test-token',
-    action:async name=>({ok:name==='doctor',message:'checked'}),
+    action:async(name,options)=>({ok:name==='doctor'&&options.model==='deepseek-chat-search',message:'checked'}),
   };
   const server=createProxyServer({config,setupController,completeImpl:async()=>({content:'',reasoning:''})});
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
@@ -160,9 +160,13 @@ test('setup UI is served with CSP and actions require the in-memory setup token'
     assert.match(await page.text(),/DeepSeek Bridge/);
     const denied=await fetch(base+'/api/setup/action',{method:'POST',headers:{'content-type':'application/json'},body:'{"action":"doctor"}'});
     assert.equal(denied.status,403);
-    const allowed=await fetch(base+'/api/setup/action',{method:'POST',headers:{'content-type':'application/json','x-setup-token':'setup-test-token'},body:'{"action":"doctor"}'});
+    const allowed=await fetch(base+'/api/setup/action',{method:'POST',headers:{'content-type':'application/json','x-setup-token':'setup-test-token'},body:'{"action":"doctor","model":"deepseek-chat-search"}'});
     assert.equal(allowed.status,200);
     assert.equal((await allowed.json()).ok,true);
+    const models=await (await fetch(base+'/v1/models')).json();
+    assert.deepEqual(models.data.map(model=>model.id),['deepseek-chat','deepseek-reasoner','deepseek-chat-search','deepseek-reasoner-search']);
+    const unavailable=await fetch(base+'/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json'},body:'{"model":"deepseek-expert","messages":[{"role":"user","content":"test"}]}'});
+    assert.equal(unavailable.status,400);
   }finally{
     server.closeAllConnections?.();
     await new Promise(resolve=>server.close(resolve));
@@ -183,4 +187,23 @@ test('setup controller confirms a launch only after the terminal launcher succee
 
   const failing=createSetupController({root:process.cwd(),launchTerminal:async()=>{throw new Error('launch failed');}});
   await assert.rejects(failing.action('auth'),/launch failed/);
+});
+
+test('setup controller passes only an available selected model to CLI agents',async()=>{
+  const calls=[];
+  const controller=createSetupController({
+    root:process.cwd(),
+    hasCommand:()=>true,
+    launchTerminal:async(root,command)=>{calls.push(command);return 9876;},
+  });
+  const claude=await controller.action('claude',{model:'deepseek-chat-search'});
+  assert.equal(claude.ok,true);
+  assert.equal(claude.model,'deepseek-chat-search');
+  assert.match(calls[0],/claude\.cmd --model deepseek-chat-search$/);
+  const opencode=await controller.action('opencode',{model:'deepseek-reasoner-search'});
+  assert.equal(opencode.ok,true);
+  assert.match(calls[1],/deepseek-web\/deepseek-reasoner-search$/);
+  const unavailable=await controller.action('claude',{model:'deepseek-expert'});
+  assert.equal(unavailable.ok,false);
+  assert.equal(calls.length,2);
 });

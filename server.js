@@ -9,16 +9,8 @@ const { SessionStore } = require('./lib/session');
 const { parseToolCall, toolPrompt } = require('./lib/tool_parser');
 const { createProtocolStream } = require('./lib/api_stream');
 const { createSetupController } = require('./lib/setup');
+const { MODELS } = require('./lib/models');
 const { complete } = require('./client');
-
-const MODELS = {
-  'deepseek-chat': { model_type: 'default', reasoning: false, search: false, label: 'DeepSeek Web default non-thinking mode' },
-  'deepseek-reasoner': { model_type: 'default', reasoning: true, search: false, label: 'DeepSeek Web default thinking mode' },
-  'deepseek-chat-search': { model_type: 'default', reasoning: false, search: true, label: 'DeepSeek Web default non-thinking mode with web search' },
-  'deepseek-reasoner-search': { model_type: 'default', reasoning: true, search: true, label: 'DeepSeek Web default thinking mode with web search' },
-  'deepseek-expert': { model_type: 'expert', reasoning: false, search: false, label: 'DeepSeek Web Expert mode (availability checked at runtime)' },
-  'deepseek-v4-pro': { model_type: 'expert', reasoning: true, search: false, label: 'Compatibility alias; exact Web upstream model name is not guaranteed' },
-};
 
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...headers });
@@ -34,6 +26,7 @@ const STATIC_FILES = {
   '/setup/': ['index.html', 'text/html; charset=utf-8'],
   '/setup/app.js': ['app.js', 'application/javascript; charset=utf-8'],
   '/setup/styles.css': ['styles.css', 'text/css; charset=utf-8'],
+  '/setup/model-picker.css': ['model-picker.css', 'text/css; charset=utf-8'],
 };
 
 function serveSetupAsset(res, pathname) {
@@ -188,7 +181,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       if (req.method === 'POST' && url.pathname === '/api/setup/action') {
         if (!setup.authorized(req.headers['x-setup-token'])) return sendError(res, 403, 'Setup action token is invalid.', 'authentication_error');
         const setupBody = await readBody(req, Math.min(config.maxBytes, 16 * 1024));
-        const result = await setup.action(setupBody.action);
+        const result = await setup.action(setupBody.action, { model: setupBody.model });
         return send(res, result.ok ? 200 : 400, result);
       }
 
@@ -198,10 +191,10 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         catch { return send(res, 503, { ready: false, action: 'Run npm run auth' }); }
       }
       if (req.method === 'GET' && url.pathname === '/v1/models') {
-        return send(res, 200, { object: 'list', data: Object.keys(MODELS).map(id => ({ id, object: 'model', owned_by: 'deepseek-web' })) });
+        return send(res, 200, { object: 'list', data: Object.entries(MODELS).filter(([, model]) => model.available).map(([id]) => ({ id, object: 'model', owned_by: 'deepseek-web' })) });
       }
       if (req.method === 'GET' && url.pathname === '/v1/model-capabilities') {
-        return send(res, 200, Object.fromEntries(Object.entries(MODELS).map(([name, model]) => [name, { reasoning: model.reasoning, web_search: model.search, upstream: model.label }])));
+        return send(res, 200, Object.fromEntries(Object.entries(MODELS).map(([name, model]) => [name, { available: model.available, reasoning: model.reasoning, web_search: model.search, upstream: model.label }])));
       }
       if (req.method === 'GET' && url.pathname === '/v1/sessions') return send(res, 200, { data: sessions.list() });
 
@@ -219,6 +212,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       const modelName = String(input.model || 'deepseek-chat').toLowerCase();
       const model = MODELS[modelName];
       if (!model) return sendError(res, 400, 'Unsupported model. See GET /v1/models.');
+      if (!model.available) return sendError(res, 400, 'This DeepSeek Web mode is currently unavailable. See GET /v1/model-capabilities.');
       if (!input.prompt.trim()) return sendError(res, 400, 'A user input/message is required');
 
       const session = sessions.get(agentKey);
