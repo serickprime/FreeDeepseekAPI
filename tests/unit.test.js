@@ -1,5 +1,6 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {parseToolCall,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
+const {createSetupController}=require('../lib/setup');
 test('loopback and external bind security',()=>{assert.equal(isLoopback('127.0.0.1'),true);assert.equal(isLoopback('0.0.0.0'),false);assert.throws(()=>assertConfig({HOST:'0.0.0.0'}));assert.equal(assertConfig({HOST:'0.0.0.0',PROXY_API_KEY:'x'.repeat(24)}).host,'0.0.0.0');});
 test('localhost browser origins allow explicit ports but reject deceptive hosts',()=>{assert.equal(isLocalOrigin('http://127.0.0.1:9655'),true);assert.equal(isLocalOrigin('http://localhost:3000'),true);assert.equal(isLocalOrigin('https://localhost.evil.example'),false);});
 test('error redaction hides credentials',()=>{assert.doesNotMatch(safeError(new Error('Bearer abcdefghijkl token=secret')),/secret|abcdefgh/);});
@@ -166,4 +167,20 @@ test('setup UI is served with CSP and actions require the in-memory setup token'
     server.closeAllConnections?.();
     await new Promise(resolve=>server.close(resolve));
   }
+});
+
+test('setup controller confirms a launch only after the terminal launcher succeeds',async()=>{
+  const calls=[];
+  const controller=createSetupController({
+    root:process.cwd(),
+    launchTerminal:async(root,command)=>{calls.push({root,command});return 4321;},
+  });
+  const result=await controller.action('auth');
+  assert.equal(result.ok,true);
+  assert.equal(result.pid,4321);
+  assert.equal(calls.length,1);
+  assert.match(calls[0].command,/npm\.cmd run auth/);
+
+  const failing=createSetupController({root:process.cwd(),launchTerminal:async()=>{throw new Error('launch failed');}});
+  await assert.rejects(failing.action('auth'),/launch failed/);
 });
