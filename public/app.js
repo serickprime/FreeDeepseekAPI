@@ -114,6 +114,9 @@ byId('workingDirectory').addEventListener('change', event => {
 byId('chooseFolder').addEventListener('click', async () => {
   const button = byId('chooseFolder');
   button.disabled = true;
+  const originalText = button.textContent;
+  button.textContent = 'Окно открыто…';
+  toast('Системное окно выбора папки открыто поверх браузера.');
   try {
     const result = await action('choose-folder');
     if (!result.canceled && result.path) {
@@ -122,7 +125,7 @@ byId('chooseFolder').addEventListener('click', async () => {
       toast('Папка проекта выбрана.');
     }
   } catch (error) { toast(error.message, true); }
-  finally { button.disabled = false; }
+  finally { button.disabled = false; button.textContent = originalText; }
 });
 
 byId('copyUrl').addEventListener('click', async event => {
