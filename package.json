@@ -8,6 +8,7 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "start": "node server.js",
+    "ui": "node scripts/launcher.js",
     "auth": "node scripts/auth.js",
     "auth:import": "node scripts/auth_import.js",
     "doctor": "node scripts/doctor.js",

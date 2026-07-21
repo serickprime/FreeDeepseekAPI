@@ -2,10 +2,13 @@
 
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { assertConfig, cors, authorized, safeError, isLoopback } = require('./lib/security');
 const { SessionStore } = require('./lib/session');
 const { parseToolCall, toolPrompt } = require('./lib/tool_parser');
 const { createProtocolStream } = require('./lib/api_stream');
+const { createSetupController } = require('./lib/setup');
 const { complete } = require('./client');
 
 const MODELS = {
@@ -24,6 +27,28 @@ function send(res, status, body, headers = {}) {
 
 function sendError(res, status, message, type = 'invalid_request_error') {
   send(res, status, { error: { message, type, code: status } });
+}
+
+const STATIC_FILES = {
+  '/setup': ['index.html', 'text/html; charset=utf-8'],
+  '/setup/': ['index.html', 'text/html; charset=utf-8'],
+  '/setup/app.js': ['app.js', 'application/javascript; charset=utf-8'],
+  '/setup/styles.css': ['styles.css', 'text/css; charset=utf-8'],
+};
+
+function serveSetupAsset(res, pathname) {
+  const asset = STATIC_FILES[pathname];
+  if (!asset) return false;
+  const file = path.join(__dirname, 'public', asset[0]);
+  res.writeHead(200, {
+    'content-type': asset[1],
+    'cache-control': asset[0] === 'index.html' ? 'no-store' : 'public, max-age=300',
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    'referrer-policy': 'no-referrer',
+  });
+  res.end(fs.readFileSync(file));
+  return true;
 }
 
 function readBody(req, maxBytes) {
@@ -140,8 +165,9 @@ function toResponses(openaiResponse, identity = {}) {
   };
 }
 
-function createProxyServer({ config = assertConfig(), completeImpl = complete, sessionStore } = {}) {
+function createProxyServer({ config = assertConfig(), completeImpl = complete, sessionStore, setupController } = {}) {
   const sessions = sessionStore || new SessionStore({ ttlMs: Number(process.env.SESSION_TTL_MS || 1_800_000) });
+  const setup = setupController || createSetupController();
 
   const server = http.createServer(async (req, res) => {
     let stream = null;
@@ -150,6 +176,21 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       if (req.method === 'OPTIONS') return res.writeHead(204).end();
       const url = new URL(req.url, 'http://localhost');
       if (!authorized(req, config.key, !isLoopback(config.host))) return sendError(res, 401, 'Invalid local proxy API key', 'authentication_error');
+
+      if (req.method === 'GET' && url.pathname === '/') {
+        res.writeHead(302, { location: '/setup', 'cache-control': 'no-store' });
+        return res.end();
+      }
+      if (req.method === 'GET' && url.pathname === '/favicon.ico') return res.writeHead(204, { 'cache-control': 'public, max-age=86400' }).end();
+      if (req.method === 'GET' && serveSetupAsset(res, url.pathname)) return;
+      if (req.method === 'GET' && url.pathname === '/api/setup/bootstrap') return send(res, 200, setup.bootstrap(), { 'cache-control': 'no-store' });
+      if (req.method === 'GET' && url.pathname === '/api/setup/status') return send(res, 200, setup.status(), { 'cache-control': 'no-store' });
+      if (req.method === 'POST' && url.pathname === '/api/setup/action') {
+        if (!setup.authorized(req.headers['x-setup-token'])) return sendError(res, 403, 'Setup action token is invalid.', 'authentication_error');
+        const setupBody = await readBody(req, Math.min(config.maxBytes, 16 * 1024));
+        const result = await setup.action(setupBody.action);
+        return send(res, result.ok ? 200 : 400, result);
+      }
 
       if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { status: 'ok', bind: config.host });
       if (req.method === 'GET' && url.pathname === '/readyz') {

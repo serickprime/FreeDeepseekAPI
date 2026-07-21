@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DeepSeek Bridge</title>
+  <link rel="stylesheet" href="/setup/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div class="brand-mark">DS</div>
+      <div>
+        <p class="eyebrow">Локальный помощник подключения</p>
+        <h1>DeepSeek Bridge</h1>
+        <p class="subtitle">Войдите в DeepSeek, проверьте соединение и запустите нужного CLI-агента без ручной настройки.</p>
+      </div>
+      <div id="apiBadge" class="badge">Проверка…</div>
+    </header>
+
+    <section class="progress" aria-label="Этапы настройки">
+      <div class="step active"><span>1</span><strong>Авторизация</strong></div>
+      <div class="line"></div>
+      <div class="step"><span>2</span><strong>Диагностика</strong></div>
+      <div class="line"></div>
+      <div class="step"><span>3</span><strong>Запуск агента</strong></div>
+    </section>
+
+    <section class="grid">
+      <article class="card primary-card">
+        <div class="card-head">
+          <div><p class="number">Шаг 1</p><h2>Подключите DeepSeek</h2></div>
+          <span id="authState" class="state waiting">Не проверено</span>
+        </div>
+        <p>Откроется отдельный профиль Chrome. Войдите в аккаунт, отправьте сообщение <code>ok</code> и нажмите Enter в окне PowerShell.</p>
+        <button id="authButton" class="button primary">Войти в DeepSeek</button>
+        <div class="hint">Логин и пароль не сохраняются. CAPTCHA и 2FA проходятся вручную.</div>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <div><p class="number">Шаг 2</p><h2>Проверьте соединение</h2></div>
+          <span id="doctorState" class="state waiting">Ожидает</span>
+        </div>
+        <p>Диагностика проверит auth-файл, текущую сессию и внутренний PoW endpoint DeepSeek.</p>
+        <button id="doctorButton" class="button secondary">Запустить диагностику</button>
+        <pre id="doctorOutput" class="console" hidden></pre>
+      </article>
+    </section>
+
+    <section class="agents-section">
+      <div class="section-title"><p class="number">Шаг 3</p><h2>Выберите CLI-агента</h2><p>Для инструментов используется проверенный режим <strong>deepseek-reasoner</strong>.</p></div>
+      <div class="agents">
+        <article class="agent-card recommended">
+          <span class="tag">Рекомендуется</span>
+          <div class="agent-icon">C</div>
+          <h3>Claude Code</h3>
+          <p>Переменные подключения применятся только к новому окну PowerShell.</p>
+          <div id="claudeAvailability" class="availability">Проверка установки…</div>
+          <button class="button primary launch" data-action="claude">Запустить Claude Code</button>
+        </article>
+        <article class="agent-card">
+          <div class="agent-icon dark">O</div>
+          <h3>OpenCode</h3>
+          <p>Использует готовый <code>opencode.json</code> из папки проекта.</p>
+          <div id="opencodeAvailability" class="availability">Проверка установки…</div>
+          <button class="button secondary launch" data-action="opencode">Запустить OpenCode</button>
+        </article>
+        <article class="agent-card muted-card">
+          <div class="agent-icon outline">API</div>
+          <h3>Другой клиент</h3>
+          <p>Используйте OpenAI-совместимый адрес:</p>
+          <button id="copyUrl" class="copy" data-value="http://127.0.0.1:9655/v1">http://127.0.0.1:9655/v1 <span>Копировать</span></button>
+        </article>
+      </div>
+    </section>
+
+    <section class="details">
+      <details>
+        <summary>Что делать, если что-то не работает?</summary>
+        <ul>
+          <li>Сессия закончилась — снова нажмите «Войти в DeepSeek».</li>
+          <li>Агент не найден — установите его, затем обновите страницу.</li>
+          <li>Порт 9655 занят — закройте старое окно прокси и запустите лаунчер снова.</li>
+          <li>Не публикуйте <code>deepseek-auth.json</code>: он предоставляет доступ к аккаунту.</li>
+        </ul>
+      </details>
+    </section>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <footer>Работает только локально · Без телеметрии · Секреты не отображаются</footer>
+  </main>
+  <script src="/setup/app.js" defer></script>
+</body>
+</html>

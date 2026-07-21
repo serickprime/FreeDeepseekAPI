@@ -1,6 +1,7 @@
 'use strict';
-const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,assertConfig,safeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {parseToolCall,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
+const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {parseToolCall,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
 test('loopback and external bind security',()=>{assert.equal(isLoopback('127.0.0.1'),true);assert.equal(isLoopback('0.0.0.0'),false);assert.throws(()=>assertConfig({HOST:'0.0.0.0'}));assert.equal(assertConfig({HOST:'0.0.0.0',PROXY_API_KEY:'x'.repeat(24)}).host,'0.0.0.0');});
+test('localhost browser origins allow explicit ports but reject deceptive hosts',()=>{assert.equal(isLocalOrigin('http://127.0.0.1:9655'),true);assert.equal(isLocalOrigin('http://localhost:3000'),true);assert.equal(isLocalOrigin('https://localhost.evil.example'),false);});
 test('error redaction hides credentials',()=>{assert.doesNotMatch(safeError(new Error('Bearer abcdefghijkl token=secret')),/secret|abcdefgh/);});
 test('session expiry/reset and bounded history',()=>{const s=new SessionStore({ttlMs:1,maxHistory:2});const x=s.get('a');s.add(x,'one','a');s.add(x,'two','b');s.add(x,'three','c');assert.equal(x.history.length,2);s.reset('a');assert.equal(s.list().length,0);});
 test('only explicit complete tool call is accepted',()=>{const c=parseToolCall('<tool_call>{"name":"read_file","arguments":{"path":"a"}}</tool_call>',['read_file']);assert.equal(c.function.name,'read_file');assert.equal(parseToolCall('{"name":"read_file","arguments":{}}',['read_file']),null);assert.equal(parseToolCall('<tool_call>{"name":"other","arguments":{}}</tool_call>',['read_file']),null);assert.equal(parseToolCall('<tool_call>{"name":"read_file","arguments":</tool_call>',['read_file']),null);});
@@ -138,4 +139,31 @@ test('protocol adapters expose protocol-specific usage fields',()=>{
   assert.equal(responses.usage.input_tokens,1);
   assert.equal(responses.usage.output_tokens,2);
   assert.equal(responses.usage.total_tokens,3);
+});
+
+test('setup UI is served with CSP and actions require the in-memory setup token',async()=>{
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const setupController={
+    bootstrap:()=>({token:'setup-test-token',status:{auth:{valid:true}}}),
+    status:()=>({auth:{valid:true}}),
+    authorized:value=>value==='setup-test-token',
+    action:async name=>({ok:name==='doctor',message:'checked'}),
+  };
+  const server=createProxyServer({config,setupController,completeImpl:async()=>({content:'',reasoning:''})});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const base=`http://127.0.0.1:${server.address().port}`;
+    const page=await fetch(base+'/setup');
+    assert.equal(page.status,200);
+    assert.match(page.headers.get('content-security-policy'),/default-src 'self'/);
+    assert.match(await page.text(),/DeepSeek Bridge/);
+    const denied=await fetch(base+'/api/setup/action',{method:'POST',headers:{'content-type':'application/json'},body:'{"action":"doctor"}'});
+    assert.equal(denied.status,403);
+    const allowed=await fetch(base+'/api/setup/action',{method:'POST',headers:{'content-type':'application/json','x-setup-token':'setup-test-token'},body:'{"action":"doctor"}'});
+    assert.equal(allowed.status,200);
+    assert.equal((await allowed.json()).ok,true);
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
 });
