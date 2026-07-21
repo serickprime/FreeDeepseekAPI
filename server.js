@@ -181,7 +181,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       if (req.method === 'POST' && url.pathname === '/api/setup/action') {
         if (!setup.authorized(req.headers['x-setup-token'])) return sendError(res, 403, 'Setup action token is invalid.', 'authentication_error');
         const setupBody = await readBody(req, Math.min(config.maxBytes, 16 * 1024));
-        const result = await setup.action(setupBody.action, { model: setupBody.model });
+        const result = await setup.action(setupBody.action, { model: setupBody.model, workingDirectory: setupBody.workingDirectory });
         return send(res, result.ok ? 200 : 400, result);
       }
 

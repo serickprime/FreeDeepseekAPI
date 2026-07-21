@@ -56,19 +56,27 @@
         <select id="modelSelect" aria-describedby="modelDescription"></select>
         <p id="modelDescription">Загрузка доступных режимов…</p>
       </div>
+      <div class="folder-picker">
+        <label for="workingDirectory">Папка проекта</label>
+        <div class="folder-control">
+          <input id="workingDirectory" type="text" spellcheck="false" autocomplete="off" aria-describedby="folderDescription">
+          <button id="chooseFolder" class="folder-button" type="button">Выбрать папку…</button>
+        </div>
+        <p id="folderDescription">Claude Code или OpenCode откроется в этой папке и будет работать с её файлами.</p>
+      </div>
       <div class="agents">
         <article class="agent-card recommended">
           <span class="tag">Рекомендуется</span>
           <div class="agent-icon">C</div>
           <h3>Claude Code</h3>
-          <p>Переменные подключения применятся только к новому окну PowerShell.</p>
+          <p>Откроется новое окно терминала в выбранной папке проекта.</p>
           <div id="claudeAvailability" class="availability">Проверка установки…</div>
           <button class="button primary launch" data-action="claude">Запустить Claude Code</button>
         </article>
         <article class="agent-card">
           <div class="agent-icon dark">O</div>
           <h3>OpenCode</h3>
-          <p>Использует готовый <code>opencode.json</code> из папки проекта.</p>
+          <p>Использует конфигурацию DeepSeek Bridge, не копируя её в папку проекта.</p>
           <div id="opencodeAvailability" class="availability">Проверка установки…</div>
           <button class="button secondary launch" data-action="opencode">Запустить OpenCode</button>
         </article>

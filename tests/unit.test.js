@@ -1,6 +1,6 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {parseToolCall,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
-const {createSetupController}=require('../lib/setup');
+const {createSetupController,existingDirectory}=require('../lib/setup');
 test('loopback and external bind security',()=>{assert.equal(isLoopback('127.0.0.1'),true);assert.equal(isLoopback('0.0.0.0'),false);assert.throws(()=>assertConfig({HOST:'0.0.0.0'}));assert.equal(assertConfig({HOST:'0.0.0.0',PROXY_API_KEY:'x'.repeat(24)}).host,'0.0.0.0');});
 test('localhost browser origins allow explicit ports but reject deceptive hosts',()=>{assert.equal(isLocalOrigin('http://127.0.0.1:9655'),true);assert.equal(isLocalOrigin('http://localhost:3000'),true);assert.equal(isLocalOrigin('https://localhost.evil.example'),false);});
 test('error redaction hides credentials',()=>{assert.doesNotMatch(safeError(new Error('Bearer abcdefghijkl token=secret')),/secret|abcdefgh/);});
@@ -148,7 +148,7 @@ test('setup UI is served with CSP and actions require the in-memory setup token'
     bootstrap:()=>({token:'setup-test-token',status:{auth:{valid:true}}}),
     status:()=>({auth:{valid:true}}),
     authorized:value=>value==='setup-test-token',
-    action:async(name,options)=>({ok:name==='doctor'&&options.model==='deepseek-chat-search',message:'checked'}),
+    action:async(name,options)=>({ok:name==='doctor'&&options.model==='deepseek-chat-search'&&options.workingDirectory==='C:\\project',message:'checked'}),
   };
   const server=createProxyServer({config,setupController,completeImpl:async()=>({content:'',reasoning:''})});
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
@@ -160,7 +160,7 @@ test('setup UI is served with CSP and actions require the in-memory setup token'
     assert.match(await page.text(),/DeepSeek Bridge/);
     const denied=await fetch(base+'/api/setup/action',{method:'POST',headers:{'content-type':'application/json'},body:'{"action":"doctor"}'});
     assert.equal(denied.status,403);
-    const allowed=await fetch(base+'/api/setup/action',{method:'POST',headers:{'content-type':'application/json','x-setup-token':'setup-test-token'},body:'{"action":"doctor","model":"deepseek-chat-search"}'});
+    const allowed=await fetch(base+'/api/setup/action',{method:'POST',headers:{'content-type':'application/json','x-setup-token':'setup-test-token'},body:'{"action":"doctor","model":"deepseek-chat-search","workingDirectory":"C:\\\\project"}'});
     assert.equal(allowed.status,200);
     assert.equal((await allowed.json()).ok,true);
     const models=await (await fetch(base+'/v1/models')).json();
@@ -194,16 +194,37 @@ test('setup controller passes only an available selected model to CLI agents',as
   const controller=createSetupController({
     root:process.cwd(),
     hasCommand:()=>true,
-    launchTerminal:async(root,command)=>{calls.push(command);return 9876;},
+    launchTerminal:async(root,command)=>{calls.push({root,command});return 9876;},
   });
-  const claude=await controller.action('claude',{model:'deepseek-chat-search'});
+  const claude=await controller.action('claude',{model:'deepseek-chat-search',workingDirectory:process.cwd()});
   assert.equal(claude.ok,true);
   assert.equal(claude.model,'deepseek-chat-search');
-  assert.match(calls[0],/claude\.cmd --model deepseek-chat-search$/);
-  const opencode=await controller.action('opencode',{model:'deepseek-reasoner-search'});
+  assert.equal(calls[0].root,process.cwd());
+  assert.match(calls[0].command,/claude\.cmd --model deepseek-chat-search$/);
+  const opencode=await controller.action('opencode',{model:'deepseek-reasoner-search',workingDirectory:process.cwd()});
   assert.equal(opencode.ok,true);
-  assert.match(calls[1],/deepseek-web\/deepseek-reasoner-search$/);
+  assert.equal(calls[1].root,process.cwd());
+  assert.match(calls[1].command,/OPENCODE_CONFIG=/);
+  assert.match(calls[1].command,/deepseek-web\/deepseek-reasoner-search$/);
   const unavailable=await controller.action('claude',{model:'deepseek-expert'});
   assert.equal(unavailable.ok,false);
   assert.equal(calls.length,2);
+});
+
+test('setup folder selection and working-directory validation are bounded',async()=>{
+  const selected=process.cwd();
+  const controller=createSetupController({
+    root:process.cwd(),
+    selectFolder:async initial=>{assert.equal(initial,process.cwd());return selected;},
+  });
+  const result=await controller.action('choose-folder',{workingDirectory:'Z:\\missing-deepseek-bridge-folder'});
+  assert.equal(result.ok,true);
+  assert.equal(result.path,selected);
+  assert.equal(existingDirectory(process.cwd(),process.cwd()),process.cwd());
+  assert.equal(existingDirectory('Z:\\missing-deepseek-bridge-folder',process.cwd()),null);
+
+  const noLaunch=createSetupController({root:process.cwd(),hasCommand:()=>true,launchTerminal:async()=>{throw new Error('must not launch');}});
+  const invalid=await noLaunch.action('claude',{model:'deepseek-reasoner',workingDirectory:'Z:\\missing-deepseek-bridge-folder'});
+  assert.equal(invalid.ok,false);
+  assert.match(invalid.message,/Папка проекта/);
 });

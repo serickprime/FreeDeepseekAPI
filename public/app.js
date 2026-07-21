@@ -44,6 +44,8 @@ function updateModelDescription() {
 
 function render(status) {
   renderModels(status.models);
+  const directory = byId('workingDirectory');
+  if (!directory.value) directory.value = localStorage.getItem('deepseek-bridge-folder') || status.workingDirectory || '';
   const ready = status.auth.valid;
   byId('apiBadge').textContent = ready ? 'API готов' : 'Нужен вход';
   byId('apiBadge').className = `badge ${ready ? 'ready' : 'error'}`;
@@ -70,7 +72,7 @@ async function action(name) {
   const response = await fetch('/api/setup/action', {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-setup-token': setupToken },
-    body: JSON.stringify({ action: name, model: byId('modelSelect').value }),
+    body: JSON.stringify({ action: name, model: byId('modelSelect').value, workingDirectory: byId('workingDirectory').value }),
   });
   const data = await response.json();
   if (!response.ok || !data.ok) throw new Error(data.message || 'Действие завершилось с ошибкой.');
@@ -104,6 +106,24 @@ document.querySelectorAll('.launch').forEach(button => button.addEventListener('
 }));
 
 byId('modelSelect').addEventListener('change', updateModelDescription);
+
+byId('workingDirectory').addEventListener('change', event => {
+  localStorage.setItem('deepseek-bridge-folder', event.currentTarget.value.trim());
+});
+
+byId('chooseFolder').addEventListener('click', async () => {
+  const button = byId('chooseFolder');
+  button.disabled = true;
+  try {
+    const result = await action('choose-folder');
+    if (!result.canceled && result.path) {
+      byId('workingDirectory').value = result.path;
+      localStorage.setItem('deepseek-bridge-folder', result.path);
+      toast('Папка проекта выбрана.');
+    }
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
+});
 
 byId('copyUrl').addEventListener('click', async event => {
   await navigator.clipboard.writeText(event.currentTarget.dataset.value);
