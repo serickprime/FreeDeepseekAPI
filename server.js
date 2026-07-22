@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { assertConfig, cors, authorized, safeError, logSafeError, isLoopback } = require('./lib/security');
 const { SessionStore } = require('./lib/session');
-const { parseToolCall, toolPrompt } = require('./lib/tool_parser');
+const { parseToolCallFromOutput, toolPrompt } = require('./lib/tool_parser');
 const { createProtocolStream } = require('./lib/api_stream');
 const { createSetupController } = require('./lib/setup');
 const { MODELS } = require('./lib/models');
@@ -235,7 +235,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         timeoutMs: config.timeoutMs,
         onDelta: input.stream ? delta => stream.delta(delta) : undefined,
       });
-      const toolCall = parseToolCall(output.content, allowedTools);
+      const toolCall = parseToolCallFromOutput(output, allowedTools);
       if (!toolCall) sessions.add(session, input.prompt, output.content);
       const openaiIdentity = streamIdentity && kind === 'openai' ? streamIdentity : {};
       const openaiResponse = toOpenAI(modelName, input.prompt, output, toolCall, openaiIdentity);

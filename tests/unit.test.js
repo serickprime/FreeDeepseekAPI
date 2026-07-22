@@ -1,5 +1,5 @@
 'use strict';
-const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {parseToolCall,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
+const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
 const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory}=require('../lib/setup');
 const {runDiagnostics,boundedTimeout}=require('../scripts/doctor');
 test('loopback and external bind security',()=>{assert.equal(isLoopback('127.0.0.1'),true);assert.equal(isLoopback('0.0.0.0'),false);assert.throws(()=>assertConfig({HOST:'0.0.0.0'}));assert.equal(assertConfig({HOST:'0.0.0.0',PROXY_API_KEY:'x'.repeat(24)}).host,'0.0.0.0');});
@@ -15,8 +15,80 @@ test('safe error logging never throws for unusual errors or logger failures',()=
   assert.equal(safeError(unusual),'Internal error');
 });
 test('session expiry/reset and bounded history',()=>{const s=new SessionStore({ttlMs:1,maxHistory:2});const x=s.get('a');s.add(x,'one','a');s.add(x,'two','b');s.add(x,'three','c');assert.equal(x.history.length,2);s.reset('a');assert.equal(s.list().length,0);});
-test('only explicit complete tool call is accepted',()=>{const c=parseToolCall('<tool_call>{"name":"read_file","arguments":{"path":"a"}}</tool_call>',['read_file']);assert.equal(c.function.name,'read_file');assert.equal(parseToolCall('{"name":"read_file","arguments":{}}',['read_file']),null);assert.equal(parseToolCall('<tool_call>{"name":"other","arguments":{}}</tool_call>',['read_file']),null);assert.equal(parseToolCall('<tool_call>{"name":"read_file","arguments":</tool_call>',['read_file']),null);});
-test('strict JSON tool envelope is accepted only as the whole response',()=>{const c=parseToolCall('{"tool_call":{"name":"read_file","arguments":{"path":"a"}}}',['read_file']);assert.equal(c.function.name,'read_file');assert.equal(parseToolCall('Example: {"tool_call":{"name":"read_file","arguments":{}}}',['read_file']),null);});
+const jsonToolCall=(name='read_file',args={path:'package.json'})=>JSON.stringify({tool_call:{name,arguments:args}});
+const xmlToolCall=(name='read_file',args={path:'package.json'})=>`<tool_call>${JSON.stringify({name,arguments:args})}</tool_call>`;
+
+test('strict JSON and XML tool calls are accepted only as the whole content',()=>{
+  for(const source of [jsonToolCall(),xmlToolCall()]){
+    const call=parseToolCall(source,['read_file']);
+    assert.equal(call.function.name,'read_file');
+    assert.deepEqual(JSON.parse(call.function.arguments),{path:'package.json'});
+  }
+});
+
+test('strict reasoning tool calls require empty content and preserve content priority',()=>{
+  assert.equal(parseToolCallFromOutput({content:'',reasoning:jsonToolCall()},['read_file']).function.name,'read_file');
+  assert.equal(parseToolCallFromOutput({content:'   ',reasoning:xmlToolCall()},['read_file']).function.name,'read_file');
+  const selected=parseToolCallFromOutput({content:jsonToolCall('content_tool',{}),reasoning:jsonToolCall('reasoning_tool',{})},['content_tool','reasoning_tool']);
+  assert.equal(selected.function.name,'content_tool');
+  assert.equal(parseToolCallFromOutput({content:'A normal final answer',reasoning:jsonToolCall()},['read_file']),null);
+});
+
+test('reasoning prose, embedded JSON, Markdown and trailing text are never tool calls',()=>{
+  const strict=jsonToolCall();
+  for(const reasoning of [
+    'I should call Read, then continue.',
+    `I will use this tool: ${strict}`,
+    `${strict}\nNow I will wait.`,
+    `\`\`\`json\n${strict}\n\`\`\``,
+    `Example request:\n${strict}`,
+  ]) assert.equal(parseToolCallFromOutput({content:'',reasoning},['read_file']),null);
+});
+
+test('damaged, repeated, multiple and non-envelope tool calls are rejected',()=>{
+  const strict=jsonToolCall();
+  for(const source of [
+    '{"tool_call":{"name":"read_file","arguments":',
+    `${strict}${strict}`,
+    `${xmlToolCall()}${xmlToolCall()}`,
+    JSON.stringify({tool_call:[{name:'read_file',arguments:{}},{name:'read_file',arguments:{}}]}),
+    JSON.stringify({name:'read_file',arguments:{}}),
+  ]) assert.equal(parseToolCall(source,['read_file']),null);
+});
+
+test('tool names and top-level arguments are strictly validated',()=>{
+  assert.equal(parseToolCall(jsonToolCall('unknown',{}),['read_file']),null);
+  assert.equal(parseToolCall(jsonToolCall('',{}),['']),null);
+  assert.equal(parseToolCall(jsonToolCall(`a${'x'.repeat(128)}`,{}),[`a${'x'.repeat(128)}`]),null);
+  for(const args of [null,[], 'path', 1, true]) assert.equal(parseToolCall(jsonToolCall('read_file',args),['read_file']),null);
+  assert.equal(parseToolCall(jsonToolCall('read_file',{}),[]),null);
+});
+
+test('tool argument and source size limits are enforced',()=>{
+  assert.equal(parseToolCall(jsonToolCall('read_file',{value:'x'.repeat(MAX_TOOL_BYTES)}),['read_file']),null);
+  assert.equal(parseToolCall('x'.repeat(MAX_TOOL_BYTES+1),['read_file']),null);
+});
+
+test('dangerous argument keys are rejected at every nested location',()=>{
+  const cases=[
+    '{"__proto__":{"polluted":true}}',
+    '{"safe":{"constructor":{"polluted":true}}}',
+    '{"items":[{"prototype":{"polluted":true}}]}',
+  ];
+  for(const rawArgs of cases){
+    const source=`{"tool_call":{"name":"read_file","arguments":${rawArgs}}}`;
+    assert.equal(parseToolCall(source,['read_file']),null);
+  }
+});
+
+test('tool argument nesting is bounded while safe objects and arrays remain valid',()=>{
+  let tooDeep={value:'ok'};
+  for(let index=0;index<MAX_NESTING_DEPTH+1;index+=1) tooDeep={next:tooDeep};
+  assert.equal(parseToolCall(jsonToolCall('read_file',tooDeep),['read_file']),null);
+  const safe={path:'package.json',options:{encoding:'utf8',ranges:[{start:1,end:3},['a','b'],null,true]}};
+  const call=parseToolCall(jsonToolCall('read_file',safe),['read_file']);
+  assert.deepEqual(JSON.parse(call.function.arguments),safe);
+});
 test('tool prompt is declarative and bounded',()=>{const p=toolPrompt([{function:{name:'x',parameters:{type:'object'}}}]);assert.match(p,/Never execute/);assert.match(p,/"x"/);});
 
 test('Retry-After supports seconds and HTTP dates',()=>{
@@ -216,6 +288,93 @@ test('streaming with tools buffers markup and emits a validated tool call',async
     assert.match(output,/"tool_calls"/);
     assert.match(output,/"finish_reason":"tool_calls"/);
   } finally {
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+});
+
+async function nonStreamingToolProtocolCase(path,body){
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,completeImpl:async()=>({content:'',reasoning:jsonToolCall('read_file',{path:'package.json'}),parentMessageId:null})});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}${path}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    assert.equal(response.status,200);
+    return response.json();
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+}
+
+test('strict reasoning tool calls map to OpenAI tool_calls',async()=>{
+  const response=await nonStreamingToolProtocolCase('/v1/chat/completions',{
+    model:'deepseek-chat',messages:[{role:'user',content:'read package'}],
+    tools:[{type:'function',function:{name:'read_file',parameters:{type:'object'}}}],
+  });
+  assert.equal(response.choices[0].finish_reason,'tool_calls');
+  assert.equal(response.choices[0].message.tool_calls[0].function.name,'read_file');
+  assert.deepEqual(JSON.parse(response.choices[0].message.tool_calls[0].function.arguments),{path:'package.json'});
+});
+
+test('strict reasoning tool calls map to Anthropic tool_use',async()=>{
+  const response=await nonStreamingToolProtocolCase('/v1/messages',{
+    model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'read package'}],
+    tools:[{name:'read_file',input_schema:{type:'object'}}],
+  });
+  assert.equal(response.stop_reason,'tool_use');
+  assert.deepEqual(response.content[0],{type:'tool_use',id:response.content[0].id,name:'read_file',input:{path:'package.json'}});
+});
+
+test('strict reasoning tool calls map to Responses function_call',async()=>{
+  const response=await nonStreamingToolProtocolCase('/v1/responses',{
+    model:'deepseek-chat',input:'read package',
+    tools:[{type:'function',name:'read_file',parameters:{type:'object'}}],
+  });
+  assert.equal(response.output[0].type,'function_call');
+  assert.equal(response.output[0].name,'read_file');
+  assert.deepEqual(JSON.parse(response.output[0].arguments),{path:'package.json'});
+});
+
+test('streaming hides a strict reasoning envelope and emits only protocol tool events',async()=>{
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const reasoning=jsonToolCall('echo',{text:'ok'});
+  const server=createProxyServer({config,completeImpl:async({onDelta})=>{
+    onDelta({reasoning});
+    return {content:'',reasoning,parentMessageId:null};
+  }});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-chat',stream:true,messages:[{role:'user',content:'use tool'}],tools:[{type:'function',function:{name:'echo',parameters:{type:'object'}}}]})});
+    const output=await response.text();
+    assert.doesNotMatch(output,/"tool_call":/);
+    assert.doesNotMatch(output,/<tool_call>/);
+    assert.match(output,/"tool_calls"/);
+    assert.match(output,/"finish_reason":"tool_calls"/);
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+});
+
+test('ordinary responses without tools and rejected tool-like text stay normal responses',async()=>{
+  const outputs=[
+    {content:'ordinary answer',reasoning:'I may use Read later',parentMessageId:null},
+    {content:`Example only: ${jsonToolCall('read_file',{})}`,reasoning:'',parentMessageId:null},
+  ];
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,completeImpl:async()=>outputs.shift()});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const base=`http://127.0.0.1:${server.address().port}/v1/chat/completions`;
+    const normal=await (await fetch(base,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content:'answer'}]})})).json();
+    assert.equal(normal.choices[0].message.content,'ordinary answer');
+    assert.equal(normal.choices[0].finish_reason,'stop');
+    const rejected=await (await fetch(base,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content:'answer'}],tools:[{type:'function',function:{name:'read_file',parameters:{type:'object'}}}]})})).json();
+    assert.match(rejected.choices[0].message.content,/^Example only:/);
+    assert.equal(rejected.choices[0].finish_reason,'stop');
+    assert.equal(rejected.choices[0].message.tool_calls,undefined);
+  }finally{
     server.closeAllConnections?.();
     await new Promise(resolve=>server.close(resolve));
   }
