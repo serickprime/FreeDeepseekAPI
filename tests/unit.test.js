@@ -1632,3 +1632,42 @@ test('Claude contract probe always removes its temporary marker workspace',async
   }),/intentional offline failure/);
   assert.equal(fs.existsSync(directory),false);
 });
+
+let claudeLiveProbeModule;
+async function claudeLiveProbe(){return claudeLiveProbeModule??=await import('../scripts/claude_long_session_live_probe.mjs');}
+
+test('Claude live probe reduces structured output to safe event flags',async()=>{
+  const {summarizeClaudeEvent}=await claudeLiveProbe();
+  const raw='{"tool_call":{"name":"Read","arguments":{"file_path":"PRIVATE_PATH"}}}';
+  const summary=summarizeClaudeEvent({type:'assistant',subtype:'message',authorization:'AUTH_SECRET',message:{content:[{type:'tool_use',id:'FULL_CALL_ID',name:'Read',input:{file_path:'ARG_SECRET'}},{type:'text',text:raw}]}},['MARKER_SECRET']);
+  assert.deepEqual(summary.tool_use_names,['Read']);assert.equal(summary.raw_tool_json_as_text,true);
+  const serialized=JSON.stringify(summary);for(const value of [raw,'PRIVATE_PATH','AUTH_SECRET','FULL_CALL_ID','ARG_SECRET','MARKER_SECRET'])assert.equal(serialized.includes(value),false,value);
+});
+
+test('Claude live probe recognizes only explicit structured lifecycle events',async()=>{
+  const {summarizeClaudeEvent}=await claudeLiveProbe();
+  assert.equal(summarizeClaudeEvent({type:'system',subtype:'compact_boundary'}).explicit_compaction,true);
+  assert.equal(summarizeClaudeEvent({type:'system',subtype:'recap'}).explicit_recap,true);
+  const ordinary=summarizeClaudeEvent({type:'assistant',subtype:'message',message:{content:[{type:'text',text:'short summary and compact prose'}]}});
+  assert.equal(ordinary.explicit_compaction,false);assert.equal(ordinary.explicit_recap,false);
+});
+
+test('Claude live probe sanitizes Bridge diagnostic records',async()=>{
+  const {parseBridgeDiagnostics,sanitizeBridgeDiagnostic}=await claudeLiveProbe();
+  const safe=sanitizeBridgeDiagnostic({event:'tool_request',protocol:'anthropic',route:'/v1/messages',model:'deepseek-reasoner',stream:true,session_source:'explicit_metadata',session_ref:'FULL_SESSION_ID',tools_field_present:true,tools_field_shape:'array',raw_tool_count:3,normalized_tool_count:3,tool_names:['Read','Glob','Grep'],is_tool_continuation:false,tool_result_count:0,prompt:'PROMPT_SECRET'});
+  assert.equal(safe.session_ref,'invalid');assert.deepEqual(safe.tool_names,['Read','Glob','Grep']);assert.equal(JSON.stringify(safe).includes('PROMPT_SECRET'),false);assert.equal(JSON.stringify(safe).includes('FULL_SESSION_ID'),false);
+  assert.equal(parseBridgeDiagnostics(`bad\n${JSON.stringify({...safe,session_ref:'abcdef012345'})}`).length,1);
+});
+
+test('Claude live probe workspace is bounded, unchanged and removed',async()=>{
+  const {withSyntheticWorkspace}=await claudeLiveProbe();let directory;
+  const result=await withSyntheticWorkspace(async value=>{directory=value.directory;assert.equal(value.markers.length,12);assert.ok(value.totalBytes<=160*1024);assert.equal(fs.readdirSync(directory).filter(name=>/^part-\d{2}\.txt$/.test(name)).length,12);return {ok:true};});
+  assert.equal(result.ok,true);assert.equal(result.temporary_files_unchanged,true);assert.equal(fs.existsSync(directory),false);
+});
+
+test('Claude live probe uses confirmed resume and read-only tool flags',async()=>{
+  const {buildClaudeArgs}=await claudeLiveProbe();const session='11111111-1111-4111-8111-111111111111';
+  const first=buildClaudeArgs({sessionId:session,first:true,prompt:'synthetic'}),next=buildClaudeArgs({sessionId:session,first:false,prompt:'synthetic'});
+  assert.ok(first.includes('--print'));assert.ok(first.includes('stream-json'));assert.equal(first[first.indexOf('--tools')+1],'Read,Glob,Grep');assert.equal(first[first.indexOf('--allowedTools')+1],'Read,Glob,Grep');assert.match(first[first.indexOf('--disallowedTools')+1],/Write.*Edit.*Bash/);
+  assert.deepEqual(first.slice(first.indexOf('--session-id'),first.indexOf('--session-id')+2),['--session-id',session]);assert.deepEqual(next.slice(next.indexOf('--resume'),next.indexOf('--resume')+2),['--resume',session]);
+});
