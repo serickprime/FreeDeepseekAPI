@@ -73,9 +73,9 @@ test('completion without diagnostic callbacks preserves retries and existing res
 
 function doctorAuth(){return JSON.stringify({token:'test-token',cookie:'test-cookie',wasmUrl:'https://example.test/pow.wasm'});}
 function doctorChallenge(){return {data:{biz_data:{challenge:{challenge:'c',salt:'s',expire_at:1,difficulty:1,algorithm:'a',signature:'sig'}}}};}
-function doctorFetch(marker,{sessionStatus=200,challengeStatus=200,completionStatus=200,completionText}={}){
+function doctorFetch(marker,{reachabilityStatus=200,sessionStatus=200,challengeStatus=200,completionStatus=200,completionText}={}){
   const responses=[
-    new Response('ok',{status:200}),
+    new Response('reachable',{status:reachabilityStatus}),
     new Response(sessionStatus===200?JSON.stringify({data:{biz_data:{id:'doctor-session'}}}):'session failed',{status:sessionStatus}),
     new Response(challengeStatus===200?JSON.stringify(doctorChallenge()):'challenge failed',{status:challengeStatus}),
     new Response(completionText===undefined?`data: {"p":"response/content","v":"${marker}"}\n`:completionText,{status:completionStatus}),
@@ -107,8 +107,40 @@ test('doctor completes every DeepSeek diagnostic stage with mocked upstream',asy
   assert.equal(result.ok,true);
   for(const expected of ['Авторизация загружена','Token и cookie присутствуют','DeepSeek Web доступен','Удалённая сессия создана','PoW challenge получен','WASM загружен','WASM скомпилирован','PoW решён','Completion запрос выполнен','Streaming ответ получен','Streaming ответ разобран','Ответ модели получен'])assert.ok(lines.some(line=>line.includes(expected)),expected);
 });
+test('doctor treats an HTTP 403 homepage response as network reachability and continues',async()=>{
+  const {result,lines}=await doctorCase({fetchOptions:{reachabilityStatus:403}});
+  assert.equal(result.ok,true);
+  assert.ok(lines.some(line=>line.includes('DeepSeek Web доступен (HTTP 403)')));
+  assert.ok(lines.some(line=>line.includes('Ответ модели получен')));
+});
+test('doctor treats an HTTP 200 homepage response as network reachability',async()=>{
+  const {result,lines}=await doctorCase({fetchOptions:{reachabilityStatus:200}});
+  assert.equal(result.ok,true);
+  assert.ok(lines.some(line=>line.includes('DeepSeek Web доступен (HTTP 200)')));
+});
+test('doctor reachability uses an unauthenticated GET to the DeepSeek homepage',async()=>{
+  const marker='DOCTOR_REACHABILITY_REQUEST';
+  const upstream=doctorFetch(marker);
+  let first=true;
+  const fetchImpl=async(url,options)=>{
+    if(first){
+      first=false;
+      assert.equal(url,'https://chat.deepseek.com');
+      assert.equal(options.method,'GET');
+      assert.equal(options.headers,undefined);
+    }
+    return upstream();
+  };
+  const {result}=await doctorCase({marker,fetchImpl});
+  assert.equal(result.ok,true);
+});
+test('doctor stops on a DeepSeek network connection error',async()=>{const {result}=await doctorCase({fetchImpl:async()=>{throw new Error('DNS lookup failed');}});assert.equal(result.stage,'web');assert.match(result.error,/DNS lookup failed/);});
+test('doctor stops on a DeepSeek reachability timeout',async()=>{const {result}=await doctorCase({fetchImpl:async()=>{const error=new Error('Connection timed out');error.name='TimeoutError';throw error;}});assert.equal(result.stage,'web');assert.match(result.error,/timed out/);});
 test('doctor identifies remote session creation errors',async()=>{const {result}=await doctorCase({fetchOptions:{sessionStatus:500}});assert.equal(result.stage,'session');assert.match(result.error,/HTTP 500/);});
+test('doctor explains HTTP 401 session auth rejection without exposing credentials',async()=>{const {result,lines}=await doctorCase({fetchOptions:{sessionStatus:401}});assert.equal(result.stage,'session');assert.match(result.error,/отклонил текущую авторизацию.*HTTP 401.*npm run auth/);assert.doesNotMatch(lines.join('\n'),/test-token|test-cookie/);});
+test('doctor explains HTTP 403 session auth rejection without exposing credentials',async()=>{const {result,lines}=await doctorCase({fetchOptions:{sessionStatus:403}});assert.equal(result.stage,'session');assert.match(result.error,/отклонил текущую авторизацию.*HTTP 403.*npm run auth/);assert.doesNotMatch(lines.join('\n'),/test-token|test-cookie/);});
 test('doctor identifies challenge errors',async()=>{const {result}=await doctorCase({fetchOptions:{challengeStatus:503}});assert.equal(result.stage,'challenge');assert.match(result.error,/HTTP 503/);});
+test('doctor keeps HTTP 403 from the internal challenge endpoint as an error',async()=>{const {result}=await doctorCase({fetchOptions:{challengeStatus:403}});assert.equal(result.stage,'challenge');assert.match(result.error,/HTTP 403/);});
 test('doctor identifies WASM download errors without leaking secrets',async()=>{const {result,lines}=await doctorCase({solvePow:doctorPow({failureStage:'download'})});assert.equal(result.stage,'wasm_download');assert.doesNotMatch(lines.join('\n'),/secret/);});
 test('doctor identifies WASM compilation errors',async()=>{const {result}=await doctorCase({solvePow:doctorPow({failureStage:'compile'})});assert.equal(result.stage,'wasm_compile');});
 test('doctor identifies PoW solve errors',async()=>{const {result}=await doctorCase({solvePow:doctorPow({failureStage:'solve'})});assert.equal(result.stage,'pow');});
@@ -116,7 +148,7 @@ test('doctor identifies completion HTTP errors',async()=>{const {result}=await d
 test('doctor rejects an empty parsed streaming response',async()=>{const {result}=await doctorCase({fetchOptions:{completionText:''}});assert.equal(result.stage,'answer');assert.match(result.error,/пустой/);});
 test('doctor rejects a response without its expected marker',async()=>{const {result}=await doctorCase({fetchOptions:{completionText:'data: {"p":"response/content","v":"OTHER"}\n'}});assert.equal(result.stage,'answer');assert.match(result.error,/маркер/);});
 test('doctor redacts credentials from arbitrary stage errors',async()=>{const {result,lines}=await doctorCase({overrides:{createSessionImpl:async()=>{throw new Error('Bearer bearer-secret token=token-secret cookie=cookie-secret authorization=auth-secret');}}});assert.equal(result.stage,'session');assert.doesNotMatch(lines.join('\n'),/bearer-secret|token-secret|cookie-secret|auth-secret/);});
-test('doctor enforces a bounded overall timeout',async()=>{const lines=[];const result=await runDiagnostics({readFile:()=>doctorAuth(),checkImpl:()=>new Promise(()=>{}),timeoutMs:25,output:line=>lines.push(line),errorOutput:line=>lines.push(line)});assert.equal(result.stage,'timeout');assert.ok(lines.some(line=>line.includes('Общее время диагностики')));assert.equal(boundedTimeout(Infinity),150_000);assert.equal(boundedTimeout(999_999),180_000);});
+test('doctor enforces a bounded overall timeout',async()=>{const lines=[];const result=await runDiagnostics({readFile:()=>doctorAuth(),reachabilityImpl:()=>new Promise(()=>{}),timeoutMs:25,output:line=>lines.push(line),errorOutput:line=>lines.push(line)});assert.equal(result.stage,'timeout');assert.ok(lines.some(line=>line.includes('Общее время диагностики')));assert.equal(boundedTimeout(Infinity),150_000);assert.equal(boundedTimeout(999_999),180_000);});
 test('setup allows bounded headroom for the full doctor process',()=>{assert.ok(DOCTOR_PROCESS_TIMEOUT_MS>180_000&&DOCTOR_PROCESS_TIMEOUT_MS<=240_000);});
 
 async function streamingProtocolCase(path, body, expectedParts) {

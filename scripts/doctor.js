@@ -4,7 +4,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { BASE_URL, checked, complete, createRemoteSession } = require('../client');
+const { BASE_URL, complete, createRemoteSession } = require('../client');
 const { solvePOW } = require('../lib/pow');
 const { safeError } = require('../lib/security');
 
@@ -40,12 +40,20 @@ function diagnosticDetail(error) {
   return safeError(error).replace(/[\r\n]+/g, ' ').slice(0, 240);
 }
 
+async function checkReachability(url, timeoutMs, fetchImpl = fetch) {
+  const response = await fetchImpl(url, { method: 'GET', signal: AbortSignal.timeout(timeoutMs) });
+  const status = Number(response?.status);
+  if (!Number.isInteger(status) || status < 100 || status > 599) throw new Error('DeepSeek Web did not return an HTTP response');
+  try { await response.body?.cancel(); } catch {}
+  return status;
+}
+
 async function runDiagnostics({
   authPath = DEFAULT_AUTH_PATH,
   readFile = file => fs.readFileSync(file, 'utf8'),
   fetchImpl = fetch,
   solvePow = solvePOW,
-  checkImpl = checked,
+  reachabilityImpl = checkReachability,
   createSessionImpl = createRemoteSession,
   completeImpl = complete,
   timeoutMs = boundedTimeout(process.env.DEEPSEEK_DOCTOR_TIMEOUT_MS),
@@ -99,8 +107,8 @@ async function runDiagnostics({
     pass('auth_fields', 'Token и cookie присутствуют');
 
     current = 'web';
-    await checkImpl(BASE_URL, { method: 'GET' }, remaining(), fetchImpl);
-    pass('web', 'DeepSeek Web доступен');
+    const reachabilityStatus = await reachabilityImpl(BASE_URL, remaining(), fetchImpl);
+    pass('web', `DeepSeek Web доступен (HTTP ${reachabilityStatus})`);
 
     current = 'session';
     const session = { id: await createSessionImpl(auth, remaining(), fetchImpl), parentMessageId: null, history: [] };
@@ -134,8 +142,12 @@ async function runDiagnostics({
     return await Promise.race([operation(), timeout]);
   } catch (error) {
     if (error?.diagnosticTimeout) current = 'timeout';
-    emit(false, LABELS[current] || 'Диагностика', diagnosticDetail(error));
-    return { ok: false, stage: current, error: diagnosticDetail(error), lines: [...lines] };
+    const rejectedAuth = current === 'session' && (error?.status === 401 || error?.status === 403);
+    const detail = rejectedAuth
+      ? `DeepSeek отклонил текущую авторизацию (HTTP ${error.status}). Выполните npm run auth вручную`
+      : diagnosticDetail(error);
+    emit(false, LABELS[current] || 'Диагностика', detail);
+    return { ok: false, stage: current, error: detail, lines: [...lines] };
   } finally {
     active = false;
     clearTimeout(timer);
@@ -149,4 +161,4 @@ async function main() {
 
 if (require.main === module) main();
 
-module.exports = { LABELS, boundedTimeout, runDiagnostics };
+module.exports = { LABELS, boundedTimeout, checkReachability, runDiagnostics };
