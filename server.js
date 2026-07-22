@@ -4,7 +4,7 @@ const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { assertConfig, cors, authorized, safeError, isLoopback } = require('./lib/security');
+const { assertConfig, cors, authorized, safeError, logSafeError, isLoopback } = require('./lib/security');
 const { SessionStore } = require('./lib/session');
 const { parseToolCall, toolPrompt } = require('./lib/tool_parser');
 const { createProtocolStream } = require('./lib/api_stream');
@@ -158,7 +158,7 @@ function toResponses(openaiResponse, identity = {}) {
   };
 }
 
-function createProxyServer({ config = assertConfig(), completeImpl = complete, sessionStore, setupController } = {}) {
+function createProxyServer({ config = assertConfig(), completeImpl = complete, sessionStore, setupController, logger } = {}) {
   const sessions = sessionStore || new SessionStore({ ttlMs: Number(process.env.SESSION_TTL_MS || 1_800_000) });
   const setup = setupController || createSetupController();
 
@@ -245,6 +245,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       if (stream) return stream.finish({ output, toolCall, finalResponse });
       return send(res, 200, finalResponse);
     } catch (error) {
+      logSafeError(error, logger);
       if (stream) return stream.fail('DeepSeek streaming request failed. Run npm run doctor or re-authenticate.');
       const status = error.status || (error.name === 'TimeoutError' ? 504 : 502);
       const message = status >= 500 ? 'DeepSeek request failed. Run npm run doctor or re-authenticate.' : safeError(error);

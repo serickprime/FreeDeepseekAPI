@@ -1,9 +1,18 @@
 'use strict';
-const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {parseToolCall,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
+const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {parseToolCall,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
 const {createSetupController,existingDirectory}=require('../lib/setup');
 test('loopback and external bind security',()=>{assert.equal(isLoopback('127.0.0.1'),true);assert.equal(isLoopback('0.0.0.0'),false);assert.throws(()=>assertConfig({HOST:'0.0.0.0'}));assert.equal(assertConfig({HOST:'0.0.0.0',PROXY_API_KEY:'x'.repeat(24)}).host,'0.0.0.0');});
 test('localhost browser origins allow explicit ports but reject deceptive hosts',()=>{assert.equal(isLocalOrigin('http://127.0.0.1:9655'),true);assert.equal(isLocalOrigin('http://localhost:3000'),true);assert.equal(isLocalOrigin('https://localhost.evil.example'),false);});
-test('error redaction hides credentials',()=>{assert.doesNotMatch(safeError(new Error('Bearer abcdefghijkl token=secret')),/secret|abcdefgh/);});
+test('error redaction hides credentials but keeps a useful reason',()=>{
+  const message=safeError(new Error('Gateway unavailable: Bearer bearer-secret token=token-secret cookie=session-secret authorization=auth-secret'));
+  assert.match(message,/Gateway unavailable/);
+  assert.doesNotMatch(message,/bearer-secret|token-secret|session-secret|auth-secret/);
+});
+test('safe error logging never throws for unusual errors or logger failures',()=>{
+  const unusual={get message(){throw new Error('message getter failed');},toString(){throw new Error('toString failed');}};
+  assert.doesNotThrow(()=>logSafeError(unusual,()=>{throw new Error('logger failed');}));
+  assert.equal(safeError(unusual),'Internal error');
+});
 test('session expiry/reset and bounded history',()=>{const s=new SessionStore({ttlMs:1,maxHistory:2});const x=s.get('a');s.add(x,'one','a');s.add(x,'two','b');s.add(x,'three','c');assert.equal(x.history.length,2);s.reset('a');assert.equal(s.list().length,0);});
 test('only explicit complete tool call is accepted',()=>{const c=parseToolCall('<tool_call>{"name":"read_file","arguments":{"path":"a"}}</tool_call>',['read_file']);assert.equal(c.function.name,'read_file');assert.equal(parseToolCall('{"name":"read_file","arguments":{}}',['read_file']),null);assert.equal(parseToolCall('<tool_call>{"name":"other","arguments":{}}</tool_call>',['read_file']),null);assert.equal(parseToolCall('<tool_call>{"name":"read_file","arguments":</tool_call>',['read_file']),null);});
 test('strict JSON tool envelope is accepted only as the whole response',()=>{const c=parseToolCall('{"tool_call":{"name":"read_file","arguments":{"path":"a"}}}',['read_file']);assert.equal(c.function.name,'read_file');assert.equal(parseToolCall('Example: {"tool_call":{"name":"read_file","arguments":{}}}',['read_file']),null);});
@@ -125,6 +134,42 @@ test('streaming with tools buffers markup and emits a validated tool call',async
     assert.doesNotMatch(output,/<tool_call>/);
     assert.match(output,/"tool_calls"/);
     assert.match(output,/"finish_reason":"tool_calls"/);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+});
+
+test('Bridge logs the safe upstream reason while streaming clients receive no secrets',async()=>{
+  const logs=[];
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,logger:line=>logs.push(line),completeImpl:async()=>{throw new Error('Gateway unavailable: Bearer bearer-secret token=token-secret cookie=session-secret authorization=auth-secret');}});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try {
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-chat',stream:true,messages:[{role:'user',content:'test'}]})});
+    const output=await response.text();
+    assert.match(output,/DeepSeek streaming request failed/);
+    assert.doesNotMatch(output,/bearer-secret|token-secret|session-secret|auth-secret/);
+    assert.match(logs.join('\n'),/Gateway unavailable/);
+    assert.doesNotMatch(logs.join('\n'),/bearer-secret|token-secret|session-secret|auth-secret/);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+});
+
+test('Bridge normal API errors do not disclose upstream secrets',async()=>{
+  const logs=[];
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,logger:line=>logs.push(line),completeImpl:async()=>{const error=new Error('Gateway unavailable: Bearer bearer-secret token=token-secret cookie=session-secret authorization=auth-secret');error.status=502;throw error;}});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try {
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content:'test'}]})});
+    const output=await response.text();
+    assert.match(output,/DeepSeek request failed/);
+    assert.doesNotMatch(output,/bearer-secret|token-secret|session-secret|auth-secret/);
+    assert.match(logs.join('\n'),/Gateway unavailable/);
+    assert.doesNotMatch(logs.join('\n'),/bearer-secret|token-secret|session-secret|auth-secret/);
   } finally {
     server.closeAllConnections?.();
     await new Promise(resolve=>server.close(resolve));
