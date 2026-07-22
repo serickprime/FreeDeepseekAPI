@@ -176,15 +176,18 @@ function resetRemoteSession(session) {
   session.parentMessageId = null;
 }
 
-async function completeOnce({ prompt, session, model, onDelta, timeoutMs, auth, fetchImpl, solvePow }) {
+async function completeOnce({ prompt, session, model, onDelta, onStage, timeoutMs, auth, fetchImpl, solvePow }) {
   const baseHeaders = headers(auth);
   if (!session.id) session.id = await createRemoteSession(auth, timeoutMs, fetchImpl);
+  onStage?.('challenge_start');
   const challengeResponse = await checked(`${BASE_URL}/api/v0/chat/create_pow_challenge`, {
     method: 'POST', headers: baseHeaders, body: JSON.stringify({ target_path: COMPLETION_PATH }),
   }, timeoutMs, fetchImpl);
   const challenge = (await challengeResponse.json())?.data?.biz_data?.challenge;
   if (!challenge) throw new Error('DeepSeek did not return a PoW challenge. Run npm run doctor.');
-  const answer = await solvePow(challenge, auth.wasmUrl || DEFAULT_WASM_URL, Math.min(timeoutMs, 15_000));
+  onStage?.('challenge_received');
+  onStage?.('wasm_download_start');
+  const answer = await solvePow(challenge, auth.wasmUrl || DEFAULT_WASM_URL, Math.min(timeoutMs, 15_000), onStage);
   const pow = Buffer.from(JSON.stringify({
     algorithm: challenge.algorithm,
     challenge: challenge.challenge,
@@ -193,6 +196,7 @@ async function completeOnce({ prompt, session, model, onDelta, timeoutMs, auth, 
     signature: challenge.signature,
     target_path: COMPLETION_PATH,
   })).toString('base64');
+  onStage?.('completion_start');
   const response = await checked(`${BASE_URL}${COMPLETION_PATH}`, {
     method: 'POST',
     headers: { ...baseHeaders, 'x-ds-pow-response': pow },
@@ -208,7 +212,11 @@ async function completeOnce({ prompt, session, model, onDelta, timeoutMs, auth, 
       preempt: false,
     }),
   }, timeoutMs, fetchImpl);
+  onStage?.('completion_completed');
+  if (!response.body) throw new Error('DeepSeek returned an empty response body.');
+  onStage?.('stream_received');
   const result = await parseStream(response.body, onDelta);
+  onStage?.('stream_parsed');
   if (result.parentMessageId) session.parentMessageId = result.parentMessageId;
   return result;
 }
@@ -218,6 +226,7 @@ async function complete({
   session,
   model,
   onDelta,
+  onStage,
   timeoutMs = 120_000,
   maxRetries = 2,
   maxRetryDelayMs = 10_000,
@@ -229,7 +238,7 @@ async function complete({
   let lastError;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     try {
-      return await completeOnce({ prompt, session, model, onDelta, timeoutMs, auth, fetchImpl, solvePow });
+      return await completeOnce({ prompt, session, model, onDelta, onStage, timeoutMs, auth, fetchImpl, solvePow });
     } catch (error) {
       lastError = error;
       if (error.status === 401 || error.status === 403) resetRemoteSession(session);
@@ -243,6 +252,7 @@ async function complete({
 }
 
 module.exports = {
+  BASE_URL,
   checked,
   complete,
   createRemoteSession,
