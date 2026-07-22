@@ -70,24 +70,84 @@ function text(value) {
   return value.map(item => typeof item === 'string' ? item : item?.text || item?.content || '').join('\n');
 }
 
-function anthropicMessageText(message) {
+function structuredText(value) {
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value ?? {}); } catch { return '{}'; }
+}
+
+function sessionToolName(session, callId) {
+  return typeof callId === 'string' && session?.toolCalls instanceof Map ? session.toolCalls.get(callId) || '' : '';
+}
+
+function rememberToolCall(session, toolCall) {
+  const id = toolCall?.id;
+  const name = toolCall?.function?.name;
+  if (typeof id !== 'string' || typeof name !== 'string') return;
+  if (!(session.toolCalls instanceof Map)) session.toolCalls = new Map();
+  session.toolCalls.set(id, name);
+  while (session.toolCalls.size > 32) session.toolCalls.delete(session.toolCalls.keys().next().value);
+}
+
+function toolCallText(name, callId, argumentsValue) {
+  return `[Tool Call]\nname: ${name || 'unknown'}\ncall_id: ${callId || 'unknown'}\narguments: ${structuredText(argumentsValue)}`;
+}
+
+function toolResultText(name, callId, result) {
+  return `[Tool Result]\nname: ${name || 'unknown'}\ncall_id: ${callId || 'unknown'}\nresult:\n${typeof result === 'string' ? result : structuredText(result)}`;
+}
+
+function openAIMessageText(message, session) {
+  const role = String(message?.role || 'user');
+  if (role === 'tool') {
+    const callId = message.tool_call_id || '';
+    return `${role}: ${toolResultText(message.name || sessionToolName(session, callId), callId, text(message.content))}`;
+  }
+  const parts = [];
+  const content = text(message?.content);
+  if (content) parts.push(`${role}: ${content}`);
+  for (const call of Array.isArray(message?.tool_calls) ? message.tool_calls : []) {
+    const callId = call?.id || '';
+    parts.push(`${role}: ${toolCallText(call?.function?.name || sessionToolName(session, callId), callId, call?.function?.arguments)}`);
+  }
+  return parts.join('\n');
+}
+
+function anthropicMessageText(message, session) {
   if (!Array.isArray(message.content)) return text(message.content);
   return message.content.map(block => {
     if (!block || typeof block !== 'object') return '';
     if (block.type === 'text' || block.type === 'thinking') return text(block.text || block.thinking);
-    if (block.type === 'tool_use') return `TOOL_CALL: ${block.name}\narguments: ${JSON.stringify(block.input || {})}`;
-    if (block.type === 'tool_result') return `[Tool Result ${block.tool_use_id || ''}]\n${text(block.content)}`;
+    if (block.type === 'tool_use') return toolCallText(block.name, block.id, block.input);
+    if (block.type === 'tool_result') return toolResultText(sessionToolName(session, block.tool_use_id), block.tool_use_id, text(block.content));
     return '';
   }).filter(Boolean).join('\n');
 }
 
-function normalize(body, kind) {
+function responsesInputText(input, session) {
+  if (typeof input === 'string') return input;
+  if (!Array.isArray(input)) return '';
+  const names = new Map(session?.toolCalls instanceof Map ? session.toolCalls : []);
+  for (const item of input) {
+    if (item?.type === 'function_call' && typeof (item.call_id || item.id) === 'string' && typeof item.name === 'string') names.set(item.call_id || item.id, item.name);
+  }
+  return input.map(item => {
+    if (typeof item === 'string') return item;
+    if (!item || typeof item !== 'object') return '';
+    if (item.type === 'function_call') return toolCallText(item.name, item.call_id || item.id, item.arguments);
+    if (item.type === 'function_call_output') return toolResultText(item.name || names.get(item.call_id) || '', item.call_id, item.output);
+    if (item.type === 'message') return `${item.role || 'user'}: ${text(item.content)}`;
+    if (item.type === 'input_text' || item.type === 'output_text') return item.text || '';
+    return text(item.content || item.text);
+  }).filter(Boolean).join('\n');
+}
+
+function normalize(body, kind, session) {
   if (kind === 'anthropic') {
     return {
       model: body.model,
       stream: body.stream === true,
       tools: (body.tools || []).map(tool => ({ function: { name: tool.name, description: tool.description, parameters: tool.input_schema } })),
-      prompt: [body.system && `System: ${text(body.system)}`, ...(body.messages || []).map(message => `${message.role}: ${anthropicMessageText(message)}`)].filter(Boolean).join('\n'),
+      prompt: [body.system && `System: ${text(body.system)}`, ...(body.messages || []).map(message => `${message.role}: ${anthropicMessageText(message, session)}`)].filter(Boolean).join('\n'),
     };
   }
   if (kind === 'responses') {
@@ -95,14 +155,14 @@ function normalize(body, kind) {
       model: body.model,
       stream: body.stream === true,
       tools: (body.tools || []).filter(tool => tool.type === 'function').map(tool => ({ function: { name: tool.name, description: tool.description, parameters: tool.parameters } })),
-      prompt: text(body.input),
+      prompt: responsesInputText(body.input, session),
     };
   }
   return {
     model: body.model,
     stream: body.stream === true,
     tools: body.tools || [],
-    prompt: (body.messages || []).map(message => `${message.role}: ${text(message.content)}`).join('\n'),
+    prompt: (body.messages || []).map(message => openAIMessageText(message, session)).filter(Boolean).join('\n'),
   };
 }
 
@@ -209,14 +269,14 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       const paths = { '/v1/chat/completions': 'openai', '/v1/responses': 'responses', '/v1/messages': 'anthropic' };
       const kind = paths[url.pathname];
       if (req.method !== 'POST' || !kind) return sendError(res, 404, 'Not found');
-      const input = normalize(body, kind);
+      const session = sessions.get(agentKey);
+      const input = normalize(body, kind, session);
       const modelName = String(input.model || 'deepseek-chat').toLowerCase();
       const model = MODELS[modelName];
       if (!model) return sendError(res, 400, 'Unsupported model. See GET /v1/models.');
       if (!model.available) return sendError(res, 400, 'This DeepSeek Web mode is currently unavailable. See GET /v1/model-capabilities.');
       if (!input.prompt.trim()) return sendError(res, 400, 'A user input/message is required');
 
-      const session = sessions.get(agentKey);
       const allowedTools = input.tools.map(tool => tool?.function?.name).filter(Boolean);
       const hasTools = allowedTools.length > 0;
       let streamIdentity = null;
@@ -249,6 +309,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         toolCall = parseToolCallFromOutput(output, allowedTools);
         output = hideRetryReasoning(output, toolCall);
       }
+      if (toolCall) rememberToolCall(session, toolCall);
       if (!toolCall) sessions.add(session, input.prompt, output.content);
       const openaiIdentity = streamIdentity && kind === 'openai' ? streamIdentity : {};
       const openaiResponse = toOpenAI(modelName, input.prompt, output, toolCall, openaiIdentity);
