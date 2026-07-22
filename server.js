@@ -7,6 +7,7 @@ const path = require('path');
 const { assertConfig, cors, authorized, safeError, logSafeError, isLoopback } = require('./lib/security');
 const { SessionStore } = require('./lib/session');
 const { parseToolCallFromOutput, toolPrompt } = require('./lib/tool_parser');
+const { createToolRetryPrompt, hideRetryReasoning, logToolRetry, shouldRetryToolResponse } = require('./lib/tool_retry');
 const { createProtocolStream } = require('./lib/api_stream');
 const { createSetupController } = require('./lib/setup');
 const { MODELS } = require('./lib/models');
@@ -228,14 +229,26 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         stream = createProtocolStream(res, { kind, ...streamIdentity, bufferForTools: hasTools });
       }
 
-      const output = await completeImpl({
+      let output = await completeImpl({
         prompt: input.prompt + toolPrompt(input.tools),
         session,
         model,
         timeoutMs: config.timeoutMs,
         onDelta: input.stream ? delta => stream.delta(delta) : undefined,
       });
-      const toolCall = parseToolCallFromOutput(output, allowedTools);
+      let toolCall = parseToolCallFromOutput(output, allowedTools);
+      if (shouldRetryToolResponse({ hasTools, output, toolCall, retryCount: 0 })) {
+        logToolRetry(logger);
+        output = await completeImpl({
+          prompt: createToolRetryPrompt(allowedTools),
+          session,
+          model: MODELS['deepseek-chat'],
+          timeoutMs: config.timeoutMs,
+          onDelta: input.stream ? delta => stream.delta(delta) : undefined,
+        });
+        toolCall = parseToolCallFromOutput(output, allowedTools);
+        output = hideRetryReasoning(output, toolCall);
+      }
       if (!toolCall) sessions.add(session, input.prompt, output.content);
       const openaiIdentity = streamIdentity && kind === 'openai' ? streamIdentity : {};
       const openaiResponse = toOpenAI(modelName, input.prompt, output, toolCall, openaiIdentity);

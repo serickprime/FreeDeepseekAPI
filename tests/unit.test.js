@@ -1,5 +1,6 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
+const {TOOL_RETRY_FAILURE_MESSAGE,createToolRetryPrompt,hideRetryReasoning,shouldRetryToolResponse}=require('../lib/tool_retry');
 const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory}=require('../lib/setup');
 const {runDiagnostics,boundedTimeout}=require('../scripts/doctor');
 test('loopback and external bind security',()=>{assert.equal(isLoopback('127.0.0.1'),true);assert.equal(isLoopback('0.0.0.0'),false);assert.throws(()=>assertConfig({HOST:'0.0.0.0'}));assert.equal(assertConfig({HOST:'0.0.0.0',PROXY_API_KEY:'x'.repeat(24)}).host,'0.0.0.0');});
@@ -88,6 +89,22 @@ test('tool argument nesting is bounded while safe objects and arrays remain vali
   const safe={path:'package.json',options:{encoding:'utf8',ranges:[{start:1,end:3},['a','b'],null,true]}};
   const call=parseToolCall(jsonToolCall('read_file',safe),['read_file']);
   assert.deepEqual(JSON.parse(call.function.arguments),safe);
+});
+test('tool retry decision is limited to the first reasoning-only result with tools',()=>{
+  const output={content:' ',reasoning:'I need a file'};
+  assert.equal(shouldRetryToolResponse({hasTools:true,output,toolCall:null,retryCount:0}),true);
+  assert.equal(shouldRetryToolResponse({hasTools:false,output,toolCall:null,retryCount:0}),false);
+  assert.equal(shouldRetryToolResponse({hasTools:true,output,toolCall:{},retryCount:0}),false);
+  assert.equal(shouldRetryToolResponse({hasTools:true,output:{content:'final',reasoning:'why'},toolCall:null,retryCount:0}),false);
+  assert.equal(shouldRetryToolResponse({hasTools:true,output,toolCall:null,retryCount:1}),false);
+});
+test('corrective tool prompt is bounded to allowed names and retry reasoning is hidden',()=>{
+  const prompt=createToolRetryPrompt(['read_file','glob','bad name','read_file']);
+  assert.match(prompt,/strict JSON tool call/);
+  assert.match(prompt,/\["read_file","glob"\]/);
+  assert.doesNotMatch(prompt,/bad name/);
+  assert.deepEqual(hideRetryReasoning({content:'final answer',reasoning:'private'},null),{content:'final answer',reasoning:''});
+  assert.equal(hideRetryReasoning({content:'',reasoning:'private'},null).content,TOOL_RETRY_FAILURE_MESSAGE);
 });
 test('tool prompt is declarative and bounded',()=>{const p=toolPrompt([{function:{name:'x',parameters:{type:'object'}}}]);assert.match(p,/Never execute/);assert.match(p,/"x"/);});
 
@@ -379,6 +396,147 @@ test('ordinary responses without tools and rejected tool-like text stay normal r
     await new Promise(resolve=>server.close(resolve));
   }
 });
+
+async function toolRetryProxyCase({path='/v1/chat/completions',body,completeImpl,logger,sessionStore,headers={}}){
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,completeImpl,logger,sessionStore});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}${path}`,{method:'POST',headers:{'content-type':'application/json',...headers},body:JSON.stringify(body)});
+    return {status:response.status,contentType:response.headers.get('content-type'),text:await response.text()};
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+}
+
+test('tool retry is skipped without tools, after a first tool call, and after final content',async()=>{
+  const cases=[
+    {body:{model:'deepseek-chat',messages:[{role:'user',content:'answer'}]},output:{content:'',reasoning:'planning'}},
+    {body:{model:'deepseek-chat',messages:[{role:'user',content:'use tool'}],tools:[{type:'function',function:{name:'read_file'}}]},output:{content:'',reasoning:jsonToolCall()}},
+    {body:{model:'deepseek-chat',messages:[{role:'user',content:'answer'}],tools:[{type:'function',function:{name:'read_file'}}]},output:{content:'final answer',reasoning:'brief thought'}},
+  ];
+  for(const item of cases){
+    let calls=0;
+    const result=await toolRetryProxyCase({body:item.body,logger:()=>{},completeImpl:async()=>{calls+=1;return {...item.output,parentMessageId:null};}});
+    assert.equal(result.status,200);
+    assert.equal(calls,1);
+  }
+});
+
+test('reasoning-only tool response causes one same-session retry in chat mode with allowed tools',async()=>{
+  const calls=[];
+  const logs=[];
+  const firstReasoning='PRIVATE_FIRST_REASONING_NEED_READ';
+  const result=await toolRetryProxyCase({
+    body:{model:'deepseek-reasoner-search',messages:[{role:'user',content:'read package'}],tools:[{type:'function',function:{name:'read_file',parameters:{type:'object'}}}]},
+    logger:line=>logs.push(line),
+    completeImpl:async options=>{
+      calls.push(options);
+      if(calls.length===1){options.session.id='remote-session';options.session.parentMessageId='first-message';return {content:'',reasoning:firstReasoning,parentMessageId:'first-message'};}
+      return {content:jsonToolCall('read_file',{path:'package.json'}),reasoning:'',parentMessageId:'second-message'};
+    },
+  });
+  const response=JSON.parse(result.text);
+  assert.equal(calls.length,2);
+  assert.equal(calls[0].model.reasoning,true);
+  assert.equal(calls[0].model.search,true);
+  assert.equal(calls[1].model.reasoning,false);
+  assert.equal(calls[1].model.search,false);
+  assert.equal(calls[1].session,calls[0].session);
+  assert.equal(calls[1].session.id,'remote-session');
+  assert.match(calls[1].prompt,/\["read_file"\]/);
+  assert.doesNotMatch(calls[1].prompt,new RegExp(firstReasoning));
+  assert.equal(response.model,'deepseek-reasoner-search');
+  assert.equal(response.choices[0].message.tool_calls[0].function.name,'read_file');
+  assert.match(logs.join('\n'),/Retrying one reasoning-only tool response/);
+  assert.doesNotMatch(logs.join('\n'),new RegExp(firstReasoning));
+});
+
+test('final text from the second attempt is returned and only it enters local history',async()=>{
+  const sessions=new SessionStore();
+  const firstReasoning='PRIVATE_INTERMEDIATE_REASONING';
+  let calls=0;
+  const result=await toolRetryProxyCase({
+    sessionStore:sessions,headers:{'x-agent-session':'retry-history'},logger:()=>{},
+    body:{model:'deepseek-reasoner',messages:[{role:'user',content:'finish'}],tools:[{type:'function',function:{name:'read_file'}}]},
+    completeImpl:async()=>{calls+=1;return calls===1?{content:'',reasoning:firstReasoning,parentMessageId:'one'}:{content:'final answer after retry',reasoning:'should stay private',parentMessageId:'two'};},
+  });
+  const response=JSON.parse(result.text);
+  assert.equal(calls,2);
+  assert.equal(response.choices[0].message.content,'final answer after retry');
+  assert.equal(response.choices[0].message.reasoning_content,undefined);
+  assert.doesNotMatch(result.text,new RegExp(firstReasoning));
+  const history=sessions.get('retry-history').history;
+  assert.equal(history.length,1);
+  assert.equal(history[0].assistant,'final answer after retry');
+  assert.doesNotMatch(JSON.stringify(history),/PRIVATE_INTERMEDIATE_REASONING|should stay private/);
+});
+
+test('a second reasoning-only result stops after two calls with a safe final message',async()=>{
+  let calls=0;
+  const result=await toolRetryProxyCase({
+    logger:()=>{},
+    body:{model:'deepseek-reasoner',messages:[{role:'user',content:'use tool'}],tools:[{type:'function',function:{name:'read_file'}}]},
+    completeImpl:async()=>{calls+=1;return {content:'',reasoning:`PRIVATE_REASONING_${calls}`,parentMessageId:String(calls)};},
+  });
+  const response=JSON.parse(result.text);
+  assert.equal(calls,2);
+  assert.equal(response.choices[0].message.content,TOOL_RETRY_FAILURE_MESSAGE);
+  assert.equal(response.choices[0].message.reasoning_content,undefined);
+  assert.doesNotMatch(result.text,/PRIVATE_REASONING/);
+});
+
+test('network, authorization and timeout errors never trigger the tool correction retry',async()=>{
+  const errors=[new Error('network failed'),Object.assign(new Error('HTTP 401'),{status:401}),Object.assign(new Error('HTTP 403'),{status:403}),Object.assign(new Error('timed out'),{name:'TimeoutError',status:504})];
+  for(const error of errors){
+    let calls=0;
+    const result=await toolRetryProxyCase({
+      logger:()=>{},
+      body:{model:'deepseek-reasoner',messages:[{role:'user',content:'use tool'}],tools:[{type:'function',function:{name:'read_file'}}]},
+      completeImpl:async()=>{calls+=1;throw error;},
+    });
+    assert.equal(calls,1);
+    assert.ok(result.status>=400);
+  }
+});
+
+async function streamingToolRetryCase(path,body,expected){
+  let calls=0;
+  const firstReasoning='PRIVATE_STREAM_REASONING';
+  const correctivePromptText='Return the final answer for the current task now.';
+  const result=await toolRetryProxyCase({path,body:{...body,stream:true},logger:()=>{},completeImpl:async({onDelta,prompt})=>{
+    calls+=1;
+    if(calls===1){onDelta({reasoning:firstReasoning});return {content:'',reasoning:firstReasoning,parentMessageId:'one'};}
+    assert.match(prompt,/strict JSON tool call/);
+    const content=jsonToolCall('read_file',{path:'package.json'});
+    onDelta({content});
+    return {content,reasoning:'',parentMessageId:'two'};
+  }});
+  assert.equal(calls,2);
+  assert.match(result.contentType,/^text\/event-stream/);
+  assert.doesNotMatch(result.text,new RegExp(`${firstReasoning}|${correctivePromptText}`));
+  assert.match(result.text,expected);
+  return result.text;
+}
+
+test('OpenAI streaming emits tool_calls only after a successful retry',()=>streamingToolRetryCase(
+  '/v1/chat/completions',
+  {model:'deepseek-reasoner',messages:[{role:'user',content:'read'}],tools:[{type:'function',function:{name:'read_file'}}]},
+  /"tool_calls"/
+));
+
+test('Anthropic streaming emits tool_use only after a successful retry',()=>streamingToolRetryCase(
+  '/v1/messages',
+  {model:'deepseek-reasoner',max_tokens:64,messages:[{role:'user',content:'read'}],tools:[{name:'read_file',input_schema:{type:'object'}}]},
+  /"type":"tool_use"/
+));
+
+test('Responses streaming emits function_call only after a successful retry',()=>streamingToolRetryCase(
+  '/v1/responses',
+  {model:'deepseek-reasoner',input:'read',tools:[{type:'function',name:'read_file',parameters:{type:'object'}}]},
+  /"type":"function_call"/
+));
 
 test('Bridge logs the safe upstream reason while streaming clients receive no secrets',async()=>{
   const logs=[];
