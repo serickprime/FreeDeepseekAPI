@@ -1,6 +1,6 @@
 'use strict';
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
-const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
+const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { complete, loadAuth, parseRetryAfter, parseStream }=client; const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
 const {TOOL_RETRY_FAILURE_MESSAGE,createToolRetryPrompt,hideRetryReasoning,shouldRetryToolResponse}=require('../lib/tool_retry');
 const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
 const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory,readAuthStatus}=require('../lib/setup');
@@ -34,6 +34,61 @@ test('setup auth status accepts only non-empty string credentials',t=>{
   assert.deepEqual(readAuthStatus(root),{present:true,valid:false});
   fs.writeFileSync(authPath,JSON.stringify({token:123,cookie:{value:'session=invalid'}}));
   assert.deepEqual(readAuthStatus(root),{present:true,valid:false});
+});
+test('client auth accepts only non-empty strings without changing credential values',t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'deepseek-bridge-client-auth-'));
+  const authPath=path.join(root,'deepseek-auth.json');
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+
+  const valid={token:'  valid-token  ',cookie:'  session=valid  '};
+  fs.writeFileSync(authPath,JSON.stringify(valid));
+  assert.deepEqual(loadAuth(authPath),valid);
+
+  const invalidCredentials=[
+    {token:'',cookie:'cookie-secret-empty-token'},
+    {token:'token-secret-empty-cookie',cookie:''},
+    {token:'   ',cookie:'cookie-secret-whitespace-token'},
+    {token:'token-secret-whitespace-cookie',cookie:'   '},
+    {token:123,cookie:'cookie-secret-numeric-token'},
+    {token:'token-secret-numeric-cookie',cookie:456},
+    {token:{value:'token-secret-object'},cookie:'cookie-secret-object-token'},
+    {token:'token-secret-object-cookie',cookie:{value:'cookie-secret-object'}},
+  ];
+
+  for(const auth of invalidCredentials){
+    fs.writeFileSync(authPath,JSON.stringify(auth));
+    assert.throws(()=>loadAuth(authPath),error=>{
+      assert.match(error.message,/^Run npm run auth first \(token or cookie missing\)\.$/);
+      assert.doesNotMatch(error.message,/secret|123|456/);
+      return true;
+    });
+  }
+});
+
+test('/readyz stays unavailable when stored credentials are invalid',async t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'deepseek-bridge-readyz-auth-'));
+  const authPath=path.join(root,'deepseek-auth.json');
+  const originalLoadAuth=client.loadAuth;
+  fs.writeFileSync(authPath,JSON.stringify({token:{secret:'token-must-not-leak'},cookie:'cookie-must-not-leak'}));
+  client.loadAuth=()=>loadAuth(authPath);
+  t.after(()=>{
+    client.loadAuth=originalLoadAuth;
+    fs.rmSync(root,{recursive:true,force:true});
+  });
+
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,completeImpl:async()=>({content:'unused',reasoning:'',parentMessageId:null})});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/readyz`);
+    const body=await response.text();
+    assert.equal(response.status,503);
+    assert.deepEqual(JSON.parse(body),{ready:false,action:'Run npm run auth'});
+    assert.doesNotMatch(body,/token-must-not-leak|cookie-must-not-leak/);
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
 });
 test('session expiry/reset and bounded history',()=>{const s=new SessionStore({ttlMs:1,maxHistory:2});const x=s.get('a');s.add(x,'one','a');s.add(x,'two','b');s.add(x,'three','c');assert.equal(x.history.length,2);s.reset('a');assert.equal(s.list().length,0);});
 

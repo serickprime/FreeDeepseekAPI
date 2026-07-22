@@ -12,7 +12,10 @@ const DEFAULT_WASM_URL = 'https://fe-static.deepseek.com/chat/static/sha3_wasm_b
 function loadAuth(authPath = AUTH_PATH) {
   try {
     const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
-    if (!auth.token || !auth.cookie) throw new Error('token or cookie missing');
+    const hasCredential = value => typeof value === 'string' && value.trim().length > 0;
+    if (!auth || typeof auth !== 'object' || !hasCredential(auth.token) || !hasCredential(auth.cookie)) {
+      throw new Error('token or cookie missing');
+    }
     return auth;
   } catch (error) {
     throw new Error(`Run npm run auth first (${error.message}).`);
