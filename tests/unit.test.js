@@ -3,6 +3,7 @@ const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { complete, loadAuth, parseRetryAfter, parseStream }=client; const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
 const {TOOL_RETRY_FAILURE_MESSAGE,createToolRetryPrompt,hideRetryReasoning,shouldRetryToolResponse}=require('../lib/tool_retry');
 const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
+const {MAX_TOOL_NAMES,MAX_TOOL_NAME_CHARS,createToolDiagnostics}=require('../lib/tool_diagnostics');
 const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory,readAuthStatus}=require('../lib/setup');
 const {runDiagnostics,boundedTimeout}=require('../scripts/doctor');
 test('loopback and external bind security',()=>{assert.equal(isLoopback('127.0.0.1'),true);assert.equal(isLoopback('0.0.0.0'),false);assert.throws(()=>assertConfig({HOST:'0.0.0.0'}));assert.equal(assertConfig({HOST:'0.0.0.0',PROXY_API_KEY:'x'.repeat(24)}).host,'0.0.0.0');});
@@ -1357,4 +1358,165 @@ test('setup folder selection and working-directory validation are bounded',async
   const invalid=await noLaunch.action('claude',{model:'deepseek-reasoner',workingDirectory:'Z:\\missing-deepseek-bridge-folder'});
   assert.equal(invalid.ok,false);
   assert.match(invalid.message,/Папка проекта/);
+});
+
+const diagnosticConfig={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+function diagnosticRecords(lines){return lines.flatMap(line=>{try{const record=JSON.parse(line);return record?.event?[record]:[];}catch{return [];}});}
+function createDiagnosticsEnabledServer(options){
+  const previous=process.env.BRIDGE_TOOL_DIAGNOSTICS;
+  process.env.BRIDGE_TOOL_DIAGNOSTICS='1';
+  try{return createProxyServer({config:diagnosticConfig,...options});}
+  finally{if(previous===undefined)delete process.env.BRIDGE_TOOL_DIAGNOSTICS;else process.env.BRIDGE_TOOL_DIAGNOSTICS=previous;}
+}
+async function withDiagnosticsServer(options,run){
+  const server=createDiagnosticsEnabledServer(options);
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const post=async(route,body,headers={})=>{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}${route}`,{method:'POST',headers:{'content-type':'application/json',...headers},body:JSON.stringify(body)});
+    const responseText=await response.text();
+    assert.equal(response.status,200,responseText);
+    return {contentType:response.headers.get('content-type'),text:responseText,json:()=>JSON.parse(responseText)};
+  };
+  try{return await run(post);}
+  finally{server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
+}
+
+test('tool diagnostics are disabled by default',async()=>{
+  const previous=process.env.BRIDGE_TOOL_DIAGNOSTICS;
+  delete process.env.BRIDGE_TOOL_DIAGNOSTICS;
+  const lines=[];
+  let server;
+  try{server=createProxyServer({config:diagnosticConfig,logger:line=>lines.push(line),completeImpl:async()=>({content:'ordinary final',reasoning:'',parentMessageId:null})});}
+  finally{if(previous===undefined)delete process.env.BRIDGE_TOOL_DIAGNOSTICS;else process.env.BRIDGE_TOOL_DIAGNOSTICS=previous;}
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content:'offline'}]})});
+    assert.equal(response.status,200);
+    assert.equal(diagnosticRecords(lines).length,0);
+  }finally{server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
+});
+
+test('tool diagnostics are bounded and never break requests when logging fails',()=>{
+  const lines=[];
+  const diagnostics=createToolDiagnostics({enabled:true,logger:line=>lines.push(line)});
+  const manyTools=Array.from({length:MAX_TOOL_NAMES+10},(_,index)=>({function:{name:index===0?`Read\n${'x'.repeat(MAX_TOOL_NAME_CHARS+20)}`:index===1?{invalid:true}:`tool_${index}`}}));
+  const response=diagnostics.request({protocol:'openai',route:'/v1/chat/completions',body:{model:'deepseek-chat',tools:manyTools},sessionSource:'anonymous',sessionKey:'anonymous:private',toolResultCount:0});
+  response.response({outcome:'final_text',contentNonempty:true});
+  const records=diagnosticRecords(lines);
+  assert.equal(records[0].tool_names.length,MAX_TOOL_NAMES);
+  assert.ok(records[0].tool_names[0].length<=MAX_TOOL_NAME_CHARS);
+  assert.doesNotMatch(records[0].tool_names[0],/[\r\n]/);
+  assert.equal(records[0].tool_names[1],'invalid');
+  const wrongLines=[];
+  const wrong=createToolDiagnostics({enabled:true,logger:line=>wrongLines.push(line)});
+  assert.doesNotThrow(()=>wrong.request({protocol:'anthropic',route:'/v1/messages',body:{model:'deepseek-chat',tools:{unexpected:true}},sessionSource:'anonymous',sessionKey:'private'}));
+  assert.equal(diagnosticRecords(wrongLines)[0].tools_field_shape,'object');
+  assert.equal(diagnosticRecords(wrongLines)[0].raw_tool_count,0);
+  const failing=createToolDiagnostics({enabled:true,logger:()=>{throw new Error('logger failed');}});
+  assert.doesNotThrow(()=>failing.request({protocol:'anthropic',route:'/v1/messages',body:{model:'deepseek-chat',tools:[]},sessionSource:'anonymous',sessionKey:'private'}));
+});
+
+test('long session diagnostics show tool presence, continuation, retry and safe outcomes without payloads',async()=>{
+  const lines=[];
+  const calls=[];
+  const secret={
+    prompt:'PROMPT_SECRET_LOCAL_PATH_C:\\private\\marker.txt',reasoning:'REASONING_SECRET',content:'CONTENT_SECRET',
+    argument:'ARGUMENT_SECRET',result:'TOOL_RESULT_SECRET',description:'DESCRIPTION_SECRET',schema:'SCHEMA_SECRET',
+    session:'SESSION_SECRET_FULL_VALUE',metadata:'METADATA_SECRET',call:'',token:'TOKEN_SECRET',cookie:'COOKIE_SECRET',authorization:'AUTHORIZATION_SECRET',
+  };
+  const tools=['Read','Write','Edit','Grep','Glob'].map((name,index)=>({type:'function',function:{name,description:index===0?secret.description:'safe',parameters:{type:'object',properties:{marker:{description:index===0?secret.schema:'safe'}}}}}));
+  const outputs=[
+    {content:secret.content,reasoning:'',parentMessageId:'p1'},
+    {content:jsonToolCall('Read',{file_path:secret.argument}),reasoning:'',parentMessageId:'p2'},
+    {content:'after tool result',reasoning:'',parentMessageId:'p3'},
+    {content:jsonToolCall('Read',{file_path:'recap.json'}),reasoning:'',parentMessageId:'p4'},
+    {content:'',reasoning:secret.reasoning,parentMessageId:'p5'},
+    {content:'after reasoning retry',reasoning:'',parentMessageId:'p6'},
+    {content:'other session final',reasoning:'',parentMessageId:'p7'},
+  ];
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{calls.push(options);return outputs.shift();}},async post=>{
+    const headers={'x-agent-session':secret.session,authorization:`Bearer ${secret.authorization}`,cookie:`session=${secret.cookie}`};
+    const base={model:'deepseek-reasoner',metadata:{user_id:secret.metadata},token:secret.token,messages:[{role:'user',content:secret.prompt}]};
+    await post('/v1/chat/completions',{...base,tools},headers);
+    const toolResponse=(await post('/v1/chat/completions',{...base,tools},headers)).json();
+    const call=toolResponse.choices[0].message.tool_calls[0];
+    secret.call=call.id;
+    await post('/v1/chat/completions',{...base,messages:[...base.messages,{role:'assistant',content:null,tool_calls:[call]},{role:'tool',name:'Read',tool_call_id:call.id,content:secret.result}],tools},headers);
+    const recap=(await post('/v1/chat/completions',{...base,messages:[{role:'user',content:'recap request'}]},headers)).json();
+    assert.equal(recap.choices[0].message.tool_calls,undefined);
+    assert.match(recap.choices[0].message.content,/^\{"tool_call"/);
+    await post('/v1/chat/completions',{...base,messages:[{role:'user',content:'retry request'}],tools},headers);
+    await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'other'}],tools},{'x-agent-session':'OTHER_SESSION_SECRET'});
+  });
+  const records=diagnosticRecords(lines);
+  const requests=records.filter(record=>record.event==='tool_request');
+  const responses=records.filter(record=>record.event==='tool_response');
+  assert.equal(requests.length,6);
+  assert.equal(responses.length,6);
+  assert.deepEqual(requests[0].tool_names,['Read','Write','Edit','Grep','Glob']);
+  assert.equal(requests[0].raw_tool_count,5);
+  assert.equal(requests[0].normalized_tool_count,5);
+  assert.equal(requests[3].tools_field_present,false);
+  assert.equal(requests[3].tools_field_shape,'absent');
+  assert.equal(requests[3].raw_tool_count,0);
+  assert.equal(requests[3].normalized_tool_count,0);
+  assert.deepEqual(requests[3].tool_names,[]);
+  assert.equal(new Set(requests.slice(0,5).map(record=>record.session_ref)).size,1);
+  assert.notEqual(requests[0].session_ref,requests[5].session_ref);
+  assert.equal(requests[2].is_tool_continuation,true);
+  assert.equal(requests[2].tool_result_count,1);
+  assert.equal(responses[1].strict_tool_call_detected,true);
+  assert.equal(responses[1].outcome,'tool_call');
+  assert.equal(responses[3].strict_tool_call_detected,false);
+  assert.equal(responses[3].outcome,'final_text');
+  assert.equal(responses[4].reasoning_retry_attempted,true);
+  assert.equal(responses[4].outcome,'final_text');
+  assert.equal(calls.length,7);
+  const journal=lines.join('\n');
+  for(const value of Object.values(secret).filter(Boolean))assert.equal(journal.includes(value),false,value);
+});
+
+test('OpenAI, Anthropic and Responses diagnostics preserve protocol signs and streaming',async()=>{
+  const lines=[];
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async({onDelta})=>{onDelta?.({content:'stream final'});return {content:'stream final',reasoning:'',parentMessageId:null};}},async post=>{
+    const openai=await post('/v1/chat/completions',{model:'deepseek-chat',stream:true,messages:[{role:'user',content:'probe'}],tools:[{type:'function',function:{name:'Read'}}]},{'x-agent-session':'protocol-openai'});
+    const anthropic=await post('/v1/messages',{model:'deepseek-chat',stream:true,messages:[{role:'user',content:'probe'}],tools:[{name:'Grep',input_schema:{type:'object'}}]},{'x-agent-session':'protocol-anthropic'});
+    const responses=await post('/v1/responses',{model:'deepseek-chat',stream:true,input:'probe',tools:[{type:'function',name:'Glob',parameters:{type:'object'}},{type:'other',name:'ignored'}]},{'x-agent-session':'protocol-responses'});
+    assert.match(openai.text,/data: \[DONE\]/);
+    assert.match(anthropic.text,/event: message_stop/);
+    assert.match(responses.text,/event: response\.completed/);
+  });
+  const requests=diagnosticRecords(lines).filter(record=>record.event==='tool_request');
+  assert.deepEqual(requests.map(record=>record.protocol),['openai','anthropic','responses']);
+  assert.deepEqual(requests.map(record=>record.tool_names),[['Read'],['Grep'],['Glob']]);
+  assert.deepEqual(requests.map(record=>record.normalized_tool_count),[1,1,1]);
+  assert.deepEqual(requests.map(record=>record.raw_tool_count),[1,1,2]);
+  assert.ok(requests.every(record=>record.stream===true));
+});
+
+test('diagnostic logger failures do not break an HTTP request',async()=>{
+  await withDiagnosticsServer({logger:()=>{throw new Error('logger failed');},completeImpl:async()=>({content:'safe final',reasoning:'',parentMessageId:null})},async post=>{
+    const response=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'probe'}],tools:[{type:'function',function:{name:'Read'}}]},{'x-agent-session':'private-session'})).json();
+    assert.equal(response.choices[0].message.content,'safe final');
+  });
+});
+
+test('repeated completed tool correction is visible only as a bounded diagnostic flag',async()=>{
+  const lines=[];
+  let calls=0;
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+    calls+=1;
+    if(calls<=2)return {content:jsonToolCall('echo',{text:'same'}),reasoning:'',parentMessageId:`p${calls}`};
+    return {content:'corrected final',reasoning:'',parentMessageId:'p3'};
+  }},async post=>{
+    const tools=[{type:'function',function:{name:'echo',parameters:{type:'object'}}}];
+    const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'echo once'}],tools},{'x-agent-session':'repeat-diagnostic'})).json();
+    const call=first.choices[0].message.tool_calls[0];
+    const second=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'tool',name:'echo',tool_call_id:call.id,content:'same'}],tools},{'x-agent-session':'repeat-diagnostic'})).json();
+    assert.equal(second.choices[0].message.content,'corrected final');
+  });
+  assert.equal(calls,3);
+  const responses=diagnosticRecords(lines).filter(record=>record.event==='tool_response');
+  assert.equal(responses[1].repeated_tool_retry_attempted,true);
+  assert.equal(responses[1].outcome,'final_text');
 });
