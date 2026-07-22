@@ -18,6 +18,18 @@ function parseJson(text, label) {
   catch { throw new Error(`${label}: invalid JSON response`); }
 }
 
+function safeToolDiagnostic(call) {
+  const name = typeof call?.function?.name === 'string' && /^[A-Za-z_][\w.-]{0,127}$/.test(call.function.name) ? call.function.name : 'unknown';
+  const callId = typeof call?.id === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(call.id) ? call.id : 'unknown';
+  let argumentsValue = {};
+  try { argumentsValue = JSON.parse(call?.function?.arguments || '{}'); } catch { argumentsValue = { invalid_json: true }; }
+  const redacted = JSON.stringify(argumentsValue)
+    .replace(/Bearer\s+[^\s"}]+/gi, 'Bearer [REDACTED]')
+    .replace(/("(?:token|cookie|authorization)"\s*:\s*")[^"]*(")/gi, '$1[REDACTED]$2')
+    .slice(0, 1000);
+  return `name=${name} call_id=${callId} arguments=${redacted}`;
+}
+
 function parseOpenAIStream(text) {
   let content = '';
   let done = false;
@@ -80,7 +92,13 @@ async function main() {
     tools: [echoTool],
     stream: false,
   }, 240_000, toolSession)).text, 'tool continuation');
-  if (continued.choices?.[0]?.message?.tool_calls) throw new Error('Tool continuation unexpectedly requested another tool.');
+  const repeatedCall = continued.choices?.[0]?.message?.tool_calls?.[0];
+  if (repeatedCall) {
+    let repeatedArguments = null;
+    try { repeatedArguments = JSON.parse(repeatedCall.function?.arguments || '{}'); } catch {}
+    const exactRepeat = repeatedCall.function?.name === call.function.name && JSON.stringify(repeatedArguments) === JSON.stringify(args);
+    throw new Error(`${exactRepeat ? 'Tool continuation repeated the completed call' : 'Tool continuation unexpectedly requested another tool'}: ${safeToolDiagnostic(repeatedCall)}`);
+  }
   if (continued.choices?.[0]?.message?.content?.trim() !== toolFinalMarker) throw new Error('Tool continuation marker mismatch.');
 
   const responsesMarker = `RESPONSES_OK_${runId}`;

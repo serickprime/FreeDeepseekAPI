@@ -9,6 +9,14 @@ const { SessionStore } = require('./lib/session');
 const { SessionResolver } = require('./lib/session_resolver');
 const { parseToolCallFromOutput, toolPrompt } = require('./lib/tool_parser');
 const { createToolRetryPrompt, hideRetryReasoning, logToolRetry, shouldRetryToolResponse } = require('./lib/tool_retry');
+const {
+  createRepeatedToolCorrectionPrompt,
+  createToolContinuationPrompt,
+  extractToolResults,
+  isExactCompletedToolCall,
+  logRepeatedToolRetry,
+  repeatedToolFailure,
+} = require('./lib/tool_continuation');
 const { createProtocolStream } = require('./lib/api_stream');
 const { estimateTokenCount, validateCountTokensBody } = require('./lib/token_count');
 const { createSetupController } = require('./lib/setup');
@@ -82,7 +90,9 @@ function structuredText(value) {
 }
 
 function sessionToolName(session, callId) {
-  return typeof callId === 'string' && session?.toolCalls instanceof Map ? session.toolCalls.get(callId) || '' : '';
+  if (typeof callId !== 'string' || !(session?.toolCalls instanceof Map)) return '';
+  const stored = session.toolCalls.get(callId);
+  return typeof stored === 'string' ? stored : stored?.name || '';
 }
 
 function rememberToolCall(session, toolCall) {
@@ -90,8 +100,13 @@ function rememberToolCall(session, toolCall) {
   const name = toolCall?.function?.name;
   if (typeof id !== 'string' || typeof name !== 'string') return;
   if (!(session.toolCalls instanceof Map)) session.toolCalls = new Map();
-  session.toolCalls.set(id, name);
+  session.toolCalls.set(id, { name, arguments: toolCall.function.arguments });
   while (session.toolCalls.size > 32) session.toolCalls.delete(session.toolCalls.keys().next().value);
+}
+
+function forgetCompletedToolCalls(session, callIds) {
+  if (!(session?.toolCalls instanceof Map)) return;
+  for (const callId of Array.isArray(callIds) ? callIds : []) session.toolCalls.delete(callId);
 }
 
 function toolCallText(name, callId, argumentsValue) {
@@ -296,6 +311,8 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       const agentKey = resolution.key;
       const session = sessions.get(agentKey);
       const input = normalize(body, kind, session);
+      const toolResults = extractToolResults(body, kind, session).filter(result => result.known);
+      const isToolContinuation = toolResults.length > 0;
       const modelName = String(input.model || 'deepseek-chat').toLowerCase();
       const model = MODELS[modelName];
       if (!model) return sendError(res, 400, 'Unsupported model. See GET /v1/models.');
@@ -304,6 +321,9 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
 
       const allowedTools = input.tools.map(tool => tool?.function?.name).filter(Boolean);
       const hasTools = allowedTools.length > 0;
+      const upstreamPrompt = isToolContinuation
+        ? createToolContinuationPrompt(toolResults, input.tools)
+        : input.prompt + toolPrompt(input.tools);
       let streamIdentity = null;
       if (input.stream) {
         streamIdentity = {
@@ -315,14 +335,16 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       }
 
       let output = await completeImpl({
-        prompt: input.prompt + toolPrompt(input.tools),
+        prompt: upstreamPrompt,
         session,
         model,
         timeoutMs: config.timeoutMs,
         onDelta: input.stream ? delta => stream.delta(delta) : undefined,
       });
       let toolCall = parseToolCallFromOutput(output, allowedTools);
+      let correctiveAttempted = false;
       if (shouldRetryToolResponse({ hasTools, output, toolCall, retryCount: 0 })) {
+        correctiveAttempted = true;
         logToolRetry(logger);
         output = await completeImpl({
           prompt: createToolRetryPrompt(allowedTools),
@@ -334,14 +356,36 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         toolCall = parseToolCallFromOutput(output, allowedTools);
         output = hideRetryReasoning(output, toolCall);
       }
+      if (isToolContinuation && isExactCompletedToolCall(toolCall, toolResults)) {
+        if (!correctiveAttempted) {
+          correctiveAttempted = true;
+          logRepeatedToolRetry(logger);
+          output = await completeImpl({
+            prompt: createRepeatedToolCorrectionPrompt(toolResults, input.tools),
+            session,
+            model: MODELS['deepseek-chat'],
+            timeoutMs: config.timeoutMs,
+            onDelta: input.stream ? delta => stream.delta(delta) : undefined,
+          });
+          toolCall = parseToolCallFromOutput(output, allowedTools);
+          if (!toolCall) output = { ...output, reasoning: '' };
+        }
+        if (isExactCompletedToolCall(toolCall, toolResults)
+          || (!toolCall && !String(output?.content || '').trim())) {
+          output = repeatedToolFailure(output);
+          toolCall = null;
+        }
+      }
+      if (isToolContinuation && !toolCall && output.reasoning) output = { ...output, reasoning: '' };
       resolver.release(resolution.callIds, agentKey);
+      forgetCompletedToolCalls(session, resolution.callIds);
       if (toolCall) {
         rememberToolCall(session, toolCall);
         resolver.bind(toolCall.id, agentKey);
       }
-      if (!toolCall) sessions.add(session, input.prompt, output.content);
+      if (!toolCall) sessions.add(session, upstreamPrompt, output.content);
       const openaiIdentity = streamIdentity && kind === 'openai' ? streamIdentity : {};
-      const openaiResponse = toOpenAI(modelName, input.prompt, output, toolCall, openaiIdentity);
+      const openaiResponse = toOpenAI(modelName, upstreamPrompt, output, toolCall, openaiIdentity);
       const finalResponse = kind === 'anthropic'
         ? toAnthropic(openaiResponse, streamIdentity || {})
         : kind === 'responses' ? toResponses(openaiResponse, streamIdentity || {}) : openaiResponse;
