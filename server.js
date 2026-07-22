@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { assertConfig, cors, authorized, safeError, logSafeError, isLoopback } = require('./lib/security');
 const { SessionStore } = require('./lib/session');
+const { SessionResolver } = require('./lib/session_resolver');
 const { parseToolCallFromOutput, toolPrompt } = require('./lib/tool_parser');
 const { createToolRetryPrompt, hideRetryReasoning, logToolRetry, shouldRetryToolResponse } = require('./lib/tool_retry');
 const { createProtocolStream } = require('./lib/api_stream');
@@ -219,8 +220,9 @@ function toResponses(openaiResponse, identity = {}) {
   };
 }
 
-function createProxyServer({ config = assertConfig(), completeImpl = complete, sessionStore, setupController, logger } = {}) {
+function createProxyServer({ config = assertConfig(), completeImpl = complete, sessionStore, sessionResolver, setupController, logger } = {}) {
   const sessions = sessionStore || new SessionStore({ ttlMs: Number(process.env.SESSION_TTL_MS || 1_800_000) });
+  const resolver = sessionResolver || new SessionResolver();
   const setup = setupController || createSetupController();
 
   const server = http.createServer(async (req, res) => {
@@ -260,15 +262,18 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       if (req.method === 'GET' && url.pathname === '/v1/sessions') return send(res, 200, { data: sessions.list() });
 
       const body = req.method === 'POST' ? await readBody(req, config.maxBytes) : null;
-      const agentKey = sessions.key(req.headers['x-agent-session'] || body?.metadata?.user_id || body?.user || 'default');
       if (req.method === 'POST' && url.pathname === '/reset-session') {
-        sessions.reset(agentKey);
+        const resolution = resolver.resolve({ headers: req.headers, body });
+        sessions.reset(resolution.key);
+        resolver.releaseSession(resolution.key);
         return send(res, 200, { ok: true });
       }
 
       const paths = { '/v1/chat/completions': 'openai', '/v1/responses': 'responses', '/v1/messages': 'anthropic' };
       const kind = paths[url.pathname];
       if (req.method !== 'POST' || !kind) return sendError(res, 404, 'Not found');
+      const resolution = resolver.resolve({ headers: req.headers, body, kind });
+      const agentKey = resolution.key;
       const session = sessions.get(agentKey);
       const input = normalize(body, kind, session);
       const modelName = String(input.model || 'deepseek-chat').toLowerCase();
@@ -309,7 +314,11 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         toolCall = parseToolCallFromOutput(output, allowedTools);
         output = hideRetryReasoning(output, toolCall);
       }
-      if (toolCall) rememberToolCall(session, toolCall);
+      resolver.release(resolution.callIds, agentKey);
+      if (toolCall) {
+        rememberToolCall(session, toolCall);
+        resolver.bind(toolCall.id, agentKey);
+      }
       if (!toolCall) sessions.add(session, input.prompt, output.content);
       const openaiIdentity = streamIdentity && kind === 'openai' ? streamIdentity : {};
       const openaiResponse = toOpenAI(modelName, input.prompt, output, toolCall, openaiIdentity);

@@ -1,5 +1,5 @@
 'use strict';
-const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
+const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
 const {TOOL_RETRY_FAILURE_MESSAGE,createToolRetryPrompt,hideRetryReasoning,shouldRetryToolResponse}=require('../lib/tool_retry');
 const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory}=require('../lib/setup');
 const {runDiagnostics,boundedTimeout}=require('../scripts/doctor');
@@ -16,6 +16,72 @@ test('safe error logging never throws for unusual errors or logger failures',()=
   assert.equal(safeError(unusual),'Internal error');
 });
 test('session expiry/reset and bounded history',()=>{const s=new SessionStore({ttlMs:1,maxHistory:2});const x=s.get('a');s.add(x,'one','a');s.add(x,'two','b');s.add(x,'three','c');assert.equal(x.history.length,2);s.reset('a');assert.equal(s.list().length,0);});
+
+test('session resolver prioritizes and hashes explicit identifiers',()=>{
+  const resolver=new SessionResolver({randomUUID:()=> 'unused'});
+  const header=resolver.resolve({headers:{'x-agent-session':'agent-header'},body:{metadata:{user_id:'metadata-user'},user:'body-user'},kind:'openai'});
+  const metadata=resolver.resolve({body:{metadata:{user_id:'metadata-user'},user:'body-user'},kind:'openai'});
+  const user=resolver.resolve({body:{user:'body-user'},kind:'openai'});
+  assert.equal(header.key,explicitSessionKey('header','agent-header'));
+  assert.equal(metadata.key,explicitSessionKey('metadata','metadata-user'));
+  assert.equal(user.key,explicitSessionKey('user','body-user'));
+  assert.notEqual(header.key,metadata.key);
+  assert.doesNotMatch(`${header.key}${metadata.key}${user.key}`,/agent-header|metadata-user|body-user/);
+  assert.equal(resolver.resolve({body:{metadata:{user_id:'metadata-user'}},kind:'openai'}).key,metadata.key);
+});
+
+test('anonymous session resolution is unique and never uses default',()=>{
+  let sequence=0;
+  const resolver=new SessionResolver({randomUUID:()=>`request-${++sequence}`});
+  const first=resolver.resolve({kind:'openai'});
+  const second=resolver.resolve({kind:'openai'});
+  assert.equal(first.key,'anonymous:request-1');
+  assert.equal(second.key,'anonymous:request-2');
+  assert.notEqual(first.key,second.key);
+  assert.notEqual(first.key,'default');
+  assert.notEqual(second.key,'default');
+});
+
+test('tool result call ids are extracted only from their supported protocols',()=>{
+  assert.deepEqual(extractToolResultCallIds({messages:[{role:'tool',tool_call_id:'call_openai'}]},'openai'),['call_openai']);
+  assert.deepEqual(extractToolResultCallIds({messages:[{role:'user',content:[{type:'tool_result',tool_use_id:'call_anthropic'}]}]},'anthropic'),['call_anthropic']);
+  assert.deepEqual(extractToolResultCallIds({input:[{type:'function_call_output',call_id:'call_responses'}]},'responses'),['call_responses']);
+  assert.deepEqual(extractToolResultCallIds({messages:[{role:'user',tool_call_id:'ignored'}]},'openai'),[]);
+});
+
+test('call-id links expire, are bounded and reject unsafe identifiers',()=>{
+  let now=100;
+  let sequence=0;
+  const resolver=new SessionResolver({ttlMs:10,maxLinks:2,now:()=>now,randomUUID:()=>`fresh-${++sequence}`});
+  assert.equal(resolver.bind('call-a','anonymous:one'),true);
+  assert.equal(resolver.resolve({kind:'openai',body:{messages:[{role:'tool',tool_call_id:'call-a'}]}}).key,'anonymous:one');
+  resolver.bind('call-b','anonymous:two');
+  resolver.bind('call-c','anonymous:three');
+  assert.equal(resolver.size,2);
+  assert.equal(resolver.resolve({kind:'openai',body:{messages:[{role:'tool',tool_call_id:'call-a'}]}}).source,'anonymous');
+  now=111;
+  assert.equal(resolver.resolve({kind:'openai',body:{messages:[{role:'tool',tool_call_id:'call-b'}]}}).source,'anonymous');
+  assert.equal(resolver.size,0);
+  assert.equal(normalizeCallId('x'.repeat(129)),null);
+  assert.equal(normalizeCallId('../unsafe'),null);
+  assert.equal(resolver.bind('x'.repeat(129),'anonymous:four'),false);
+  const oversizedSession=resolver.resolve({headers:{'x-agent-session':'s'.repeat(129)},body:{metadata:{user_id:'must-not-fallback'}},kind:'openai'});
+  assert.equal(oversizedSession.source,'anonymous');
+  assert.doesNotMatch(oversizedSession.key,/must-not-fallback|s{20}/);
+});
+
+test('session store has bounded memory and no implicit default key',()=>{
+  let now=0;
+  const sessions=new SessionStore({maxSessions:2,ttlMs:10,now:()=>now});
+  sessions.get('anonymous:one');
+  now=1;sessions.get('anonymous:two');
+  now=2;sessions.get('anonymous:three');
+  assert.equal(sessions.list().length,2);
+  assert.equal(sessions.list().some(item=>item.key==='anonymous:one'),false);
+  now=20;
+  assert.equal(sessions.list().length,0);
+  assert.notEqual(sessions.key(),'default');
+});
 const jsonToolCall=(name='read_file',args={path:'package.json'})=>JSON.stringify({tool_call:{name,arguments:args}});
 const xmlToolCall=(name='read_file',args={path:'package.json'})=>`<tool_call>${JSON.stringify({name,arguments:args})}</tool_call>`;
 
@@ -397,9 +463,9 @@ test('ordinary responses without tools and rejected tool-like text stay normal r
   }
 });
 
-async function toolRetryProxyCase({path='/v1/chat/completions',body,completeImpl,logger,sessionStore,headers={}}){
+async function toolRetryProxyCase({path='/v1/chat/completions',body,completeImpl,logger,sessionStore,sessionResolver,headers={}}){
   const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
-  const server=createProxyServer({config,completeImpl,logger,sessionStore});
+  const server=createProxyServer({config,completeImpl,logger,sessionStore,sessionResolver});
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   try{
     const response=await fetch(`http://127.0.0.1:${server.address().port}${path}`,{method:'POST',headers:{'content-type':'application/json',...headers},body:JSON.stringify(body)});
@@ -427,8 +493,10 @@ test('tool retry is skipped without tools, after a first tool call, and after fi
 test('reasoning-only tool response causes one same-session retry in chat mode with allowed tools',async()=>{
   const calls=[];
   const logs=[];
+  const sessions=new SessionStore();
   const firstReasoning='PRIVATE_FIRST_REASONING_NEED_READ';
   const result=await toolRetryProxyCase({
+    sessionStore:sessions,
     body:{model:'deepseek-reasoner-search',messages:[{role:'user',content:'read package'}],tools:[{type:'function',function:{name:'read_file',parameters:{type:'object'}}}]},
     logger:line=>logs.push(line),
     completeImpl:async options=>{
@@ -445,6 +513,9 @@ test('reasoning-only tool response causes one same-session retry in chat mode wi
   assert.equal(calls[1].model.search,false);
   assert.equal(calls[1].session,calls[0].session);
   assert.equal(calls[1].session.id,'remote-session');
+  assert.equal(sessions.list().length,1);
+  assert.match(sessions.list()[0].key,/^anonymous:/);
+  assert.notEqual(sessions.list()[0].key,'default');
   assert.match(calls[1].prompt,/\["read_file"\]/);
   assert.doesNotMatch(calls[1].prompt,new RegExp(firstReasoning));
   assert.equal(response.model,'deepseek-reasoner-search');
@@ -457,17 +528,18 @@ test('final text from the second attempt is returned and only it enters local hi
   const sessions=new SessionStore();
   const firstReasoning='PRIVATE_INTERMEDIATE_REASONING';
   let calls=0;
+  let resolvedSession;
   const result=await toolRetryProxyCase({
     sessionStore:sessions,headers:{'x-agent-session':'retry-history'},logger:()=>{},
     body:{model:'deepseek-reasoner',messages:[{role:'user',content:'finish'}],tools:[{type:'function',function:{name:'read_file'}}]},
-    completeImpl:async()=>{calls+=1;return calls===1?{content:'',reasoning:firstReasoning,parentMessageId:'one'}:{content:'final answer after retry',reasoning:'should stay private',parentMessageId:'two'};},
+    completeImpl:async options=>{calls+=1;resolvedSession=options.session;return calls===1?{content:'',reasoning:firstReasoning,parentMessageId:'one'}:{content:'final answer after retry',reasoning:'should stay private',parentMessageId:'two'};},
   });
   const response=JSON.parse(result.text);
   assert.equal(calls,2);
   assert.equal(response.choices[0].message.content,'final answer after retry');
   assert.equal(response.choices[0].message.reasoning_content,undefined);
   assert.doesNotMatch(result.text,new RegExp(firstReasoning));
-  const history=sessions.get('retry-history').history;
+  const history=resolvedSession.history;
   assert.equal(history.length,1);
   assert.equal(history[0].assistant,'final answer after retry');
   assert.doesNotMatch(JSON.stringify(history),/PRIVATE_INTERMEDIATE_REASONING|should stay private/);
@@ -538,13 +610,14 @@ test('Responses streaming emits function_call only after a successful retry',()=
   /"type":"function_call"/
 ));
 
-async function withAgenticCycleServer(completeImpl,run){
-  const sessions=new SessionStore();
+async function withAgenticCycleServer(completeImpl,run,{sessions=new SessionStore(),sessionResolver}={}){
   const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
-  const server=createProxyServer({config,sessionStore:sessions,logger:()=>{},completeImpl});
+  const server=createProxyServer({config,sessionStore:sessions,sessionResolver,logger:()=>{},completeImpl});
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const post=async(path,body,agentSession)=>{
-    const response=await fetch(`http://127.0.0.1:${server.address().port}${path}`,{method:'POST',headers:{'content-type':'application/json','x-agent-session':agentSession},body:JSON.stringify(body)});
+    const headers={'content-type':'application/json'};
+    if(agentSession!==undefined)headers['x-agent-session']=agentSession;
+    const response=await fetch(`http://127.0.0.1:${server.address().port}${path}`,{method:'POST',headers,body:JSON.stringify(body)});
     const responseText=await response.text();
     assert.equal(response.status,200,responseText);
     return {contentType:response.headers.get('content-type'),text:responseText,json:()=>JSON.parse(responseText)};
@@ -567,7 +640,7 @@ test('OpenAI tool result continuation preserves name, call id, result, session a
     const tools=[{type:'function',function:{name:'echo',parameters:{type:'object'}}}];
     const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'use echo'}],tools},'openai-cycle')).json();
     const call=first.choices[0].message.tool_calls[0];
-    assert.equal(sessions.get('openai-cycle').history.length,0);
+    assert.equal(calls[0].session.history.length,0);
     const second=await post('/v1/chat/completions',{model:'deepseek-chat',stream:true,messages:[
       {role:'user',content:'use echo'},
       {role:'assistant',content:null,tool_calls:[call]},
@@ -581,8 +654,8 @@ test('OpenAI tool result continuation preserves name, call id, result, session a
     assert.match(second.contentType,/^text\/event-stream/);
     assert.match(second.text,new RegExp(marker));
     assert.doesNotMatch(second.text,/PRIVATE_FIRST_REASONING/);
-    assert.equal(sessions.get('openai-cycle').history.length,1);
-    assert.equal(sessions.get('openai-cycle').history[0].assistant,marker);
+    assert.equal(calls[0].session.history.length,1);
+    assert.equal(calls[0].session.history[0].assistant,marker);
   });
 });
 
@@ -598,7 +671,7 @@ test('Anthropic tool_result continuation preserves tool_use id, name and result'
     const first=(await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'use echo'}],tools},'anthropic-cycle')).json();
     const call=first.content[0];
     assert.equal(call.type,'tool_use');
-    assert.equal(sessions.get('anthropic-cycle').history.length,0);
+    assert.equal(calls[0].session.history.length,0);
     const second=(await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:[
       {role:'user',content:'use echo'},
       {role:'assistant',content:[call]},
@@ -626,7 +699,7 @@ test('Responses function_call_output continuation preserves call id, name and re
     const first=(await post('/v1/responses',{model:'deepseek-chat',input:'use echo',tools},'responses-cycle')).json();
     const call=first.output[0];
     assert.equal(call.type,'function_call');
-    assert.equal(sessions.get('responses-cycle').history.length,0);
+    assert.equal(calls[0].session.history.length,0);
     const second=(await post('/v1/responses',{model:'deepseek-chat',previous_response_id:first.id,input:[
       {type:'function_call_output',call_id:call.call_id,output:'client executed echo safely'},
     ],tools},'responses-cycle')).json();
@@ -679,6 +752,131 @@ test('different x-agent-session values never share the same session object',asyn
     await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'agent A'}]},'agent-A');
     assert.notEqual(seen.get('A'),seen.get('B'));
   });
+});
+
+test('metadata.user_id, user and x-agent-session select stable sessions with header priority',async()=>{
+  const calls=[];
+  await withAgenticCycleServer(async options=>{calls.push(options);return {content:'ok',reasoning:'',parentMessageId:String(calls.length)};},async({post})=>{
+    const request=(label,extra={},header)=>post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:label}],...extra},header);
+    await request('metadata one',{metadata:{user_id:'metadata-id'}});
+    await request('metadata two',{metadata:{user_id:'metadata-id'}});
+    await request('user one',{user:'user-id'});
+    await request('user two',{user:'user-id'});
+    await request('header one',{metadata:{user_id:'metadata-a'},user:'user-a'},'header-id');
+    await request('header two',{metadata:{user_id:'metadata-b'},user:'user-b'},'header-id');
+  });
+  assert.equal(calls[0].session,calls[1].session);
+  assert.equal(calls[2].session,calls[3].session);
+  assert.equal(calls[4].session,calls[5].session);
+  assert.notEqual(calls[0].session,calls[2].session);
+  assert.notEqual(calls[0].session,calls[4].session);
+});
+
+test('sequential and parallel anonymous HTTP requests always use isolated sessions',async()=>{
+  const calls=[];
+  await withAgenticCycleServer(async options=>{calls.push(options);return {content:'anonymous final',reasoning:'',parentMessageId:null};},async({post})=>{
+    const body=label=>({model:'deepseek-chat',messages:[{role:'user',content:label}]});
+    await post('/v1/chat/completions',body('anonymous one'));
+    await post('/v1/chat/completions',body('anonymous two'));
+    await Promise.all([
+      post('/v1/chat/completions',body('anonymous parallel A')),
+      post('/v1/chat/completions',body('anonymous parallel B')),
+    ]);
+  });
+  assert.equal(calls.length,4);
+  assert.equal(new Set(calls.map(call=>call.session)).size,4);
+});
+
+async function anonymousToolContinuationCase(kind){
+  const calls=[];
+  const resolver=new SessionResolver();
+  await withAgenticCycleServer(async options=>{
+    calls.push(options);
+    if(calls.length===1){options.session.id=`remote-${kind}`;options.session.parentMessageId='parent-tool';return {content:jsonToolCall('echo',{value:kind}),reasoning:'',parentMessageId:'parent-tool'};}
+    return {content:`${kind} final`,reasoning:'',parentMessageId:'parent-final'};
+  },async({post})=>{
+    if(kind==='openai'){
+      const tools=[{type:'function',function:{name:'echo',parameters:{type:'object'}}}];
+      const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'use echo'}],tools})).json();
+      const call=first.choices[0].message.tool_calls[0];
+      assert.equal(resolver.size,1);
+      const second=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'tool',name:'echo',tool_call_id:call.id,content:'openai result'}],tools})).json();
+      assert.equal(second.choices[0].message.content,'openai final');
+    }else if(kind==='anthropic'){
+      const tools=[{name:'echo',input_schema:{type:'object'}}];
+      const first=(await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'use echo'}],tools})).json();
+      const call=first.content[0];
+      assert.equal(resolver.size,1);
+      const second=(await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:[{type:'tool_result',tool_use_id:call.id,content:'anthropic result'}]}],tools})).json();
+      assert.equal(second.content[0].text,'anthropic final');
+    }else{
+      const tools=[{type:'function',name:'echo',parameters:{type:'object'}}];
+      const first=(await post('/v1/responses',{model:'deepseek-chat',input:'use echo',tools})).json();
+      const call=first.output[0];
+      assert.equal(resolver.size,1);
+      const second=(await post('/v1/responses',{model:'deepseek-chat',input:[{type:'function_call_output',call_id:call.call_id,output:'responses result'}],tools})).json();
+      assert.equal(second.output[0].content[0].text,'responses final');
+    }
+  },{sessionResolver:resolver});
+  assert.equal(calls.length,2);
+  assert.equal(calls[0].session,calls[1].session);
+  assert.equal(calls[1].session.parentMessageId,'parent-tool');
+  assert.equal(resolver.size,0);
+}
+
+test('anonymous tool results resume their bound OpenAI, Anthropic and Responses sessions',async t=>{
+  await t.test('OpenAI tool_call_id',()=>anonymousToolContinuationCase('openai'));
+  await t.test('Anthropic tool_use_id',()=>anonymousToolContinuationCase('anthropic'));
+  await t.test('Responses call_id',()=>anonymousToolContinuationCase('responses'));
+});
+
+test('unknown and expired call ids start new isolated sessions',async t=>{
+  await t.test('unknown call id',async()=>{
+    const calls=[];
+    const resolver=new SessionResolver();
+    await withAgenticCycleServer(async options=>{calls.push(options);return calls.length===1?{content:jsonToolCall('echo',{}),reasoning:'',parentMessageId:'tool'}:{content:'safe final',reasoning:'',parentMessageId:'final'};},async({post})=>{
+      const tools=[{type:'function',function:{name:'echo'}}];
+      await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'use echo'}],tools});
+      await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'tool',name:'echo',tool_call_id:'call_unknown',content:'unknown result'}],tools});
+    },{sessionResolver:resolver});
+    assert.notEqual(calls[0].session,calls[1].session);
+  });
+  await t.test('expired call id',async()=>{
+    let now=0;
+    const calls=[];
+    const resolver=new SessionResolver({ttlMs:5,now:()=>now});
+    let callId;
+    await withAgenticCycleServer(async options=>{calls.push(options);return calls.length===1?{content:jsonToolCall('echo',{}),reasoning:'',parentMessageId:'tool'}:{content:'safe final',reasoning:'',parentMessageId:'final'};},async({post})=>{
+      const tools=[{type:'function',function:{name:'echo'}}];
+      const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'use echo'}],tools})).json();
+      callId=first.choices[0].message.tool_calls[0].id;
+      now=6;
+      await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'tool',name:'echo',tool_call_id:callId,content:'late result'}],tools});
+    },{sessionResolver:resolver});
+    assert.notEqual(calls[0].session,calls[1].session);
+    assert.equal(resolver.size,0);
+  });
+});
+
+test('/v1/sessions exposes only bounded opaque keys and session metadata',async()=>{
+  const sessions=new SessionStore();
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,sessionStore:sessions,logger:()=>{},completeImpl:async()=>({content:'safe final',reasoning:'',parentMessageId:null})});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const secretSession='Bearer-session-secret';
+  const secretPrompt='PRIVATE_FILE_CONTENT_MARKER';
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json','x-agent-session':secretSession,authorization:'Bearer authorization-secret',cookie:'session=cookie-secret'},body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content:secretPrompt}]})});
+    assert.equal(response.status,200);
+    const listing=await (await fetch(`http://127.0.0.1:${server.address().port}/v1/sessions`)).text();
+    assert.doesNotMatch(listing,/Bearer-session-secret|authorization-secret|cookie-secret|PRIVATE_FILE_CONTENT_MARKER|token|cookie|authorization|default/i);
+    const parsed=JSON.parse(listing);
+    assert.match(parsed.data[0].key,/^explicit:header:[a-f0-9]{32}$/);
+    assert.deepEqual(Object.keys(parsed.data[0]).sort(),['key','remote_session','turns','updated_at'].sort());
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
 });
 
 test('Bridge logs the safe upstream reason while streaming clients receive no secrets',async()=>{
