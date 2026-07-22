@@ -10,6 +10,7 @@ const { SessionResolver } = require('./lib/session_resolver');
 const { parseToolCallFromOutput, toolPrompt } = require('./lib/tool_parser');
 const { createToolRetryPrompt, hideRetryReasoning, logToolRetry, shouldRetryToolResponse } = require('./lib/tool_retry');
 const { createProtocolStream } = require('./lib/api_stream');
+const { estimateTokenCount, validateCountTokensBody } = require('./lib/token_count');
 const { createSetupController } = require('./lib/setup');
 const { MODELS } = require('./lib/models');
 const { complete } = require('./client');
@@ -21,6 +22,10 @@ function send(res, status, body, headers = {}) {
 
 function sendError(res, status, message, type = 'invalid_request_error') {
   send(res, status, { error: { message, type, code: status } });
+}
+
+function sendAnthropicError(res, status, message, type = 'invalid_request_error') {
+  send(res, status, { type: 'error', error: { type, message } });
 }
 
 const STATIC_FILES = {
@@ -227,11 +232,18 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
 
   const server = http.createServer(async (req, res) => {
     let stream = null;
+    let requestPath = '';
     try {
-      if (!cors(req, res, config.origins)) return sendError(res, 403, 'Origin is not allowed');
-      if (req.method === 'OPTIONS') return res.writeHead(204).end();
       const url = new URL(req.url, 'http://localhost');
-      if (!authorized(req, config.key, !isLoopback(config.host))) return sendError(res, 401, 'Invalid local proxy API key', 'authentication_error');
+      requestPath = url.pathname;
+      const countTokensRequest = requestPath === '/v1/messages/count_tokens';
+      if (!cors(req, res, config.origins)) return countTokensRequest
+        ? sendAnthropicError(res, 403, 'Origin is not allowed', 'permission_error')
+        : sendError(res, 403, 'Origin is not allowed');
+      if (req.method === 'OPTIONS') return res.writeHead(204).end();
+      if (!authorized(req, config.key, !isLoopback(config.host))) return countTokensRequest
+        ? sendAnthropicError(res, 401, 'Invalid local proxy API key', 'authentication_error')
+        : sendError(res, 401, 'Invalid local proxy API key', 'authentication_error');
 
       if (req.method === 'GET' && url.pathname === '/') {
         res.writeHead(302, { location: '/setup', 'cache-control': 'no-store' });
@@ -260,8 +272,16 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         return send(res, 200, Object.fromEntries(Object.entries(MODELS).map(([name, model]) => [name, { available: model.available, reasoning: model.reasoning, web_search: model.search, upstream: model.label }])));
       }
       if (req.method === 'GET' && url.pathname === '/v1/sessions') return send(res, 200, { data: sessions.list() });
+      if (url.pathname === '/v1/messages/count_tokens' && req.method !== 'POST') {
+        return sendAnthropicError(res, 405, 'Only POST is supported for this endpoint.');
+      }
 
       const body = req.method === 'POST' ? await readBody(req, config.maxBytes) : null;
+      if (req.method === 'POST' && url.pathname === '/v1/messages/count_tokens') {
+        const validationError = validateCountTokensBody(body);
+        if (validationError) return sendAnthropicError(res, 400, validationError);
+        return send(res, 200, { input_tokens: estimateTokenCount(body) }, { 'x-deepseek-bridge-token-count': 'estimate' });
+      }
       if (req.method === 'POST' && url.pathname === '/reset-session') {
         const resolution = resolver.resolve({ headers: req.headers, body });
         sessions.reset(resolution.key);
@@ -331,6 +351,10 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       logSafeError(error, logger);
       if (stream) return stream.fail('DeepSeek streaming request failed. Run npm run doctor or re-authenticate.');
       const status = error.status || (error.name === 'TimeoutError' ? 504 : 502);
+      if (requestPath === '/v1/messages/count_tokens') {
+        const type = status === 413 ? 'request_too_large' : status === 400 ? 'invalid_request_error' : 'api_error';
+        return sendAnthropicError(res, status, status >= 500 ? 'Local token estimation failed.' : safeError(error), type);
+      }
       const message = status >= 500 ? 'DeepSeek request failed. Run npm run doctor or re-authenticate.' : safeError(error);
       return sendError(res, status, message, status === 504 ? 'request_timeout' : 'upstream_error');
     }

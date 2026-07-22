@@ -1,5 +1,5 @@
 'use strict';
-const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
+const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
 const {TOOL_RETRY_FAILURE_MESSAGE,createToolRetryPrompt,hideRetryReasoning,shouldRetryToolResponse}=require('../lib/tool_retry');
 const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory}=require('../lib/setup');
 const {runDiagnostics,boundedTimeout}=require('../scripts/doctor');
@@ -81,6 +81,60 @@ test('session store has bounded memory and no implicit default key',()=>{
   now=20;
   assert.equal(sessions.list().length,0);
   assert.notEqual(sessions.key(),'default');
+});
+
+test('token text estimate is deterministic and accounts for multilingual text and emoji',()=>{
+  const english=estimateTextTokens('token probe in ordinary English');
+  const russian=estimateTextTokens('Проверка количества токенов');
+  const chinese=estimateTextTokens('你好世界');
+  const emoji=estimateTextTokens('😀');
+  assert.ok(Number.isInteger(english)&&english>0);
+  assert.ok(russian>=8);
+  assert.ok(chinese>=4);
+  assert.ok(emoji>=2);
+  assert.equal(estimateTextTokens('Проверка количества токенов'),russian);
+});
+
+test('token estimate includes system, messages and Anthropic content blocks',()=>{
+  const base={model:'deepseek-chat',messages:[{role:'user',content:'hello'}]};
+  const simple=estimateTokenCount(base);
+  const rich=estimateTokenCount({
+    ...base,
+    system:[{type:'text',text:'system rules'}],
+    messages:[
+      {role:'user',content:[{type:'text',text:'hello'},{type:'image',source:{type:'base64',data:'not-counted'}}]},
+      {role:'assistant',content:[{type:'thinking',thinking:'consider safely'},{type:'tool_use',id:'toolu_1',name:'read_file',input:{path:'package.json'}}]},
+      {role:'user',content:[{type:'tool_result',tool_use_id:'toolu_1',content:[{type:'text',text:'result text'}]},{type:'future_block',payload:'opaque'}]},
+    ],
+  });
+  assert.ok(Number.isInteger(rich)&&rich>=0);
+  assert.ok(rich>simple+IMAGE_BLOCK_TOKENS+UNKNOWN_BLOCK_TOKENS);
+});
+
+test('token estimate includes tool names, descriptions and nested JSON Schema',()=>{
+  const withoutTools=estimateTokenCount({model:'deepseek-chat',messages:[]});
+  const withTools=estimateTokenCount({model:'deepseek-chat',messages:[],tools:[{
+    name:'read_file',description:'Read a local text file safely',input_schema:{type:'object',properties:{path:{type:'string'},options:{type:'object',properties:{encoding:{type:'string'},ranges:{type:'array',items:{type:'number'}}}}},required:['path']},
+  }]});
+  assert.ok(withTools>withoutTools);
+});
+
+test('token estimator bounds deep, cyclic and unusual structures',()=>{
+  const cycle={type:'object'};cycle.self=cycle;
+  let deep={value:'end'};for(let index=0;index<MAX_TOKEN_DEPTH+20;index++)deep={nested:deep};
+  const body={model:'deepseek-chat',messages:[{role:'user',content:[{type:'image',source:cycle},{type:'unknown',payload:cycle}]}],tools:[{name:'safe_tool',input_schema:{cycle,deep}}]};
+  const first=estimateTokenCount(body);
+  const second=estimateTokenCount(body);
+  assert.ok(Number.isInteger(first)&&first>=IMAGE_BLOCK_TOKENS);
+  assert.equal(first,second);
+});
+
+test('count_tokens body validation requires the confirmed Anthropic contract',()=>{
+  assert.match(validateCountTokensBody({}),/model is required/);
+  assert.match(validateCountTokensBody({model:'deepseek-chat'}),/messages is required/);
+  assert.match(validateCountTokensBody({model:'deepseek-chat',messages:[],system:{}}),/system must/);
+  assert.match(validateCountTokensBody({model:'deepseek-chat',messages:[],tools:{}}),/tools must/);
+  assert.equal(validateCountTokensBody({model:'deepseek-chat',messages:[]}),null);
 });
 const jsonToolCall=(name='read_file',args={path:'package.json'})=>JSON.stringify({tool_call:{name,arguments:args}});
 const xmlToolCall=(name='read_file',args={path:'package.json'})=>`<tool_call>${JSON.stringify({name,arguments:args})}</tool_call>`;
@@ -877,6 +931,93 @@ test('/v1/sessions exposes only bounded opaque keys and session metadata',async(
     server.closeAllConnections?.();
     await new Promise(resolve=>server.close(resolve));
   }
+});
+
+async function withCountTokensServer(run,{maxBytes=1024*1024,host='127.0.0.1',key=''}={}){
+  const sessions=new SessionStore();
+  let completionCalls=0;
+  const config={host,port:0,key,maxBytes,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,sessionStore:sessions,logger:()=>{},completeImpl:async()=>{completionCalls+=1;return {content:'unexpected',reasoning:'',parentMessageId:null};}});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const request=async({method='POST',body,raw,headers={}}={})=>{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/messages/count_tokens`,{method,headers:{...(method==='POST'?{'content-type':'application/json'}:{}),...headers},...(method==='POST'?{body:raw===undefined?JSON.stringify(body):raw}:{})});
+    const text=await response.text();
+    return {status:response.status,headers:response.headers,text,json:()=>JSON.parse(text)};
+  };
+  try{return await run({request,sessions,getCompletionCalls:()=>completionCalls,port:server.address().port});}
+  finally{server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
+}
+
+test('POST /v1/messages/count_tokens returns a local Anthropic-compatible estimate',async()=>{
+  await withCountTokensServer(async({request,sessions,getCompletionCalls})=>{
+    const body={
+      model:'deepseek-chat',
+      system:[{type:'text',text:'system prompt'}],
+      messages:[
+        {role:'user',content:[{type:'text',text:'English русский 中文 😀'}]},
+        {role:'assistant',content:[{type:'thinking',thinking:'private thought'},{type:'tool_use',id:'toolu_local',name:'echo',input:{value:'probe'}}]},
+        {role:'user',content:[{type:'tool_result',tool_use_id:'toolu_local',content:'probe result'}]},
+      ],
+      tools:[{name:'echo',description:'Return a value',input_schema:{type:'object',properties:{value:{type:'string'}}}}],
+    };
+    const result=await request({body});
+    assert.equal(result.status,200,result.text);
+    assert.equal(result.headers.get('x-deepseek-bridge-token-count'),'estimate');
+    assert.deepEqual(Object.keys(result.json()),['input_tokens']);
+    assert.ok(Number.isInteger(result.json().input_tokens));
+    assert.ok(result.json().input_tokens>=0);
+    assert.equal(getCompletionCalls(),0);
+    assert.equal(sessions.list().length,0);
+  });
+});
+
+test('count_tokens handles empty, malformed, wrong-method and secret-bearing requests safely',async()=>{
+  await withCountTokensServer(async({request,sessions,getCompletionCalls})=>{
+    const empty=await request({body:{}});
+    assert.equal(empty.status,400);
+    assert.deepEqual(empty.json(),{type:'error',error:{type:'invalid_request_error',message:'model is required and must be a non-empty string.'}});
+    const malformed=await request({raw:'{"model":"deepseek-chat","messages":['});
+    assert.equal(malformed.status,400);
+    assert.equal(malformed.json().type,'error');
+    assert.equal(malformed.json().error.type,'invalid_request_error');
+    const method=await request({method:'GET'});
+    assert.equal(method.status,405);
+    const secret='Bearer bearer-secret token=token-secret cookie=cookie-secret authorization=auth-secret';
+    const invalid=await request({body:{model:{secret},messages:[]},headers:{authorization:secret}});
+    assert.equal(invalid.status,400);
+    assert.doesNotMatch(invalid.text,/bearer-secret|token-secret|cookie-secret|auth-secret/);
+    assert.equal(getCompletionCalls(),0);
+    assert.equal(sessions.list().length,0);
+  });
+});
+
+test('count_tokens keeps the existing request-size limit',async()=>{
+  await withCountTokensServer(async({request,sessions,getCompletionCalls})=>{
+    const result=await request({body:{model:'deepseek-chat',messages:[{role:'user',content:'x'.repeat(512)}]}});
+    assert.equal(result.status,413);
+    assert.equal(result.json().type,'error');
+    assert.equal(result.json().error.type,'request_too_large');
+    assert.equal(getCompletionCalls(),0);
+    assert.equal(sessions.list().length,0);
+  },{maxBytes:128});
+});
+
+test('count_tokens reuses local authorization and CORS enforcement',async()=>{
+  const key='local-count-key-that-is-long-enough';
+  await withCountTokensServer(async({request,getCompletionCalls})=>{
+    const body={model:'deepseek-chat',messages:[]};
+    const unauthorized=await request({body});
+    assert.equal(unauthorized.status,401);
+    assert.equal(unauthorized.json().type,'error');
+    assert.equal(unauthorized.json().error.type,'authentication_error');
+    const forbidden=await request({body,headers:{authorization:`Bearer ${key}`,origin:'https://localhost.evil.example'}});
+    assert.equal(forbidden.status,403);
+    assert.equal(forbidden.json().error.type,'permission_error');
+    const allowed=await request({body,headers:{authorization:`Bearer ${key}`,origin:'http://localhost:3000'}});
+    assert.equal(allowed.status,200);
+    assert.equal(allowed.headers.get('access-control-allow-origin'),'http://localhost:3000');
+    assert.equal(getCompletionCalls(),0);
+  },{host:'0.0.0.0',key});
 });
 
 test('Bridge logs the safe upstream reason while streaming clients receive no secrets',async()=>{
