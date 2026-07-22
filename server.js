@@ -4,10 +4,21 @@ const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { assertConfig, cors, authorized, safeError, isLoopback } = require('./lib/security');
+const { assertConfig, cors, authorized, safeError, logSafeError, isLoopback } = require('./lib/security');
 const { SessionStore } = require('./lib/session');
-const { parseToolCall, toolPrompt } = require('./lib/tool_parser');
+const { SessionResolver } = require('./lib/session_resolver');
+const { parseToolCallFromOutput, toolPrompt } = require('./lib/tool_parser');
+const { createToolRetryPrompt, hideRetryReasoning, logToolRetry, shouldRetryToolResponse } = require('./lib/tool_retry');
+const {
+  createRepeatedToolCorrectionPrompt,
+  createToolContinuationPrompt,
+  extractToolResults,
+  isExactCompletedToolCall,
+  logRepeatedToolRetry,
+  repeatedToolFailure,
+} = require('./lib/tool_continuation');
 const { createProtocolStream } = require('./lib/api_stream');
+const { estimateTokenCount, validateCountTokensBody } = require('./lib/token_count');
 const { createSetupController } = require('./lib/setup');
 const { MODELS } = require('./lib/models');
 const { complete } = require('./client');
@@ -19,6 +30,10 @@ function send(res, status, body, headers = {}) {
 
 function sendError(res, status, message, type = 'invalid_request_error') {
   send(res, status, { error: { message, type, code: status } });
+}
+
+function sendAnthropicError(res, status, message, type = 'invalid_request_error') {
+  send(res, status, { type: 'error', error: { type, message } });
 }
 
 const STATIC_FILES = {
@@ -69,24 +84,91 @@ function text(value) {
   return value.map(item => typeof item === 'string' ? item : item?.text || item?.content || '').join('\n');
 }
 
-function anthropicMessageText(message) {
+function structuredText(value) {
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value ?? {}); } catch { return '{}'; }
+}
+
+function sessionToolName(session, callId) {
+  if (typeof callId !== 'string' || !(session?.toolCalls instanceof Map)) return '';
+  const stored = session.toolCalls.get(callId);
+  return typeof stored === 'string' ? stored : stored?.name || '';
+}
+
+function rememberToolCall(session, toolCall) {
+  const id = toolCall?.id;
+  const name = toolCall?.function?.name;
+  if (typeof id !== 'string' || typeof name !== 'string') return;
+  if (!(session.toolCalls instanceof Map)) session.toolCalls = new Map();
+  session.toolCalls.set(id, { name, arguments: toolCall.function.arguments });
+  while (session.toolCalls.size > 32) session.toolCalls.delete(session.toolCalls.keys().next().value);
+}
+
+function forgetCompletedToolCalls(session, callIds) {
+  if (!(session?.toolCalls instanceof Map)) return;
+  for (const callId of Array.isArray(callIds) ? callIds : []) session.toolCalls.delete(callId);
+}
+
+function toolCallText(name, callId, argumentsValue) {
+  return `[Tool Call]\nname: ${name || 'unknown'}\ncall_id: ${callId || 'unknown'}\narguments: ${structuredText(argumentsValue)}`;
+}
+
+function toolResultText(name, callId, result) {
+  return `[Tool Result]\nname: ${name || 'unknown'}\ncall_id: ${callId || 'unknown'}\nresult:\n${typeof result === 'string' ? result : structuredText(result)}`;
+}
+
+function openAIMessageText(message, session) {
+  const role = String(message?.role || 'user');
+  if (role === 'tool') {
+    const callId = message.tool_call_id || '';
+    return `${role}: ${toolResultText(message.name || sessionToolName(session, callId), callId, text(message.content))}`;
+  }
+  const parts = [];
+  const content = text(message?.content);
+  if (content) parts.push(`${role}: ${content}`);
+  for (const call of Array.isArray(message?.tool_calls) ? message.tool_calls : []) {
+    const callId = call?.id || '';
+    parts.push(`${role}: ${toolCallText(call?.function?.name || sessionToolName(session, callId), callId, call?.function?.arguments)}`);
+  }
+  return parts.join('\n');
+}
+
+function anthropicMessageText(message, session) {
   if (!Array.isArray(message.content)) return text(message.content);
   return message.content.map(block => {
     if (!block || typeof block !== 'object') return '';
     if (block.type === 'text' || block.type === 'thinking') return text(block.text || block.thinking);
-    if (block.type === 'tool_use') return `TOOL_CALL: ${block.name}\narguments: ${JSON.stringify(block.input || {})}`;
-    if (block.type === 'tool_result') return `[Tool Result ${block.tool_use_id || ''}]\n${text(block.content)}`;
+    if (block.type === 'tool_use') return toolCallText(block.name, block.id, block.input);
+    if (block.type === 'tool_result') return toolResultText(sessionToolName(session, block.tool_use_id), block.tool_use_id, text(block.content));
     return '';
   }).filter(Boolean).join('\n');
 }
 
-function normalize(body, kind) {
+function responsesInputText(input, session) {
+  if (typeof input === 'string') return input;
+  if (!Array.isArray(input)) return '';
+  const names = new Map(session?.toolCalls instanceof Map ? session.toolCalls : []);
+  for (const item of input) {
+    if (item?.type === 'function_call' && typeof (item.call_id || item.id) === 'string' && typeof item.name === 'string') names.set(item.call_id || item.id, item.name);
+  }
+  return input.map(item => {
+    if (typeof item === 'string') return item;
+    if (!item || typeof item !== 'object') return '';
+    if (item.type === 'function_call') return toolCallText(item.name, item.call_id || item.id, item.arguments);
+    if (item.type === 'function_call_output') return toolResultText(item.name || names.get(item.call_id) || '', item.call_id, item.output);
+    if (item.type === 'message') return `${item.role || 'user'}: ${text(item.content)}`;
+    if (item.type === 'input_text' || item.type === 'output_text') return item.text || '';
+    return text(item.content || item.text);
+  }).filter(Boolean).join('\n');
+}
+
+function normalize(body, kind, session) {
   if (kind === 'anthropic') {
     return {
       model: body.model,
       stream: body.stream === true,
       tools: (body.tools || []).map(tool => ({ function: { name: tool.name, description: tool.description, parameters: tool.input_schema } })),
-      prompt: [body.system && `System: ${text(body.system)}`, ...(body.messages || []).map(message => `${message.role}: ${anthropicMessageText(message)}`)].filter(Boolean).join('\n'),
+      prompt: [body.system && `System: ${text(body.system)}`, ...(body.messages || []).map(message => `${message.role}: ${anthropicMessageText(message, session)}`)].filter(Boolean).join('\n'),
     };
   }
   if (kind === 'responses') {
@@ -94,14 +176,14 @@ function normalize(body, kind) {
       model: body.model,
       stream: body.stream === true,
       tools: (body.tools || []).filter(tool => tool.type === 'function').map(tool => ({ function: { name: tool.name, description: tool.description, parameters: tool.parameters } })),
-      prompt: text(body.input),
+      prompt: responsesInputText(body.input, session),
     };
   }
   return {
     model: body.model,
     stream: body.stream === true,
     tools: body.tools || [],
-    prompt: (body.messages || []).map(message => `${message.role}: ${text(message.content)}`).join('\n'),
+    prompt: (body.messages || []).map(message => openAIMessageText(message, session)).filter(Boolean).join('\n'),
   };
 }
 
@@ -158,17 +240,25 @@ function toResponses(openaiResponse, identity = {}) {
   };
 }
 
-function createProxyServer({ config = assertConfig(), completeImpl = complete, sessionStore, setupController } = {}) {
+function createProxyServer({ config = assertConfig(), completeImpl = complete, sessionStore, sessionResolver, setupController, logger } = {}) {
   const sessions = sessionStore || new SessionStore({ ttlMs: Number(process.env.SESSION_TTL_MS || 1_800_000) });
+  const resolver = sessionResolver || new SessionResolver();
   const setup = setupController || createSetupController();
 
   const server = http.createServer(async (req, res) => {
     let stream = null;
+    let requestPath = '';
     try {
-      if (!cors(req, res, config.origins)) return sendError(res, 403, 'Origin is not allowed');
-      if (req.method === 'OPTIONS') return res.writeHead(204).end();
       const url = new URL(req.url, 'http://localhost');
-      if (!authorized(req, config.key, !isLoopback(config.host))) return sendError(res, 401, 'Invalid local proxy API key', 'authentication_error');
+      requestPath = url.pathname;
+      const countTokensRequest = requestPath === '/v1/messages/count_tokens';
+      if (!cors(req, res, config.origins)) return countTokensRequest
+        ? sendAnthropicError(res, 403, 'Origin is not allowed', 'permission_error')
+        : sendError(res, 403, 'Origin is not allowed');
+      if (req.method === 'OPTIONS') return res.writeHead(204).end();
+      if (!authorized(req, config.key, !isLoopback(config.host))) return countTokensRequest
+        ? sendAnthropicError(res, 401, 'Invalid local proxy API key', 'authentication_error')
+        : sendError(res, 401, 'Invalid local proxy API key', 'authentication_error');
 
       if (req.method === 'GET' && url.pathname === '/') {
         res.writeHead(302, { location: '/setup', 'cache-control': 'no-store' });
@@ -197,27 +287,43 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         return send(res, 200, Object.fromEntries(Object.entries(MODELS).map(([name, model]) => [name, { available: model.available, reasoning: model.reasoning, web_search: model.search, upstream: model.label }])));
       }
       if (req.method === 'GET' && url.pathname === '/v1/sessions') return send(res, 200, { data: sessions.list() });
+      if (url.pathname === '/v1/messages/count_tokens' && req.method !== 'POST') {
+        return sendAnthropicError(res, 405, 'Only POST is supported for this endpoint.');
+      }
 
       const body = req.method === 'POST' ? await readBody(req, config.maxBytes) : null;
-      const agentKey = sessions.key(req.headers['x-agent-session'] || body?.metadata?.user_id || body?.user || 'default');
+      if (req.method === 'POST' && url.pathname === '/v1/messages/count_tokens') {
+        const validationError = validateCountTokensBody(body);
+        if (validationError) return sendAnthropicError(res, 400, validationError);
+        return send(res, 200, { input_tokens: estimateTokenCount(body) }, { 'x-deepseek-bridge-token-count': 'estimate' });
+      }
       if (req.method === 'POST' && url.pathname === '/reset-session') {
-        sessions.reset(agentKey);
+        const resolution = resolver.resolve({ headers: req.headers, body });
+        sessions.reset(resolution.key);
+        resolver.releaseSession(resolution.key);
         return send(res, 200, { ok: true });
       }
 
       const paths = { '/v1/chat/completions': 'openai', '/v1/responses': 'responses', '/v1/messages': 'anthropic' };
       const kind = paths[url.pathname];
       if (req.method !== 'POST' || !kind) return sendError(res, 404, 'Not found');
-      const input = normalize(body, kind);
+      const resolution = resolver.resolve({ headers: req.headers, body, kind });
+      const agentKey = resolution.key;
+      const session = sessions.get(agentKey);
+      const input = normalize(body, kind, session);
+      const toolResults = extractToolResults(body, kind, session).filter(result => result.known);
+      const isToolContinuation = toolResults.length > 0;
       const modelName = String(input.model || 'deepseek-chat').toLowerCase();
       const model = MODELS[modelName];
       if (!model) return sendError(res, 400, 'Unsupported model. See GET /v1/models.');
       if (!model.available) return sendError(res, 400, 'This DeepSeek Web mode is currently unavailable. See GET /v1/model-capabilities.');
       if (!input.prompt.trim()) return sendError(res, 400, 'A user input/message is required');
 
-      const session = sessions.get(agentKey);
       const allowedTools = input.tools.map(tool => tool?.function?.name).filter(Boolean);
       const hasTools = allowedTools.length > 0;
+      const upstreamPrompt = isToolContinuation
+        ? createToolContinuationPrompt(toolResults, input.tools)
+        : input.prompt + toolPrompt(input.tools);
       let streamIdentity = null;
       if (input.stream) {
         streamIdentity = {
@@ -228,25 +334,71 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         stream = createProtocolStream(res, { kind, ...streamIdentity, bufferForTools: hasTools });
       }
 
-      const output = await completeImpl({
-        prompt: input.prompt + toolPrompt(input.tools),
+      let output = await completeImpl({
+        prompt: upstreamPrompt,
         session,
         model,
         timeoutMs: config.timeoutMs,
         onDelta: input.stream ? delta => stream.delta(delta) : undefined,
       });
-      const toolCall = parseToolCall(output.content, allowedTools);
-      if (!toolCall) sessions.add(session, input.prompt, output.content);
+      let toolCall = parseToolCallFromOutput(output, allowedTools);
+      let correctiveAttempted = false;
+      if (shouldRetryToolResponse({ hasTools, output, toolCall, retryCount: 0 })) {
+        correctiveAttempted = true;
+        logToolRetry(logger);
+        output = await completeImpl({
+          prompt: createToolRetryPrompt(allowedTools),
+          session,
+          model: MODELS['deepseek-chat'],
+          timeoutMs: config.timeoutMs,
+          onDelta: input.stream ? delta => stream.delta(delta) : undefined,
+        });
+        toolCall = parseToolCallFromOutput(output, allowedTools);
+        output = hideRetryReasoning(output, toolCall);
+      }
+      if (isToolContinuation && isExactCompletedToolCall(toolCall, toolResults)) {
+        if (!correctiveAttempted) {
+          correctiveAttempted = true;
+          logRepeatedToolRetry(logger);
+          output = await completeImpl({
+            prompt: createRepeatedToolCorrectionPrompt(toolResults, input.tools),
+            session,
+            model: MODELS['deepseek-chat'],
+            timeoutMs: config.timeoutMs,
+            onDelta: input.stream ? delta => stream.delta(delta) : undefined,
+          });
+          toolCall = parseToolCallFromOutput(output, allowedTools);
+          if (!toolCall) output = { ...output, reasoning: '' };
+        }
+        if (isExactCompletedToolCall(toolCall, toolResults)
+          || (!toolCall && !String(output?.content || '').trim())) {
+          output = repeatedToolFailure(output);
+          toolCall = null;
+        }
+      }
+      if (isToolContinuation && !toolCall && output.reasoning) output = { ...output, reasoning: '' };
+      resolver.release(resolution.callIds, agentKey);
+      forgetCompletedToolCalls(session, resolution.callIds);
+      if (toolCall) {
+        rememberToolCall(session, toolCall);
+        resolver.bind(toolCall.id, agentKey);
+      }
+      if (!toolCall) sessions.add(session, upstreamPrompt, output.content);
       const openaiIdentity = streamIdentity && kind === 'openai' ? streamIdentity : {};
-      const openaiResponse = toOpenAI(modelName, input.prompt, output, toolCall, openaiIdentity);
+      const openaiResponse = toOpenAI(modelName, upstreamPrompt, output, toolCall, openaiIdentity);
       const finalResponse = kind === 'anthropic'
         ? toAnthropic(openaiResponse, streamIdentity || {})
         : kind === 'responses' ? toResponses(openaiResponse, streamIdentity || {}) : openaiResponse;
       if (stream) return stream.finish({ output, toolCall, finalResponse });
       return send(res, 200, finalResponse);
     } catch (error) {
+      logSafeError(error, logger);
       if (stream) return stream.fail('DeepSeek streaming request failed. Run npm run doctor or re-authenticate.');
       const status = error.status || (error.name === 'TimeoutError' ? 504 : 502);
+      if (requestPath === '/v1/messages/count_tokens') {
+        const type = status === 413 ? 'request_too_large' : status === 400 ? 'invalid_request_error' : 'api_error';
+        return sendAnthropicError(res, status, status >= 500 ? 'Local token estimation failed.' : safeError(error), type);
+      }
       const message = status >= 500 ? 'DeepSeek request failed. Run npm run doctor or re-authenticate.' : safeError(error);
       return sendError(res, status, message, status === 504 ? 'request_timeout' : 'upstream_error');
     }

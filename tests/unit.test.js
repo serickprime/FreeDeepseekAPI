@@ -1,12 +1,306 @@
 'use strict';
-const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {parseToolCall,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
-const {createSetupController,existingDirectory}=require('../lib/setup');
+const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { complete, loadAuth, parseRetryAfter, parseStream }=client; const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
+const {TOOL_RETRY_FAILURE_MESSAGE,createToolRetryPrompt,hideRetryReasoning,shouldRetryToolResponse}=require('../lib/tool_retry');
+const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
+const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory,readAuthStatus}=require('../lib/setup');
+const {runDiagnostics,boundedTimeout}=require('../scripts/doctor');
 test('loopback and external bind security',()=>{assert.equal(isLoopback('127.0.0.1'),true);assert.equal(isLoopback('0.0.0.0'),false);assert.throws(()=>assertConfig({HOST:'0.0.0.0'}));assert.equal(assertConfig({HOST:'0.0.0.0',PROXY_API_KEY:'x'.repeat(24)}).host,'0.0.0.0');});
 test('localhost browser origins allow explicit ports but reject deceptive hosts',()=>{assert.equal(isLocalOrigin('http://127.0.0.1:9655'),true);assert.equal(isLocalOrigin('http://localhost:3000'),true);assert.equal(isLocalOrigin('https://localhost.evil.example'),false);});
-test('error redaction hides credentials',()=>{assert.doesNotMatch(safeError(new Error('Bearer abcdefghijkl token=secret')),/secret|abcdefgh/);});
+test('error redaction hides credentials but keeps a useful reason',()=>{
+  const message=safeError(new Error('Gateway unavailable: Bearer bearer-secret token=token-secret cookie=session-secret authorization=auth-secret'));
+  assert.match(message,/Gateway unavailable/);
+  assert.doesNotMatch(message,/bearer-secret|token-secret|session-secret|auth-secret/);
+});
+test('safe error logging never throws for unusual errors or logger failures',()=>{
+  const unusual={get message(){throw new Error('message getter failed');},toString(){throw new Error('toString failed');}};
+  assert.doesNotThrow(()=>logSafeError(unusual,()=>{throw new Error('logger failed');}));
+  assert.equal(safeError(unusual),'Internal error');
+});
+test('setup auth status accepts only non-empty string credentials',t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'deepseek-bridge-auth-status-'));
+  const authPath=path.join(root,'deepseek-auth.json');
+  const previousAuthPath=process.env.DEEPSEEK_AUTH_PATH;
+  delete process.env.DEEPSEEK_AUTH_PATH;
+  t.after(()=>{
+    if(previousAuthPath===undefined) delete process.env.DEEPSEEK_AUTH_PATH;
+    else process.env.DEEPSEEK_AUTH_PATH=previousAuthPath;
+    fs.rmSync(root,{recursive:true,force:true});
+  });
+
+  fs.writeFileSync(authPath,JSON.stringify({token:'valid-token',cookie:'session=valid'}));
+  assert.deepEqual(readAuthStatus(root),{present:true,valid:true});
+  fs.writeFileSync(authPath,JSON.stringify({token:'   ',cookie:'session=valid'}));
+  assert.deepEqual(readAuthStatus(root),{present:true,valid:false});
+  fs.writeFileSync(authPath,JSON.stringify({token:123,cookie:{value:'session=invalid'}}));
+  assert.deepEqual(readAuthStatus(root),{present:true,valid:false});
+});
+test('client auth accepts only non-empty strings without changing credential values',t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'deepseek-bridge-client-auth-'));
+  const authPath=path.join(root,'deepseek-auth.json');
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+
+  const valid={token:'  valid-token  ',cookie:'  session=valid  '};
+  fs.writeFileSync(authPath,JSON.stringify(valid));
+  assert.deepEqual(loadAuth(authPath),valid);
+
+  const invalidCredentials=[
+    {token:'',cookie:'cookie-secret-empty-token'},
+    {token:'token-secret-empty-cookie',cookie:''},
+    {token:'   ',cookie:'cookie-secret-whitespace-token'},
+    {token:'token-secret-whitespace-cookie',cookie:'   '},
+    {token:123,cookie:'cookie-secret-numeric-token'},
+    {token:'token-secret-numeric-cookie',cookie:456},
+    {token:{value:'token-secret-object'},cookie:'cookie-secret-object-token'},
+    {token:'token-secret-object-cookie',cookie:{value:'cookie-secret-object'}},
+  ];
+
+  for(const auth of invalidCredentials){
+    fs.writeFileSync(authPath,JSON.stringify(auth));
+    assert.throws(()=>loadAuth(authPath),error=>{
+      assert.match(error.message,/^Run npm run auth first \(token or cookie missing\)\.$/);
+      assert.doesNotMatch(error.message,/secret|123|456/);
+      return true;
+    });
+  }
+});
+
+test('/readyz stays unavailable when stored credentials are invalid',async t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'deepseek-bridge-readyz-auth-'));
+  const authPath=path.join(root,'deepseek-auth.json');
+  const originalLoadAuth=client.loadAuth;
+  fs.writeFileSync(authPath,JSON.stringify({token:{secret:'token-must-not-leak'},cookie:'cookie-must-not-leak'}));
+  client.loadAuth=()=>loadAuth(authPath);
+  t.after(()=>{
+    client.loadAuth=originalLoadAuth;
+    fs.rmSync(root,{recursive:true,force:true});
+  });
+
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,completeImpl:async()=>({content:'unused',reasoning:'',parentMessageId:null})});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/readyz`);
+    const body=await response.text();
+    assert.equal(response.status,503);
+    assert.deepEqual(JSON.parse(body),{ready:false,action:'Run npm run auth'});
+    assert.doesNotMatch(body,/token-must-not-leak|cookie-must-not-leak/);
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+});
 test('session expiry/reset and bounded history',()=>{const s=new SessionStore({ttlMs:1,maxHistory:2});const x=s.get('a');s.add(x,'one','a');s.add(x,'two','b');s.add(x,'three','c');assert.equal(x.history.length,2);s.reset('a');assert.equal(s.list().length,0);});
-test('only explicit complete tool call is accepted',()=>{const c=parseToolCall('<tool_call>{"name":"read_file","arguments":{"path":"a"}}</tool_call>',['read_file']);assert.equal(c.function.name,'read_file');assert.equal(parseToolCall('{"name":"read_file","arguments":{}}',['read_file']),null);assert.equal(parseToolCall('<tool_call>{"name":"other","arguments":{}}</tool_call>',['read_file']),null);assert.equal(parseToolCall('<tool_call>{"name":"read_file","arguments":</tool_call>',['read_file']),null);});
-test('strict JSON tool envelope is accepted only as the whole response',()=>{const c=parseToolCall('{"tool_call":{"name":"read_file","arguments":{"path":"a"}}}',['read_file']);assert.equal(c.function.name,'read_file');assert.equal(parseToolCall('Example: {"tool_call":{"name":"read_file","arguments":{}}}',['read_file']),null);});
+
+test('session resolver prioritizes and hashes explicit identifiers',()=>{
+  const resolver=new SessionResolver({randomUUID:()=> 'unused'});
+  const header=resolver.resolve({headers:{'x-agent-session':'agent-header'},body:{metadata:{user_id:'metadata-user'},user:'body-user'},kind:'openai'});
+  const metadata=resolver.resolve({body:{metadata:{user_id:'metadata-user'},user:'body-user'},kind:'openai'});
+  const user=resolver.resolve({body:{user:'body-user'},kind:'openai'});
+  assert.equal(header.key,explicitSessionKey('header','agent-header'));
+  assert.equal(metadata.key,explicitSessionKey('metadata','metadata-user'));
+  assert.equal(user.key,explicitSessionKey('user','body-user'));
+  assert.notEqual(header.key,metadata.key);
+  assert.doesNotMatch(`${header.key}${metadata.key}${user.key}`,/agent-header|metadata-user|body-user/);
+  assert.equal(resolver.resolve({body:{metadata:{user_id:'metadata-user'}},kind:'openai'}).key,metadata.key);
+});
+
+test('anonymous session resolution is unique and never uses default',()=>{
+  let sequence=0;
+  const resolver=new SessionResolver({randomUUID:()=>`request-${++sequence}`});
+  const first=resolver.resolve({kind:'openai'});
+  const second=resolver.resolve({kind:'openai'});
+  assert.equal(first.key,'anonymous:request-1');
+  assert.equal(second.key,'anonymous:request-2');
+  assert.notEqual(first.key,second.key);
+  assert.notEqual(first.key,'default');
+  assert.notEqual(second.key,'default');
+});
+
+test('tool result call ids are extracted only from their supported protocols',()=>{
+  assert.deepEqual(extractToolResultCallIds({messages:[{role:'tool',tool_call_id:'call_openai'}]},'openai'),['call_openai']);
+  assert.deepEqual(extractToolResultCallIds({messages:[{role:'user',content:[{type:'tool_result',tool_use_id:'call_anthropic'}]}]},'anthropic'),['call_anthropic']);
+  assert.deepEqual(extractToolResultCallIds({input:[{type:'function_call_output',call_id:'call_responses'}]},'responses'),['call_responses']);
+  assert.deepEqual(extractToolResultCallIds({messages:[{role:'user',tool_call_id:'ignored'}]},'openai'),[]);
+});
+
+test('call-id links expire, are bounded and reject unsafe identifiers',()=>{
+  let now=100;
+  let sequence=0;
+  const resolver=new SessionResolver({ttlMs:10,maxLinks:2,now:()=>now,randomUUID:()=>`fresh-${++sequence}`});
+  assert.equal(resolver.bind('call-a','anonymous:one'),true);
+  assert.equal(resolver.resolve({kind:'openai',body:{messages:[{role:'tool',tool_call_id:'call-a'}]}}).key,'anonymous:one');
+  resolver.bind('call-b','anonymous:two');
+  resolver.bind('call-c','anonymous:three');
+  assert.equal(resolver.size,2);
+  assert.equal(resolver.resolve({kind:'openai',body:{messages:[{role:'tool',tool_call_id:'call-a'}]}}).source,'anonymous');
+  now=111;
+  assert.equal(resolver.resolve({kind:'openai',body:{messages:[{role:'tool',tool_call_id:'call-b'}]}}).source,'anonymous');
+  assert.equal(resolver.size,0);
+  assert.equal(normalizeCallId('x'.repeat(129)),null);
+  assert.equal(normalizeCallId('../unsafe'),null);
+  assert.equal(resolver.bind('x'.repeat(129),'anonymous:four'),false);
+  const oversizedSession=resolver.resolve({headers:{'x-agent-session':'s'.repeat(129)},body:{metadata:{user_id:'must-not-fallback'}},kind:'openai'});
+  assert.equal(oversizedSession.source,'anonymous');
+  assert.doesNotMatch(oversizedSession.key,/must-not-fallback|s{20}/);
+});
+
+test('session store has bounded memory and no implicit default key',()=>{
+  let now=0;
+  const sessions=new SessionStore({maxSessions:2,ttlMs:10,now:()=>now});
+  sessions.get('anonymous:one');
+  now=1;sessions.get('anonymous:two');
+  now=2;sessions.get('anonymous:three');
+  assert.equal(sessions.list().length,2);
+  assert.equal(sessions.list().some(item=>item.key==='anonymous:one'),false);
+  now=20;
+  assert.equal(sessions.list().length,0);
+  assert.notEqual(sessions.key(),'default');
+});
+
+test('token text estimate is deterministic and accounts for multilingual text and emoji',()=>{
+  const english=estimateTextTokens('token probe in ordinary English');
+  const russian=estimateTextTokens('Проверка количества токенов');
+  const chinese=estimateTextTokens('你好世界');
+  const emoji=estimateTextTokens('😀');
+  assert.ok(Number.isInteger(english)&&english>0);
+  assert.ok(russian>=8);
+  assert.ok(chinese>=4);
+  assert.ok(emoji>=2);
+  assert.equal(estimateTextTokens('Проверка количества токенов'),russian);
+});
+
+test('token estimate includes system, messages and Anthropic content blocks',()=>{
+  const base={model:'deepseek-chat',messages:[{role:'user',content:'hello'}]};
+  const simple=estimateTokenCount(base);
+  const rich=estimateTokenCount({
+    ...base,
+    system:[{type:'text',text:'system rules'}],
+    messages:[
+      {role:'user',content:[{type:'text',text:'hello'},{type:'image',source:{type:'base64',data:'not-counted'}}]},
+      {role:'assistant',content:[{type:'thinking',thinking:'consider safely'},{type:'tool_use',id:'toolu_1',name:'read_file',input:{path:'package.json'}}]},
+      {role:'user',content:[{type:'tool_result',tool_use_id:'toolu_1',content:[{type:'text',text:'result text'}]},{type:'future_block',payload:'opaque'}]},
+    ],
+  });
+  assert.ok(Number.isInteger(rich)&&rich>=0);
+  assert.ok(rich>simple+IMAGE_BLOCK_TOKENS+UNKNOWN_BLOCK_TOKENS);
+});
+
+test('token estimate includes tool names, descriptions and nested JSON Schema',()=>{
+  const withoutTools=estimateTokenCount({model:'deepseek-chat',messages:[]});
+  const withTools=estimateTokenCount({model:'deepseek-chat',messages:[],tools:[{
+    name:'read_file',description:'Read a local text file safely',input_schema:{type:'object',properties:{path:{type:'string'},options:{type:'object',properties:{encoding:{type:'string'},ranges:{type:'array',items:{type:'number'}}}}},required:['path']},
+  }]});
+  assert.ok(withTools>withoutTools);
+});
+
+test('token estimator bounds deep, cyclic and unusual structures',()=>{
+  const cycle={type:'object'};cycle.self=cycle;
+  let deep={value:'end'};for(let index=0;index<MAX_TOKEN_DEPTH+20;index++)deep={nested:deep};
+  const body={model:'deepseek-chat',messages:[{role:'user',content:[{type:'image',source:cycle},{type:'unknown',payload:cycle}]}],tools:[{name:'safe_tool',input_schema:{cycle,deep}}]};
+  const first=estimateTokenCount(body);
+  const second=estimateTokenCount(body);
+  assert.ok(Number.isInteger(first)&&first>=IMAGE_BLOCK_TOKENS);
+  assert.equal(first,second);
+});
+
+test('count_tokens body validation requires the confirmed Anthropic contract',()=>{
+  assert.match(validateCountTokensBody({}),/model is required/);
+  assert.match(validateCountTokensBody({model:'deepseek-chat'}),/messages is required/);
+  assert.match(validateCountTokensBody({model:'deepseek-chat',messages:[],system:{}}),/system must/);
+  assert.match(validateCountTokensBody({model:'deepseek-chat',messages:[],tools:{}}),/tools must/);
+  assert.equal(validateCountTokensBody({model:'deepseek-chat',messages:[]}),null);
+});
+const jsonToolCall=(name='read_file',args={path:'package.json'})=>JSON.stringify({tool_call:{name,arguments:args}});
+const xmlToolCall=(name='read_file',args={path:'package.json'})=>`<tool_call>${JSON.stringify({name,arguments:args})}</tool_call>`;
+
+test('strict JSON and XML tool calls are accepted only as the whole content',()=>{
+  for(const source of [jsonToolCall(),xmlToolCall()]){
+    const call=parseToolCall(source,['read_file']);
+    assert.equal(call.function.name,'read_file');
+    assert.deepEqual(JSON.parse(call.function.arguments),{path:'package.json'});
+  }
+});
+
+test('strict reasoning tool calls require empty content and preserve content priority',()=>{
+  assert.equal(parseToolCallFromOutput({content:'',reasoning:jsonToolCall()},['read_file']).function.name,'read_file');
+  assert.equal(parseToolCallFromOutput({content:'   ',reasoning:xmlToolCall()},['read_file']).function.name,'read_file');
+  const selected=parseToolCallFromOutput({content:jsonToolCall('content_tool',{}),reasoning:jsonToolCall('reasoning_tool',{})},['content_tool','reasoning_tool']);
+  assert.equal(selected.function.name,'content_tool');
+  assert.equal(parseToolCallFromOutput({content:'A normal final answer',reasoning:jsonToolCall()},['read_file']),null);
+});
+
+test('reasoning prose, embedded JSON, Markdown and trailing text are never tool calls',()=>{
+  const strict=jsonToolCall();
+  for(const reasoning of [
+    'I should call Read, then continue.',
+    `I will use this tool: ${strict}`,
+    `${strict}\nNow I will wait.`,
+    `\`\`\`json\n${strict}\n\`\`\``,
+    `Example request:\n${strict}`,
+  ]) assert.equal(parseToolCallFromOutput({content:'',reasoning},['read_file']),null);
+});
+
+test('damaged, repeated, multiple and non-envelope tool calls are rejected',()=>{
+  const strict=jsonToolCall();
+  for(const source of [
+    '{"tool_call":{"name":"read_file","arguments":',
+    `${strict}${strict}`,
+    `${xmlToolCall()}${xmlToolCall()}`,
+    JSON.stringify({tool_call:[{name:'read_file',arguments:{}},{name:'read_file',arguments:{}}]}),
+    JSON.stringify({name:'read_file',arguments:{}}),
+  ]) assert.equal(parseToolCall(source,['read_file']),null);
+});
+
+test('tool names and top-level arguments are strictly validated',()=>{
+  assert.equal(parseToolCall(jsonToolCall('unknown',{}),['read_file']),null);
+  assert.equal(parseToolCall(jsonToolCall('',{}),['']),null);
+  assert.equal(parseToolCall(jsonToolCall(`a${'x'.repeat(128)}`,{}),[`a${'x'.repeat(128)}`]),null);
+  for(const args of [null,[], 'path', 1, true]) assert.equal(parseToolCall(jsonToolCall('read_file',args),['read_file']),null);
+  assert.equal(parseToolCall(jsonToolCall('read_file',{}),[]),null);
+});
+
+test('tool argument and source size limits are enforced',()=>{
+  assert.equal(parseToolCall(jsonToolCall('read_file',{value:'x'.repeat(MAX_TOOL_BYTES)}),['read_file']),null);
+  assert.equal(parseToolCall('x'.repeat(MAX_TOOL_BYTES+1),['read_file']),null);
+});
+
+test('dangerous argument keys are rejected at every nested location',()=>{
+  const cases=[
+    '{"__proto__":{"polluted":true}}',
+    '{"safe":{"constructor":{"polluted":true}}}',
+    '{"items":[{"prototype":{"polluted":true}}]}',
+  ];
+  for(const rawArgs of cases){
+    const source=`{"tool_call":{"name":"read_file","arguments":${rawArgs}}}`;
+    assert.equal(parseToolCall(source,['read_file']),null);
+  }
+});
+
+test('tool argument nesting is bounded while safe objects and arrays remain valid',()=>{
+  let tooDeep={value:'ok'};
+  for(let index=0;index<MAX_NESTING_DEPTH+1;index+=1) tooDeep={next:tooDeep};
+  assert.equal(parseToolCall(jsonToolCall('read_file',tooDeep),['read_file']),null);
+  const safe={path:'package.json',options:{encoding:'utf8',ranges:[{start:1,end:3},['a','b'],null,true]}};
+  const call=parseToolCall(jsonToolCall('read_file',safe),['read_file']);
+  assert.deepEqual(JSON.parse(call.function.arguments),safe);
+});
+test('tool retry decision is limited to the first reasoning-only result with tools',()=>{
+  const output={content:' ',reasoning:'I need a file'};
+  assert.equal(shouldRetryToolResponse({hasTools:true,output,toolCall:null,retryCount:0}),true);
+  assert.equal(shouldRetryToolResponse({hasTools:false,output,toolCall:null,retryCount:0}),false);
+  assert.equal(shouldRetryToolResponse({hasTools:true,output,toolCall:{},retryCount:0}),false);
+  assert.equal(shouldRetryToolResponse({hasTools:true,output:{content:'final',reasoning:'why'},toolCall:null,retryCount:0}),false);
+  assert.equal(shouldRetryToolResponse({hasTools:true,output,toolCall:null,retryCount:1}),false);
+});
+test('corrective tool prompt is bounded to allowed names and retry reasoning is hidden',()=>{
+  const prompt=createToolRetryPrompt(['read_file','glob','bad name','read_file']);
+  assert.match(prompt,/strict JSON tool call/);
+  assert.match(prompt,/\["read_file","glob"\]/);
+  assert.doesNotMatch(prompt,/bad name/);
+  assert.deepEqual(hideRetryReasoning({content:'final answer',reasoning:'private'},null),{content:'final answer',reasoning:''});
+  assert.equal(hideRetryReasoning({content:'',reasoning:'private'},null).content,TOOL_RETRY_FAILURE_MESSAGE);
+});
 test('tool prompt is declarative and bounded',()=>{const p=toolPrompt([{function:{name:'x',parameters:{type:'object'}}}]);assert.match(p,/Never execute/);assert.match(p,/"x"/);});
 
 test('Retry-After supports seconds and HTTP dates',()=>{
@@ -43,7 +337,7 @@ test('DeepSeek stream parser applies fragment append patches used by the live We
   assert.deepEqual(deltas,[{content:'CHECK'},{content:'_4826'},{reasoning:'because'},{reasoning:'...'}]);
 });
 
-test('completion honors Retry-After, resets remote session and retries only a bounded number',async()=>{
+test('completion without diagnostic callbacks preserves retries and existing result behavior',async()=>{
   const calls=[]; const waits=[];
   const responses=[
     new Response(JSON.stringify({data:{biz_data:{id:'session-1'}}}),{status:200,headers:{'content-type':'application/json'}}),
@@ -60,6 +354,86 @@ test('completion honors Retry-After, resets remote session and retries only a bo
   assert.equal(calls.length,6);
   assert.deepEqual(waits,[2000]);
 });
+
+function doctorAuth(){return JSON.stringify({token:'test-token',cookie:'test-cookie',wasmUrl:'https://example.test/pow.wasm'});}
+function doctorChallenge(){return {data:{biz_data:{challenge:{challenge:'c',salt:'s',expire_at:1,difficulty:1,algorithm:'a',signature:'sig'}}}};}
+function doctorFetch(marker,{reachabilityStatus=200,sessionStatus=200,challengeStatus=200,completionStatus=200,completionText}={}){
+  const responses=[
+    new Response('reachable',{status:reachabilityStatus}),
+    new Response(sessionStatus===200?JSON.stringify({data:{biz_data:{id:'doctor-session'}}}):'session failed',{status:sessionStatus}),
+    new Response(challengeStatus===200?JSON.stringify(doctorChallenge()):'challenge failed',{status:challengeStatus}),
+    new Response(completionText===undefined?`data: {"p":"response/content","v":"${marker}"}\n`:completionText,{status:completionStatus}),
+  ];
+  return async()=>responses.shift();
+}
+function doctorPow({failureStage}={}){
+  return async(challenge,url,timeout,onStage)=>{
+    if(failureStage==='download')throw new Error('WASM download failed token=secret');
+    onStage('wasm_downloaded');
+    onStage('wasm_compile_start');
+    if(failureStage==='compile')throw new Error('WASM compilation failed');
+    onStage('wasm_compiled');
+    onStage('pow_solve_start');
+    if(failureStage==='solve')throw new Error('PoW solve failed');
+    onStage('pow_solved');
+    return 7;
+  };
+}
+async function doctorCase(options={}){
+  const marker=options.marker||'DOCTOR_MARKER_TEST';
+  const lines=[];
+  const result=await runDiagnostics({readFile:()=>doctorAuth(),marker,fetchImpl:options.fetchImpl||doctorFetch(marker,options.fetchOptions),solvePow:options.solvePow||doctorPow(),timeoutMs:options.timeoutMs||10_000,output:line=>lines.push(line),errorOutput:line=>lines.push(line),...options.overrides});
+  return {result,lines};
+}
+
+test('doctor completes every DeepSeek diagnostic stage with mocked upstream',async()=>{
+  const {result,lines}=await doctorCase();
+  assert.equal(result.ok,true);
+  for(const expected of ['Авторизация загружена','Token и cookie присутствуют','DeepSeek Web доступен','Удалённая сессия создана','PoW challenge получен','WASM загружен','WASM скомпилирован','PoW решён','Completion запрос выполнен','Streaming ответ получен','Streaming ответ разобран','Ответ модели получен'])assert.ok(lines.some(line=>line.includes(expected)),expected);
+});
+test('doctor treats an HTTP 403 homepage response as network reachability and continues',async()=>{
+  const {result,lines}=await doctorCase({fetchOptions:{reachabilityStatus:403}});
+  assert.equal(result.ok,true);
+  assert.ok(lines.some(line=>line.includes('DeepSeek Web доступен (HTTP 403)')));
+  assert.ok(lines.some(line=>line.includes('Ответ модели получен')));
+});
+test('doctor treats an HTTP 200 homepage response as network reachability',async()=>{
+  const {result,lines}=await doctorCase({fetchOptions:{reachabilityStatus:200}});
+  assert.equal(result.ok,true);
+  assert.ok(lines.some(line=>line.includes('DeepSeek Web доступен (HTTP 200)')));
+});
+test('doctor reachability uses an unauthenticated GET to the DeepSeek homepage',async()=>{
+  const marker='DOCTOR_REACHABILITY_REQUEST';
+  const upstream=doctorFetch(marker);
+  let first=true;
+  const fetchImpl=async(url,options)=>{
+    if(first){
+      first=false;
+      assert.equal(url,'https://chat.deepseek.com');
+      assert.equal(options.method,'GET');
+      assert.equal(options.headers,undefined);
+    }
+    return upstream();
+  };
+  const {result}=await doctorCase({marker,fetchImpl});
+  assert.equal(result.ok,true);
+});
+test('doctor stops on a DeepSeek network connection error',async()=>{const {result}=await doctorCase({fetchImpl:async()=>{throw new Error('DNS lookup failed');}});assert.equal(result.stage,'web');assert.match(result.error,/DNS lookup failed/);});
+test('doctor stops on a DeepSeek reachability timeout',async()=>{const {result}=await doctorCase({fetchImpl:async()=>{const error=new Error('Connection timed out');error.name='TimeoutError';throw error;}});assert.equal(result.stage,'web');assert.match(result.error,/timed out/);});
+test('doctor identifies remote session creation errors',async()=>{const {result}=await doctorCase({fetchOptions:{sessionStatus:500}});assert.equal(result.stage,'session');assert.match(result.error,/HTTP 500/);});
+test('doctor explains HTTP 401 session auth rejection without exposing credentials',async()=>{const {result,lines}=await doctorCase({fetchOptions:{sessionStatus:401}});assert.equal(result.stage,'session');assert.match(result.error,/отклонил текущую авторизацию.*HTTP 401.*npm run auth/);assert.doesNotMatch(lines.join('\n'),/test-token|test-cookie/);});
+test('doctor explains HTTP 403 session auth rejection without exposing credentials',async()=>{const {result,lines}=await doctorCase({fetchOptions:{sessionStatus:403}});assert.equal(result.stage,'session');assert.match(result.error,/отклонил текущую авторизацию.*HTTP 403.*npm run auth/);assert.doesNotMatch(lines.join('\n'),/test-token|test-cookie/);});
+test('doctor identifies challenge errors',async()=>{const {result}=await doctorCase({fetchOptions:{challengeStatus:503}});assert.equal(result.stage,'challenge');assert.match(result.error,/HTTP 503/);});
+test('doctor keeps HTTP 403 from the internal challenge endpoint as an error',async()=>{const {result}=await doctorCase({fetchOptions:{challengeStatus:403}});assert.equal(result.stage,'challenge');assert.match(result.error,/HTTP 403/);});
+test('doctor identifies WASM download errors without leaking secrets',async()=>{const {result,lines}=await doctorCase({solvePow:doctorPow({failureStage:'download'})});assert.equal(result.stage,'wasm_download');assert.doesNotMatch(lines.join('\n'),/secret/);});
+test('doctor identifies WASM compilation errors',async()=>{const {result}=await doctorCase({solvePow:doctorPow({failureStage:'compile'})});assert.equal(result.stage,'wasm_compile');});
+test('doctor identifies PoW solve errors',async()=>{const {result}=await doctorCase({solvePow:doctorPow({failureStage:'solve'})});assert.equal(result.stage,'pow');});
+test('doctor identifies completion HTTP errors',async()=>{const {result}=await doctorCase({fetchOptions:{completionStatus:403}});assert.equal(result.stage,'completion');assert.match(result.error,/HTTP 403/);});
+test('doctor rejects an empty parsed streaming response',async()=>{const {result}=await doctorCase({fetchOptions:{completionText:''}});assert.equal(result.stage,'answer');assert.match(result.error,/пустой/);});
+test('doctor rejects a response without its expected marker',async()=>{const {result}=await doctorCase({fetchOptions:{completionText:'data: {"p":"response/content","v":"OTHER"}\n'}});assert.equal(result.stage,'answer');assert.match(result.error,/маркер/);});
+test('doctor redacts credentials from arbitrary stage errors',async()=>{const {result,lines}=await doctorCase({overrides:{createSessionImpl:async()=>{throw new Error('Bearer bearer-secret token=token-secret cookie=cookie-secret authorization=auth-secret');}}});assert.equal(result.stage,'session');assert.doesNotMatch(lines.join('\n'),/bearer-secret|token-secret|cookie-secret|auth-secret/);});
+test('doctor enforces a bounded overall timeout',async()=>{const lines=[];const result=await runDiagnostics({readFile:()=>doctorAuth(),reachabilityImpl:()=>new Promise(()=>{}),timeoutMs:25,output:line=>lines.push(line),errorOutput:line=>lines.push(line)});assert.equal(result.stage,'timeout');assert.ok(lines.some(line=>line.includes('Общее время диагностики')));assert.equal(boundedTimeout(Infinity),150_000);assert.equal(boundedTimeout(999_999),180_000);});
+test('setup allows bounded headroom for the full doctor process',()=>{assert.ok(DOCTOR_PROCESS_TIMEOUT_MS>180_000&&DOCTOR_PROCESS_TIMEOUT_MS<=240_000);});
 
 async function streamingProtocolCase(path, body, expectedParts) {
   let releaseUpstream;
@@ -125,6 +499,762 @@ test('streaming with tools buffers markup and emits a validated tool call',async
     assert.doesNotMatch(output,/<tool_call>/);
     assert.match(output,/"tool_calls"/);
     assert.match(output,/"finish_reason":"tool_calls"/);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+});
+
+async function nonStreamingToolProtocolCase(path,body){
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,completeImpl:async()=>({content:'',reasoning:jsonToolCall('read_file',{path:'package.json'}),parentMessageId:null})});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}${path}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    assert.equal(response.status,200);
+    return response.json();
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+}
+
+test('strict reasoning tool calls map to OpenAI tool_calls',async()=>{
+  const response=await nonStreamingToolProtocolCase('/v1/chat/completions',{
+    model:'deepseek-chat',messages:[{role:'user',content:'read package'}],
+    tools:[{type:'function',function:{name:'read_file',parameters:{type:'object'}}}],
+  });
+  assert.equal(response.choices[0].finish_reason,'tool_calls');
+  assert.equal(response.choices[0].message.tool_calls[0].function.name,'read_file');
+  assert.deepEqual(JSON.parse(response.choices[0].message.tool_calls[0].function.arguments),{path:'package.json'});
+});
+
+test('strict reasoning tool calls map to Anthropic tool_use',async()=>{
+  const response=await nonStreamingToolProtocolCase('/v1/messages',{
+    model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'read package'}],
+    tools:[{name:'read_file',input_schema:{type:'object'}}],
+  });
+  assert.equal(response.stop_reason,'tool_use');
+  assert.deepEqual(response.content[0],{type:'tool_use',id:response.content[0].id,name:'read_file',input:{path:'package.json'}});
+});
+
+test('strict reasoning tool calls map to Responses function_call',async()=>{
+  const response=await nonStreamingToolProtocolCase('/v1/responses',{
+    model:'deepseek-chat',input:'read package',
+    tools:[{type:'function',name:'read_file',parameters:{type:'object'}}],
+  });
+  assert.equal(response.output[0].type,'function_call');
+  assert.equal(response.output[0].name,'read_file');
+  assert.deepEqual(JSON.parse(response.output[0].arguments),{path:'package.json'});
+});
+
+test('streaming hides a strict reasoning envelope and emits only protocol tool events',async()=>{
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const reasoning=jsonToolCall('echo',{text:'ok'});
+  const server=createProxyServer({config,completeImpl:async({onDelta})=>{
+    onDelta({reasoning});
+    return {content:'',reasoning,parentMessageId:null};
+  }});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-chat',stream:true,messages:[{role:'user',content:'use tool'}],tools:[{type:'function',function:{name:'echo',parameters:{type:'object'}}}]})});
+    const output=await response.text();
+    assert.doesNotMatch(output,/"tool_call":/);
+    assert.doesNotMatch(output,/<tool_call>/);
+    assert.match(output,/"tool_calls"/);
+    assert.match(output,/"finish_reason":"tool_calls"/);
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+});
+
+test('ordinary responses without tools and rejected tool-like text stay normal responses',async()=>{
+  const outputs=[
+    {content:'ordinary answer',reasoning:'I may use Read later',parentMessageId:null},
+    {content:`Example only: ${jsonToolCall('read_file',{})}`,reasoning:'',parentMessageId:null},
+  ];
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,completeImpl:async()=>outputs.shift()});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const base=`http://127.0.0.1:${server.address().port}/v1/chat/completions`;
+    const normal=await (await fetch(base,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content:'answer'}]})})).json();
+    assert.equal(normal.choices[0].message.content,'ordinary answer');
+    assert.equal(normal.choices[0].finish_reason,'stop');
+    const rejected=await (await fetch(base,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content:'answer'}],tools:[{type:'function',function:{name:'read_file',parameters:{type:'object'}}}]})})).json();
+    assert.match(rejected.choices[0].message.content,/^Example only:/);
+    assert.equal(rejected.choices[0].finish_reason,'stop');
+    assert.equal(rejected.choices[0].message.tool_calls,undefined);
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+});
+
+async function toolRetryProxyCase({path='/v1/chat/completions',body,completeImpl,logger,sessionStore,sessionResolver,headers={}}){
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,completeImpl,logger,sessionStore,sessionResolver});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}${path}`,{method:'POST',headers:{'content-type':'application/json',...headers},body:JSON.stringify(body)});
+    return {status:response.status,contentType:response.headers.get('content-type'),text:await response.text()};
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+}
+
+test('tool retry is skipped without tools, after a first tool call, and after final content',async()=>{
+  const cases=[
+    {body:{model:'deepseek-chat',messages:[{role:'user',content:'answer'}]},output:{content:'',reasoning:'planning'}},
+    {body:{model:'deepseek-chat',messages:[{role:'user',content:'use tool'}],tools:[{type:'function',function:{name:'read_file'}}]},output:{content:'',reasoning:jsonToolCall()}},
+    {body:{model:'deepseek-chat',messages:[{role:'user',content:'answer'}],tools:[{type:'function',function:{name:'read_file'}}]},output:{content:'final answer',reasoning:'brief thought'}},
+  ];
+  for(const item of cases){
+    let calls=0;
+    const result=await toolRetryProxyCase({body:item.body,logger:()=>{},completeImpl:async()=>{calls+=1;return {...item.output,parentMessageId:null};}});
+    assert.equal(result.status,200);
+    assert.equal(calls,1);
+  }
+});
+
+test('reasoning-only tool response causes one same-session retry in chat mode with allowed tools',async()=>{
+  const calls=[];
+  const logs=[];
+  const sessions=new SessionStore();
+  const firstReasoning='PRIVATE_FIRST_REASONING_NEED_READ';
+  const result=await toolRetryProxyCase({
+    sessionStore:sessions,
+    body:{model:'deepseek-reasoner-search',messages:[{role:'user',content:'read package'}],tools:[{type:'function',function:{name:'read_file',parameters:{type:'object'}}}]},
+    logger:line=>logs.push(line),
+    completeImpl:async options=>{
+      calls.push(options);
+      if(calls.length===1){options.session.id='remote-session';options.session.parentMessageId='first-message';return {content:'',reasoning:firstReasoning,parentMessageId:'first-message'};}
+      return {content:jsonToolCall('read_file',{path:'package.json'}),reasoning:'',parentMessageId:'second-message'};
+    },
+  });
+  const response=JSON.parse(result.text);
+  assert.equal(calls.length,2);
+  assert.equal(calls[0].model.reasoning,true);
+  assert.equal(calls[0].model.search,true);
+  assert.equal(calls[1].model.reasoning,false);
+  assert.equal(calls[1].model.search,false);
+  assert.equal(calls[1].session,calls[0].session);
+  assert.equal(calls[1].session.id,'remote-session');
+  assert.equal(sessions.list().length,1);
+  assert.match(sessions.list()[0].key,/^anonymous:/);
+  assert.notEqual(sessions.list()[0].key,'default');
+  assert.match(calls[1].prompt,/\["read_file"\]/);
+  assert.doesNotMatch(calls[1].prompt,new RegExp(firstReasoning));
+  assert.equal(response.model,'deepseek-reasoner-search');
+  assert.equal(response.choices[0].message.tool_calls[0].function.name,'read_file');
+  assert.match(logs.join('\n'),/Retrying one reasoning-only tool response/);
+  assert.doesNotMatch(logs.join('\n'),new RegExp(firstReasoning));
+});
+
+test('final text from the second attempt is returned and only it enters local history',async()=>{
+  const sessions=new SessionStore();
+  const firstReasoning='PRIVATE_INTERMEDIATE_REASONING';
+  let calls=0;
+  let resolvedSession;
+  const result=await toolRetryProxyCase({
+    sessionStore:sessions,headers:{'x-agent-session':'retry-history'},logger:()=>{},
+    body:{model:'deepseek-reasoner',messages:[{role:'user',content:'finish'}],tools:[{type:'function',function:{name:'read_file'}}]},
+    completeImpl:async options=>{calls+=1;resolvedSession=options.session;return calls===1?{content:'',reasoning:firstReasoning,parentMessageId:'one'}:{content:'final answer after retry',reasoning:'should stay private',parentMessageId:'two'};},
+  });
+  const response=JSON.parse(result.text);
+  assert.equal(calls,2);
+  assert.equal(response.choices[0].message.content,'final answer after retry');
+  assert.equal(response.choices[0].message.reasoning_content,undefined);
+  assert.doesNotMatch(result.text,new RegExp(firstReasoning));
+  const history=resolvedSession.history;
+  assert.equal(history.length,1);
+  assert.equal(history[0].assistant,'final answer after retry');
+  assert.doesNotMatch(JSON.stringify(history),/PRIVATE_INTERMEDIATE_REASONING|should stay private/);
+});
+
+test('a second reasoning-only result stops after two calls with a safe final message',async()=>{
+  let calls=0;
+  const result=await toolRetryProxyCase({
+    logger:()=>{},
+    body:{model:'deepseek-reasoner',messages:[{role:'user',content:'use tool'}],tools:[{type:'function',function:{name:'read_file'}}]},
+    completeImpl:async()=>{calls+=1;return {content:'',reasoning:`PRIVATE_REASONING_${calls}`,parentMessageId:String(calls)};},
+  });
+  const response=JSON.parse(result.text);
+  assert.equal(calls,2);
+  assert.equal(response.choices[0].message.content,TOOL_RETRY_FAILURE_MESSAGE);
+  assert.equal(response.choices[0].message.reasoning_content,undefined);
+  assert.doesNotMatch(result.text,/PRIVATE_REASONING/);
+});
+
+test('network, authorization and timeout errors never trigger the tool correction retry',async()=>{
+  const errors=[new Error('network failed'),Object.assign(new Error('HTTP 401'),{status:401}),Object.assign(new Error('HTTP 403'),{status:403}),Object.assign(new Error('timed out'),{name:'TimeoutError',status:504})];
+  for(const error of errors){
+    let calls=0;
+    const result=await toolRetryProxyCase({
+      logger:()=>{},
+      body:{model:'deepseek-reasoner',messages:[{role:'user',content:'use tool'}],tools:[{type:'function',function:{name:'read_file'}}]},
+      completeImpl:async()=>{calls+=1;throw error;},
+    });
+    assert.equal(calls,1);
+    assert.ok(result.status>=400);
+  }
+});
+
+async function streamingToolRetryCase(path,body,expected){
+  let calls=0;
+  const firstReasoning='PRIVATE_STREAM_REASONING';
+  const correctivePromptText='Return the final answer for the current task now.';
+  const result=await toolRetryProxyCase({path,body:{...body,stream:true},logger:()=>{},completeImpl:async({onDelta,prompt})=>{
+    calls+=1;
+    if(calls===1){onDelta({reasoning:firstReasoning});return {content:'',reasoning:firstReasoning,parentMessageId:'one'};}
+    assert.match(prompt,/strict JSON tool call/);
+    const content=jsonToolCall('read_file',{path:'package.json'});
+    onDelta({content});
+    return {content,reasoning:'',parentMessageId:'two'};
+  }});
+  assert.equal(calls,2);
+  assert.match(result.contentType,/^text\/event-stream/);
+  assert.doesNotMatch(result.text,new RegExp(`${firstReasoning}|${correctivePromptText}`));
+  assert.match(result.text,expected);
+  return result.text;
+}
+
+test('OpenAI streaming emits tool_calls only after a successful retry',()=>streamingToolRetryCase(
+  '/v1/chat/completions',
+  {model:'deepseek-reasoner',messages:[{role:'user',content:'read'}],tools:[{type:'function',function:{name:'read_file'}}]},
+  /"tool_calls"/
+));
+
+test('Anthropic streaming emits tool_use only after a successful retry',()=>streamingToolRetryCase(
+  '/v1/messages',
+  {model:'deepseek-reasoner',max_tokens:64,messages:[{role:'user',content:'read'}],tools:[{name:'read_file',input_schema:{type:'object'}}]},
+  /"type":"tool_use"/
+));
+
+test('Responses streaming emits function_call only after a successful retry',()=>streamingToolRetryCase(
+  '/v1/responses',
+  {model:'deepseek-reasoner',input:'read',tools:[{type:'function',name:'read_file',parameters:{type:'object'}}]},
+  /"type":"function_call"/
+));
+
+async function withAgenticCycleServer(completeImpl,run,{sessions=new SessionStore(),sessionResolver}={}){
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,sessionStore:sessions,sessionResolver,logger:()=>{},completeImpl});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const post=async(path,body,agentSession)=>{
+    const headers={'content-type':'application/json'};
+    if(agentSession!==undefined)headers['x-agent-session']=agentSession;
+    const response=await fetch(`http://127.0.0.1:${server.address().port}${path}`,{method:'POST',headers,body:JSON.stringify(body)});
+    const responseText=await response.text();
+    assert.equal(response.status,200,responseText);
+    return {contentType:response.headers.get('content-type'),text:responseText,json:()=>JSON.parse(responseText)};
+  };
+  try{return await run({post,sessions});}
+  finally{server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
+}
+
+test('tool continuation sends only the current real result instead of duplicated client history',async()=>{
+  const calls=[];
+  const originalTask='ORIGINAL_ECHO_TASK_BEFORE_CONTINUATION';
+  const resultText='REAL_ECHO_RESULT_FOR_CONTINUATION';
+  await withAgenticCycleServer(async options=>{
+    calls.push(options);
+    if(calls.length===1){
+      options.session.id='remote-regression';
+      options.session.parentMessageId='parent-tool';
+      return {content:jsonToolCall('echo',{text:'probe'}),reasoning:'',parentMessageId:'parent-tool'};
+    }
+    return {content:'continuation complete',reasoning:'PRIVATE_CONTINUATION_REASONING',parentMessageId:'parent-final'};
+  },async({post})=>{
+    const tools=[{type:'function',function:{name:'echo',parameters:{type:'object'}}}];
+    const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:originalTask}],tools},'continuation-regression')).json();
+    const call=first.choices[0].message.tool_calls[0];
+    const continued=await post('/v1/chat/completions',{model:'deepseek-chat',messages:[
+      {role:'user',content:originalTask},
+      {role:'assistant',content:null,tool_calls:[call]},
+      {role:'tool',name:'echo',tool_call_id:call.id,content:resultText},
+    ],tools},'continuation-regression');
+    assert.doesNotMatch(continued.text,/PRIVATE_CONTINUATION_REASONING/);
+  });
+  assert.equal(calls.length,2);
+  assert.equal(calls[0].session,calls[1].session);
+  assert.equal(calls[1].session.parentMessageId,'parent-tool');
+  assert.doesNotMatch(calls[1].prompt,new RegExp(originalTask));
+  assert.doesNotMatch(calls[1].prompt,/assistant: \[Tool Call\]/);
+  assert.match(calls[1].prompt,/TOOL RESULT CONTINUATION/);
+  assert.match(calls[1].prompt,/\[Completed Tool Result\]/);
+  assert.match(calls[1].prompt,new RegExp(resultText));
+  assert.equal(calls[1].prompt.split(resultText).length-1,1);
+  assert.doesNotMatch(calls[1].prompt,/TOOL REQUEST SYSTEM/);
+});
+
+test('OpenAI tool result continuation preserves name, call id, result, session and streaming',async()=>{
+  const calls=[];
+  const marker='OPENAI_TOOL_RESULT_MARKER';
+  await withAgenticCycleServer(async options=>{
+    calls.push(options);
+    if(calls.length===1){options.session.id='remote-openai';options.session.parentMessageId='parent-tool';return {content:jsonToolCall('echo',{text:'request'}),reasoning:'PRIVATE_FIRST_REASONING',parentMessageId:'parent-tool'};}
+    assert.equal(options.session.parentMessageId,'parent-tool');
+    options.onDelta({content:marker});
+    options.session.parentMessageId='parent-final';
+    return {content:marker,reasoning:'',parentMessageId:'parent-final'};
+  },async({post,sessions})=>{
+    const tools=[{type:'function',function:{name:'echo',parameters:{type:'object'}}}];
+    const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'use echo'}],tools},'openai-cycle')).json();
+    const call=first.choices[0].message.tool_calls[0];
+    assert.equal(calls[0].session.history.length,0);
+    const second=await post('/v1/chat/completions',{model:'deepseek-chat',stream:true,messages:[
+      {role:'user',content:'use echo'},
+      {role:'assistant',content:null,tool_calls:[call]},
+      {role:'tool',name:'echo',tool_call_id:call.id,content:'client executed echo safely'},
+    ],tools},'openai-cycle');
+    assert.equal(calls.length,2);
+    assert.equal(calls[0].session,calls[1].session);
+    assert.doesNotMatch(calls[1].prompt,/user: use echo|\[Tool Call\]/);
+    assert.match(calls[1].prompt,/Completed Tool Result[\s\S]*name: echo/);
+    assert.match(calls[1].prompt,new RegExp(`call_id: ${call.id}`));
+    assert.match(calls[1].prompt,/Tool Result[\s\S]*client executed echo safely/);
+    assert.match(second.contentType,/^text\/event-stream/);
+    assert.match(second.text,new RegExp(marker));
+    assert.doesNotMatch(second.text,/PRIVATE_FIRST_REASONING/);
+    assert.equal(calls[0].session.history.length,1);
+    assert.equal(calls[0].session.history[0].assistant,marker);
+  });
+});
+
+test('Anthropic tool_result continuation preserves tool_use id, name and result',async()=>{
+  const calls=[];
+  const marker='ANTHROPIC_TOOL_RESULT_MARKER';
+  await withAgenticCycleServer(async options=>{
+    calls.push(options);
+    if(calls.length===1){options.session.id='remote-anthropic';options.session.parentMessageId='parent-tool';return {content:jsonToolCall('echo',{text:'request'}),reasoning:'PRIVATE_FIRST_REASONING',parentMessageId:'parent-tool'};}
+    return {content:marker,reasoning:'',parentMessageId:'parent-final'};
+  },async({post,sessions})=>{
+    const tools=[{name:'echo',input_schema:{type:'object'}}];
+    const first=(await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'use echo'}],tools},'anthropic-cycle')).json();
+    const call=first.content[0];
+    assert.equal(call.type,'tool_use');
+    assert.equal(calls[0].session.history.length,0);
+    const second=(await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:[
+      {role:'user',content:'use echo'},
+      {role:'assistant',content:[call]},
+      {role:'user',content:[{type:'tool_result',tool_use_id:call.id,content:'client executed echo safely'}]},
+    ],tools},'anthropic-cycle')).json();
+    assert.equal(calls.length,2);
+    assert.equal(calls[0].session,calls[1].session);
+    assert.doesNotMatch(calls[1].prompt,/use echo|\[Tool Call\]/);
+    assert.match(calls[1].prompt,/Completed Tool Result[\s\S]*name: echo/);
+    assert.match(calls[1].prompt,new RegExp(`call_id: ${call.id}`));
+    assert.match(calls[1].prompt,/Tool Result[\s\S]*client executed echo safely/);
+    assert.equal(second.content[0].text,marker);
+    assert.doesNotMatch(JSON.stringify(second),/PRIVATE_FIRST_REASONING/);
+  });
+});
+
+test('Responses function_call_output continuation preserves call id, name and result',async()=>{
+  const calls=[];
+  const marker='RESPONSES_TOOL_RESULT_MARKER';
+  await withAgenticCycleServer(async options=>{
+    calls.push(options);
+    if(calls.length===1){options.session.id='remote-responses';options.session.parentMessageId='parent-tool';return {content:jsonToolCall('echo',{text:'request'}),reasoning:'PRIVATE_FIRST_REASONING',parentMessageId:'parent-tool'};}
+    return {content:marker,reasoning:'',parentMessageId:'parent-final'};
+  },async({post,sessions})=>{
+    const tools=[{type:'function',name:'echo',parameters:{type:'object'}}];
+    const first=(await post('/v1/responses',{model:'deepseek-chat',input:'use echo',tools},'responses-cycle')).json();
+    const call=first.output[0];
+    assert.equal(call.type,'function_call');
+    assert.equal(calls[0].session.history.length,0);
+    const second=(await post('/v1/responses',{model:'deepseek-chat',previous_response_id:first.id,input:[
+      {type:'function_call_output',call_id:call.call_id,output:'client executed echo safely'},
+    ],tools},'responses-cycle')).json();
+    assert.equal(calls.length,2);
+    assert.equal(calls[0].session,calls[1].session);
+    assert.match(calls[1].prompt,/Tool Result[\s\S]*name: echo/);
+    assert.match(calls[1].prompt,new RegExp(`call_id: ${call.call_id}`));
+    assert.match(calls[1].prompt,/Tool Result[\s\S]*client executed echo safely/);
+    assert.equal(second.output[0].content[0].text,marker);
+    assert.doesNotMatch(JSON.stringify(second),/PRIVATE_FIRST_REASONING/);
+  });
+});
+
+test('two sequential OpenAI tools preserve distinct ids and arguments without a retry',async()=>{
+  const calls=[];
+  await withAgenticCycleServer(async options=>{
+    calls.push(options);
+    if(calls.length===1)return {content:jsonToolCall('first_tool',{value:'one'}),reasoning:'',parentMessageId:'one'};
+    if(calls.length===2)return {content:jsonToolCall('second_tool',{value:'two'}),reasoning:'',parentMessageId:'two'};
+    return {content:'two tools completed',reasoning:'',parentMessageId:'three'};
+  },async({post})=>{
+    const tools=['first_tool','second_tool'].map(name=>({type:'function',function:{name,parameters:{type:'object'}}}));
+    const base=[{role:'user',content:'use two tools'}];
+    const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:base,tools},'two-tools')).json();
+    const callOne=first.choices[0].message.tool_calls[0];
+    const messagesTwo=[...base,{role:'assistant',content:null,tool_calls:[callOne]},{role:'tool',name:'first_tool',tool_call_id:callOne.id,content:'result-one'}];
+    const second=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:messagesTwo,tools},'two-tools')).json();
+    const callTwo=second.choices[0].message.tool_calls[0];
+    assert.notEqual(callOne.id,callTwo.id);
+    assert.deepEqual(JSON.parse(callOne.function.arguments),{value:'one'});
+    assert.deepEqual(JSON.parse(callTwo.function.arguments),{value:'two'});
+    const third=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[...messagesTwo,{role:'assistant',content:null,tool_calls:[callTwo]},{role:'tool',name:'second_tool',tool_call_id:callTwo.id,content:'result-two'}],tools},'two-tools')).json();
+    assert.equal(calls.length,3);
+    assert.match(calls[2].prompt,new RegExp(`name: second_tool[\\s\\S]*call_id: ${callTwo.id}[\\s\\S]*result-two`));
+    assert.doesNotMatch(calls[2].prompt,new RegExp(`call_id: ${callOne.id}|result-one`));
+    assert.equal(third.choices[0].message.content,'two tools completed');
+  });
+});
+
+test('exact completed tool matching is protocol-neutral and canonicalizes argument order',()=>{
+  const session={toolCalls:new Map([['call_shared',{name:'echo',arguments:'{"b":2,"a":1}'}]])};
+  const bodies={
+    openai:{messages:[{role:'tool',name:'echo',tool_call_id:'call_shared',content:'openai result'}]},
+    anthropic:{messages:[{role:'user',content:[{type:'tool_result',tool_use_id:'call_shared',content:'anthropic result'}]}]},
+    responses:{input:[{type:'function_call_output',call_id:'call_shared',output:'responses result'}]},
+  };
+  for(const [kind,body] of Object.entries(bodies)){
+    const results=extractToolResults(body,kind,session);
+    assert.equal(results[0].callId,'call_shared');
+    assert.equal(results[0].name,'echo');
+    assert.equal(isExactCompletedToolCall({function:{name:'echo',arguments:'{"a":1,"b":2}'}},results),true);
+    assert.equal(isExactCompletedToolCall({function:{name:'echo',arguments:'{"a":1,"b":3}'}},results),false);
+  }
+});
+
+test('an exact repeated completed tool call gets one hidden corrective retry',async()=>{
+  const calls=[];
+  const finalMarker='EXACT_REPEAT_CORRECTED_FINAL';
+  await withAgenticCycleServer(async options=>{
+    calls.push(options);
+    if(calls.length===1){
+      options.session.id='remote-exact-repeat';
+      options.session.parentMessageId='parent-tool';
+      return {content:jsonToolCall('echo',{text:'same'}),reasoning:'',parentMessageId:'parent-tool'};
+    }
+    if(calls.length===2)return {content:jsonToolCall('echo',{text:'same'}),reasoning:'',parentMessageId:'parent-repeat'};
+    options.onDelta({content:finalMarker});
+    return {content:finalMarker,reasoning:'PRIVATE_CORRECTIVE_REASONING',parentMessageId:'parent-final'};
+  },async({post})=>{
+    const tools=[{type:'function',function:{name:'echo',parameters:{type:'object'}}}];
+    const first=(await post('/v1/chat/completions',{model:'deepseek-reasoner',messages:[{role:'user',content:'echo once'}],tools},'exact-repeat')).json();
+    const call=first.choices[0].message.tool_calls[0];
+    const second=await post('/v1/chat/completions',{model:'deepseek-reasoner',stream:true,messages:[
+      {role:'user',content:'echo once'},
+      {role:'assistant',content:null,tool_calls:[call]},
+      {role:'tool',name:'echo',tool_call_id:call.id,content:'same'},
+    ],tools},'exact-repeat');
+    assert.equal(calls.length,3);
+    assert.equal(calls[0].session,calls[1].session);
+    assert.equal(calls[1].session,calls[2].session);
+    assert.equal(calls[1].session.parentMessageId,'parent-tool');
+    assert.equal(calls[2].model.reasoning,false);
+    assert.equal(calls[2].model.search,false);
+    assert.match(calls[2].prompt,/already executed the tool call you just repeated/);
+    assert.match(second.text,new RegExp(finalMarker));
+    assert.doesNotMatch(second.text,/PRIVATE_CORRECTIVE_REASONING|already executed the tool call|tool_call/);
+  });
+});
+
+test('a second exact repetition stops safely without a third corrective attempt',async()=>{
+  const calls=[];
+  await withAgenticCycleServer(async options=>{
+    calls.push(options);
+    if(calls.length===1){
+      options.session.id='remote-repeat-limit';
+      options.session.parentMessageId='parent-tool';
+    }
+    return {content:jsonToolCall('echo',{text:'same'}),reasoning:'PRIVATE_REPEAT_REASONING',parentMessageId:`parent-${calls.length}`};
+  },async({post})=>{
+    const tools=[{type:'function',function:{name:'echo',parameters:{type:'object'}}}];
+    const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'echo once'}],tools},'repeat-limit')).json();
+    const call=first.choices[0].message.tool_calls[0];
+    const second=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[
+      {role:'tool',name:'echo',tool_call_id:call.id,content:'same'},
+    ],tools},'repeat-limit')).json();
+    assert.equal(calls.length,3);
+    assert.equal(second.choices[0].message.content,REPEATED_TOOL_FAILURE_MESSAGE);
+    assert.equal(second.choices[0].message.tool_calls,undefined);
+    assert.doesNotMatch(JSON.stringify(second),/PRIVATE_REPEAT_REASONING/);
+  });
+});
+
+test('the same tool with different arguments remains a valid next tool call',async()=>{
+  const calls=[];
+  await withAgenticCycleServer(async options=>{
+    calls.push(options);
+    return calls.length===1
+      ? {content:jsonToolCall('echo',{text:'first'}),reasoning:'',parentMessageId:'parent-first'}
+      : {content:jsonToolCall('echo',{text:'second'}),reasoning:'',parentMessageId:'parent-second'};
+  },async({post})=>{
+    const tools=[{type:'function',function:{name:'echo',parameters:{type:'object'}}}];
+    const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'echo twice'}],tools},'different-args')).json();
+    const call=first.choices[0].message.tool_calls[0];
+    const second=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[
+      {role:'tool',name:'echo',tool_call_id:call.id,content:'first'},
+    ],tools},'different-args')).json();
+    assert.equal(calls.length,2);
+    assert.equal(second.choices[0].finish_reason,'tool_calls');
+    assert.deepEqual(JSON.parse(second.choices[0].message.tool_calls[0].function.arguments),{text:'second'});
+  });
+});
+
+test('different x-agent-session values never share the same session object',async()=>{
+  const seen=new Map();
+  await withAgenticCycleServer(async options=>{
+    const key=options.prompt.includes('agent A')?'A':'B';
+    if(!seen.has(key))seen.set(key,options.session);
+    else assert.equal(seen.get(key),options.session);
+    return {content:`final ${key}`,reasoning:'',parentMessageId:key};
+  },async({post})=>{
+    await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'agent A'}]},'agent-A');
+    await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'agent B'}]},'agent-B');
+    await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'agent A'}]},'agent-A');
+    assert.notEqual(seen.get('A'),seen.get('B'));
+  });
+});
+
+test('metadata.user_id, user and x-agent-session select stable sessions with header priority',async()=>{
+  const calls=[];
+  await withAgenticCycleServer(async options=>{calls.push(options);return {content:'ok',reasoning:'',parentMessageId:String(calls.length)};},async({post})=>{
+    const request=(label,extra={},header)=>post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:label}],...extra},header);
+    await request('metadata one',{metadata:{user_id:'metadata-id'}});
+    await request('metadata two',{metadata:{user_id:'metadata-id'}});
+    await request('user one',{user:'user-id'});
+    await request('user two',{user:'user-id'});
+    await request('header one',{metadata:{user_id:'metadata-a'},user:'user-a'},'header-id');
+    await request('header two',{metadata:{user_id:'metadata-b'},user:'user-b'},'header-id');
+  });
+  assert.equal(calls[0].session,calls[1].session);
+  assert.equal(calls[2].session,calls[3].session);
+  assert.equal(calls[4].session,calls[5].session);
+  assert.notEqual(calls[0].session,calls[2].session);
+  assert.notEqual(calls[0].session,calls[4].session);
+});
+
+test('sequential and parallel anonymous HTTP requests always use isolated sessions',async()=>{
+  const calls=[];
+  await withAgenticCycleServer(async options=>{calls.push(options);return {content:'anonymous final',reasoning:'',parentMessageId:null};},async({post})=>{
+    const body=label=>({model:'deepseek-chat',messages:[{role:'user',content:label}]});
+    await post('/v1/chat/completions',body('anonymous one'));
+    await post('/v1/chat/completions',body('anonymous two'));
+    await Promise.all([
+      post('/v1/chat/completions',body('anonymous parallel A')),
+      post('/v1/chat/completions',body('anonymous parallel B')),
+    ]);
+  });
+  assert.equal(calls.length,4);
+  assert.equal(new Set(calls.map(call=>call.session)).size,4);
+});
+
+async function anonymousToolContinuationCase(kind){
+  const calls=[];
+  const resolver=new SessionResolver();
+  await withAgenticCycleServer(async options=>{
+    calls.push(options);
+    if(calls.length===1){options.session.id=`remote-${kind}`;options.session.parentMessageId='parent-tool';return {content:jsonToolCall('echo',{value:kind}),reasoning:'',parentMessageId:'parent-tool'};}
+    return {content:`${kind} final`,reasoning:'',parentMessageId:'parent-final'};
+  },async({post})=>{
+    if(kind==='openai'){
+      const tools=[{type:'function',function:{name:'echo',parameters:{type:'object'}}}];
+      const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'use echo'}],tools})).json();
+      const call=first.choices[0].message.tool_calls[0];
+      assert.equal(resolver.size,1);
+      const second=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'tool',name:'echo',tool_call_id:call.id,content:'openai result'}],tools})).json();
+      assert.equal(second.choices[0].message.content,'openai final');
+    }else if(kind==='anthropic'){
+      const tools=[{name:'echo',input_schema:{type:'object'}}];
+      const first=(await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'use echo'}],tools})).json();
+      const call=first.content[0];
+      assert.equal(resolver.size,1);
+      const second=(await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:[{type:'tool_result',tool_use_id:call.id,content:'anthropic result'}]}],tools})).json();
+      assert.equal(second.content[0].text,'anthropic final');
+    }else{
+      const tools=[{type:'function',name:'echo',parameters:{type:'object'}}];
+      const first=(await post('/v1/responses',{model:'deepseek-chat',input:'use echo',tools})).json();
+      const call=first.output[0];
+      assert.equal(resolver.size,1);
+      const second=(await post('/v1/responses',{model:'deepseek-chat',input:[{type:'function_call_output',call_id:call.call_id,output:'responses result'}],tools})).json();
+      assert.equal(second.output[0].content[0].text,'responses final');
+    }
+  },{sessionResolver:resolver});
+  assert.equal(calls.length,2);
+  assert.equal(calls[0].session,calls[1].session);
+  assert.equal(calls[1].session.parentMessageId,'parent-tool');
+  assert.equal(resolver.size,0);
+}
+
+test('anonymous tool results resume their bound OpenAI, Anthropic and Responses sessions',async t=>{
+  await t.test('OpenAI tool_call_id',()=>anonymousToolContinuationCase('openai'));
+  await t.test('Anthropic tool_use_id',()=>anonymousToolContinuationCase('anthropic'));
+  await t.test('Responses call_id',()=>anonymousToolContinuationCase('responses'));
+});
+
+test('unknown and expired call ids start new isolated sessions',async t=>{
+  await t.test('unknown call id',async()=>{
+    const calls=[];
+    const resolver=new SessionResolver();
+    await withAgenticCycleServer(async options=>{calls.push(options);return calls.length===1?{content:jsonToolCall('echo',{}),reasoning:'',parentMessageId:'tool'}:{content:'safe final',reasoning:'',parentMessageId:'final'};},async({post})=>{
+      const tools=[{type:'function',function:{name:'echo'}}];
+      await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'use echo'}],tools});
+      await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'tool',name:'echo',tool_call_id:'call_unknown',content:'unknown result'}],tools});
+    },{sessionResolver:resolver});
+    assert.notEqual(calls[0].session,calls[1].session);
+  });
+  await t.test('expired call id',async()=>{
+    let now=0;
+    const calls=[];
+    const resolver=new SessionResolver({ttlMs:5,now:()=>now});
+    let callId;
+    await withAgenticCycleServer(async options=>{calls.push(options);return calls.length===1?{content:jsonToolCall('echo',{}),reasoning:'',parentMessageId:'tool'}:{content:'safe final',reasoning:'',parentMessageId:'final'};},async({post})=>{
+      const tools=[{type:'function',function:{name:'echo'}}];
+      const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'use echo'}],tools})).json();
+      callId=first.choices[0].message.tool_calls[0].id;
+      now=6;
+      await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'tool',name:'echo',tool_call_id:callId,content:'late result'}],tools});
+    },{sessionResolver:resolver});
+    assert.notEqual(calls[0].session,calls[1].session);
+    assert.equal(resolver.size,0);
+  });
+});
+
+test('/v1/sessions exposes only bounded opaque keys and session metadata',async()=>{
+  const sessions=new SessionStore();
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,sessionStore:sessions,logger:()=>{},completeImpl:async()=>({content:'safe final',reasoning:'',parentMessageId:null})});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const secretSession='Bearer-session-secret';
+  const secretPrompt='PRIVATE_FILE_CONTENT_MARKER';
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json','x-agent-session':secretSession,authorization:'Bearer authorization-secret',cookie:'session=cookie-secret'},body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content:secretPrompt}]})});
+    assert.equal(response.status,200);
+    const listing=await (await fetch(`http://127.0.0.1:${server.address().port}/v1/sessions`)).text();
+    assert.doesNotMatch(listing,/Bearer-session-secret|authorization-secret|cookie-secret|PRIVATE_FILE_CONTENT_MARKER|token|cookie|authorization|default/i);
+    const parsed=JSON.parse(listing);
+    assert.match(parsed.data[0].key,/^explicit:header:[a-f0-9]{32}$/);
+    assert.deepEqual(Object.keys(parsed.data[0]).sort(),['key','remote_session','turns','updated_at'].sort());
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+});
+
+async function withCountTokensServer(run,{maxBytes=1024*1024,host='127.0.0.1',key=''}={}){
+  const sessions=new SessionStore();
+  let completionCalls=0;
+  const config={host,port:0,key,maxBytes,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,sessionStore:sessions,logger:()=>{},completeImpl:async()=>{completionCalls+=1;return {content:'unexpected',reasoning:'',parentMessageId:null};}});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const request=async({method='POST',body,raw,headers={}}={})=>{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/messages/count_tokens`,{method,headers:{...(method==='POST'?{'content-type':'application/json'}:{}),...headers},...(method==='POST'?{body:raw===undefined?JSON.stringify(body):raw}:{})});
+    const text=await response.text();
+    return {status:response.status,headers:response.headers,text,json:()=>JSON.parse(text)};
+  };
+  try{return await run({request,sessions,getCompletionCalls:()=>completionCalls,port:server.address().port});}
+  finally{server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
+}
+
+test('POST /v1/messages/count_tokens returns a local Anthropic-compatible estimate',async()=>{
+  await withCountTokensServer(async({request,sessions,getCompletionCalls})=>{
+    const body={
+      model:'deepseek-chat',
+      system:[{type:'text',text:'system prompt'}],
+      messages:[
+        {role:'user',content:[{type:'text',text:'English русский 中文 😀'}]},
+        {role:'assistant',content:[{type:'thinking',thinking:'private thought'},{type:'tool_use',id:'toolu_local',name:'echo',input:{value:'probe'}}]},
+        {role:'user',content:[{type:'tool_result',tool_use_id:'toolu_local',content:'probe result'}]},
+      ],
+      tools:[{name:'echo',description:'Return a value',input_schema:{type:'object',properties:{value:{type:'string'}}}}],
+    };
+    const result=await request({body});
+    assert.equal(result.status,200,result.text);
+    assert.equal(result.headers.get('x-deepseek-bridge-token-count'),'estimate');
+    assert.deepEqual(Object.keys(result.json()),['input_tokens']);
+    assert.ok(Number.isInteger(result.json().input_tokens));
+    assert.ok(result.json().input_tokens>=0);
+    assert.equal(getCompletionCalls(),0);
+    assert.equal(sessions.list().length,0);
+  });
+});
+
+test('count_tokens handles empty, malformed, wrong-method and secret-bearing requests safely',async()=>{
+  await withCountTokensServer(async({request,sessions,getCompletionCalls})=>{
+    const empty=await request({body:{}});
+    assert.equal(empty.status,400);
+    assert.deepEqual(empty.json(),{type:'error',error:{type:'invalid_request_error',message:'model is required and must be a non-empty string.'}});
+    const malformed=await request({raw:'{"model":"deepseek-chat","messages":['});
+    assert.equal(malformed.status,400);
+    assert.equal(malformed.json().type,'error');
+    assert.equal(malformed.json().error.type,'invalid_request_error');
+    const method=await request({method:'GET'});
+    assert.equal(method.status,405);
+    const secret='Bearer bearer-secret token=token-secret cookie=cookie-secret authorization=auth-secret';
+    const invalid=await request({body:{model:{secret},messages:[]},headers:{authorization:secret}});
+    assert.equal(invalid.status,400);
+    assert.doesNotMatch(invalid.text,/bearer-secret|token-secret|cookie-secret|auth-secret/);
+    assert.equal(getCompletionCalls(),0);
+    assert.equal(sessions.list().length,0);
+  });
+});
+
+test('count_tokens keeps the existing request-size limit',async()=>{
+  await withCountTokensServer(async({request,sessions,getCompletionCalls})=>{
+    const result=await request({body:{model:'deepseek-chat',messages:[{role:'user',content:'x'.repeat(512)}]}});
+    assert.equal(result.status,413);
+    assert.equal(result.json().type,'error');
+    assert.equal(result.json().error.type,'request_too_large');
+    assert.equal(getCompletionCalls(),0);
+    assert.equal(sessions.list().length,0);
+  },{maxBytes:128});
+});
+
+test('count_tokens reuses local authorization and CORS enforcement',async()=>{
+  const key='local-count-key-that-is-long-enough';
+  await withCountTokensServer(async({request,getCompletionCalls})=>{
+    const body={model:'deepseek-chat',messages:[]};
+    const unauthorized=await request({body});
+    assert.equal(unauthorized.status,401);
+    assert.equal(unauthorized.json().type,'error');
+    assert.equal(unauthorized.json().error.type,'authentication_error');
+    const forbidden=await request({body,headers:{authorization:`Bearer ${key}`,origin:'https://localhost.evil.example'}});
+    assert.equal(forbidden.status,403);
+    assert.equal(forbidden.json().error.type,'permission_error');
+    const allowed=await request({body,headers:{authorization:`Bearer ${key}`,origin:'http://localhost:3000'}});
+    assert.equal(allowed.status,200);
+    assert.equal(allowed.headers.get('access-control-allow-origin'),'http://localhost:3000');
+    assert.equal(getCompletionCalls(),0);
+  },{host:'0.0.0.0',key});
+});
+
+test('Bridge logs the safe upstream reason while streaming clients receive no secrets',async()=>{
+  const logs=[];
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,logger:line=>logs.push(line),completeImpl:async()=>{throw new Error('Gateway unavailable: Bearer bearer-secret token=token-secret cookie=session-secret authorization=auth-secret');}});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try {
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-chat',stream:true,messages:[{role:'user',content:'test'}]})});
+    const output=await response.text();
+    assert.match(output,/DeepSeek streaming request failed/);
+    assert.doesNotMatch(output,/bearer-secret|token-secret|session-secret|auth-secret/);
+    assert.match(logs.join('\n'),/Gateway unavailable/);
+    assert.doesNotMatch(logs.join('\n'),/bearer-secret|token-secret|session-secret|auth-secret/);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+});
+
+test('Bridge normal API errors do not disclose upstream secrets',async()=>{
+  const logs=[];
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  const server=createProxyServer({config,logger:line=>logs.push(line),completeImpl:async()=>{const error=new Error('Gateway unavailable: Bearer bearer-secret token=token-secret cookie=session-secret authorization=auth-secret');error.status=502;throw error;}});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try {
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content:'test'}]})});
+    const output=await response.text();
+    assert.match(output,/DeepSeek request failed/);
+    assert.doesNotMatch(output,/bearer-secret|token-secret|session-secret|auth-secret/);
+    assert.match(logs.join('\n'),/Gateway unavailable/);
+    assert.doesNotMatch(logs.join('\n'),/bearer-secret|token-secret|session-secret|auth-secret/);
   } finally {
     server.closeAllConnections?.();
     await new Promise(resolve=>server.close(resolve));

@@ -1,10 +1,10 @@
 const base = process.env.PROXY_URL || 'http://127.0.0.1:9655';
 const runId = Date.now().toString(36);
 
-async function post(path, body, timeoutMs = 240_000) {
+async function post(path, body, timeoutMs = 240_000, agentSession = `live-${runId}-${path}`) {
   const response = await fetch(base + path, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-agent-session': `live-${runId}-${path}` },
+    headers: { 'content-type': 'application/json', 'x-agent-session': agentSession },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -16,6 +16,18 @@ async function post(path, body, timeoutMs = 240_000) {
 function parseJson(text, label) {
   try { return JSON.parse(text); }
   catch { throw new Error(`${label}: invalid JSON response`); }
+}
+
+function safeToolDiagnostic(call) {
+  const name = typeof call?.function?.name === 'string' && /^[A-Za-z_][\w.-]{0,127}$/.test(call.function.name) ? call.function.name : 'unknown';
+  const callId = typeof call?.id === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(call.id) ? call.id : 'unknown';
+  let argumentsValue = {};
+  try { argumentsValue = JSON.parse(call?.function?.arguments || '{}'); } catch { argumentsValue = { invalid_json: true }; }
+  const redacted = JSON.stringify(argumentsValue)
+    .replace(/Bearer\s+[^\s"}]+/gi, 'Bearer [REDACTED]')
+    .replace(/("(?:token|cookie|authorization)"\s*:\s*")[^"]*(")/gi, '$1[REDACTED]$2')
+    .slice(0, 1000);
+  return `name=${name} call_id=${callId} arguments=${redacted}`;
 }
 
 function parseOpenAIStream(text) {
@@ -56,16 +68,38 @@ async function main() {
   if (!reason.choices?.[0]?.message?.reasoning_content) throw new Error('reasoning_content missing.');
 
   const toolMarker = `TOOL_OK_${runId}`;
+  const toolFinalMarker = `TOOL_CONTINUED_${runId}`;
+  const toolSession = `live-${runId}-tool-cycle`;
+  const echoTool = { type: 'function', function: { name: 'echo', description: 'Return supplied text without side effects', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } } };
   const tool = parseJson((await post('/v1/chat/completions', {
-    model: 'deepseek-chat',
-    messages: [{ role: 'user', content: `Use echo with text ${toolMarker}. Return only the tool request.` }],
-    tools: [{ type: 'function', function: { name: 'echo', description: 'Return supplied text', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } } }],
+    model: 'deepseek-reasoner',
+    messages: [{ role: 'user', content: `Use echo with text ${toolMarker}. After the real tool result, reply exactly ${toolFinalMarker}. Return only the tool request now.` }],
+    tools: [echoTool],
     stream: false,
-  })).text, 'tool completion');
+  }, 240_000, toolSession)).text, 'tool completion');
   const call = tool.choices?.[0]?.message?.tool_calls?.[0];
   if (tool.choices?.[0]?.finish_reason !== 'tool_calls' || call?.function?.name !== 'echo') throw new Error('Validated tool call missing.');
   const args = parseJson(call.function.arguments, 'tool arguments');
   if (args.text !== toolMarker) throw new Error('Tool arguments marker mismatch.');
+  const safeEchoResult = args.text;
+  const continued = parseJson((await post('/v1/chat/completions', {
+    model: 'deepseek-reasoner',
+    messages: [
+      { role: 'user', content: `Use echo with text ${toolMarker}. After the real tool result, reply exactly ${toolFinalMarker}. Return only the tool request now.` },
+      { role: 'assistant', content: null, tool_calls: [call] },
+      { role: 'tool', name: 'echo', tool_call_id: call.id, content: `echo returned ${safeEchoResult}. Reply exactly ${toolFinalMarker}.` },
+    ],
+    tools: [echoTool],
+    stream: false,
+  }, 240_000, toolSession)).text, 'tool continuation');
+  const repeatedCall = continued.choices?.[0]?.message?.tool_calls?.[0];
+  if (repeatedCall) {
+    let repeatedArguments = null;
+    try { repeatedArguments = JSON.parse(repeatedCall.function?.arguments || '{}'); } catch {}
+    const exactRepeat = repeatedCall.function?.name === call.function.name && JSON.stringify(repeatedArguments) === JSON.stringify(args);
+    throw new Error(`${exactRepeat ? 'Tool continuation repeated the completed call' : 'Tool continuation unexpectedly requested another tool'}: ${safeToolDiagnostic(repeatedCall)}`);
+  }
+  if (continued.choices?.[0]?.message?.content?.trim() !== toolFinalMarker) throw new Error('Tool continuation marker mismatch.');
 
   const responsesMarker = `RESPONSES_OK_${runId}`;
   const responses = parseJson((await post('/v1/responses', { model: 'deepseek-chat', input: `Reply exactly: ${responsesMarker}`, stream: false })).text, 'Responses API');
@@ -83,7 +117,7 @@ async function main() {
   })).text, 'search completion');
   if (!search.choices?.[0]?.message?.content?.includes(searchMarker)) throw new Error('Search-mode marker missing.');
 
-  console.log('✓ auth/session, normal response, OpenAI SSE, reasoning, tool call, Responses, Anthropic and search passed');
+  console.log('✓ auth/session, normal response, OpenAI SSE, reasoning, tool call continuation, Responses, Anthropic and search passed');
 }
 
 main().catch(error => {
