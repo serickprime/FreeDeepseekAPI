@@ -1,8 +1,9 @@
 'use strict';
+const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const { complete, parseRetryAfter, parseStream }=require('../client'); const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
 const {TOOL_RETRY_FAILURE_MESSAGE,createToolRetryPrompt,hideRetryReasoning,shouldRetryToolResponse}=require('../lib/tool_retry');
 const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
-const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory}=require('../lib/setup');
+const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory,readAuthStatus}=require('../lib/setup');
 const {runDiagnostics,boundedTimeout}=require('../scripts/doctor');
 test('loopback and external bind security',()=>{assert.equal(isLoopback('127.0.0.1'),true);assert.equal(isLoopback('0.0.0.0'),false);assert.throws(()=>assertConfig({HOST:'0.0.0.0'}));assert.equal(assertConfig({HOST:'0.0.0.0',PROXY_API_KEY:'x'.repeat(24)}).host,'0.0.0.0');});
 test('localhost browser origins allow explicit ports but reject deceptive hosts',()=>{assert.equal(isLocalOrigin('http://127.0.0.1:9655'),true);assert.equal(isLocalOrigin('http://localhost:3000'),true);assert.equal(isLocalOrigin('https://localhost.evil.example'),false);});
@@ -15,6 +16,24 @@ test('safe error logging never throws for unusual errors or logger failures',()=
   const unusual={get message(){throw new Error('message getter failed');},toString(){throw new Error('toString failed');}};
   assert.doesNotThrow(()=>logSafeError(unusual,()=>{throw new Error('logger failed');}));
   assert.equal(safeError(unusual),'Internal error');
+});
+test('setup auth status accepts only non-empty string credentials',t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'deepseek-bridge-auth-status-'));
+  const authPath=path.join(root,'deepseek-auth.json');
+  const previousAuthPath=process.env.DEEPSEEK_AUTH_PATH;
+  delete process.env.DEEPSEEK_AUTH_PATH;
+  t.after(()=>{
+    if(previousAuthPath===undefined) delete process.env.DEEPSEEK_AUTH_PATH;
+    else process.env.DEEPSEEK_AUTH_PATH=previousAuthPath;
+    fs.rmSync(root,{recursive:true,force:true});
+  });
+
+  fs.writeFileSync(authPath,JSON.stringify({token:'valid-token',cookie:'session=valid'}));
+  assert.deepEqual(readAuthStatus(root),{present:true,valid:true});
+  fs.writeFileSync(authPath,JSON.stringify({token:'   ',cookie:'session=valid'}));
+  assert.deepEqual(readAuthStatus(root),{present:true,valid:false});
+  fs.writeFileSync(authPath,JSON.stringify({token:123,cookie:{value:'session=invalid'}}));
+  assert.deepEqual(readAuthStatus(root),{present:true,valid:false});
 });
 test('session expiry/reset and bounded history',()=>{const s=new SessionStore({ttlMs:1,maxHistory:2});const x=s.get('a');s.add(x,'one','a');s.add(x,'two','b');s.add(x,'three','c');assert.equal(x.history.length,2);s.reset('a');assert.equal(s.list().length,0);});
 
