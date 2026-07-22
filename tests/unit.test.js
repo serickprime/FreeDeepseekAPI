@@ -1520,3 +1520,115 @@ test('repeated completed tool correction is visible only as a bounded diagnostic
   assert.equal(responses[1].repeated_tool_retry_attempted,true);
   assert.equal(responses[1].outcome,'final_text');
 });
+
+let claudeProbeModule;
+async function claudeProbe(){return claudeProbeModule??=await import('../scripts/claude_contract_probe.mjs');}
+
+test('Claude contract probe records only its explicit safe field allowlist',async()=>{
+  const {SAFE_RECORD_FIELDS,sanitizeContractRequest}=await claudeProbe();
+  const secretValues=[
+    'PROMPT_CONTRACT_SECRET','SYSTEM_CONTRACT_SECRET','MESSAGE_CONTRACT_SECRET',
+    'ARGUMENT_CONTRACT_SECRET','RESULT_CONTRACT_SECRET','SCHEMA_CONTRACT_SECRET',
+    'AUTH_CONTRACT_SECRET','Z:\\contract-probe-private\\marker.txt','toolu_full_private_identifier',
+  ];
+  const record=sanitizeContractRequest({
+    sequence:1,method:'POST',pathname:'/v1/messages',salt:Buffer.alloc(32,7),
+    body:{
+      model:'probe-model',stream:true,prompt:secretValues[0],authorization:secretValues[6],
+      system:secretValues[1],metadata:{safe_key:'value',authorization:secretValues[6]},
+      messages:[
+        {role:'user',content:[{type:'text',text:secretValues[2]}]},
+        {role:'assistant',content:[{type:'tool_use',id:secretValues[8],name:'Read',input:{file_path:secretValues[7],secret:secretValues[3]}}]},
+        {role:'user',content:[{type:'tool_result',tool_use_id:secretValues[8],content:secretValues[4]}]},
+      ],
+      tools:[{name:'Read',description:'private description',input_schema:{type:'object',properties:{file_path:{type:'string',description:secretValues[5]}}}}],
+    },
+  });
+  assert.deepEqual(Object.keys(record),SAFE_RECORD_FIELDS);
+  assert.deepEqual(record.tool_names,['Read']);
+  assert.equal(record.tool_result_count,1);
+  assert.equal(record.tool_use_count,1);
+  assert.deepEqual(record.content_block_types,['text','tool_use','tool_result']);
+  assert.deepEqual(record.tool_object_keys,[['description','input_schema','name']]);
+  assert.equal(record.tool_schema_present,true);
+  assert.equal(record.tool_result_id_fingerprint.length,1);
+  assert.notEqual(record.tool_result_id_fingerprint[0],secretValues[8]);
+  const serialized=JSON.stringify(record);
+  for(const value of secretValues)assert.equal(serialized.includes(value),false,value);
+  assert.equal(serialized.includes('private description'),false);
+  assert.equal(serialized.includes('authorization'),false);
+});
+
+test('Claude contract probe bounds tool names and tolerates unexpected body shapes',async()=>{
+  const {sanitizeContractRequest}=await claudeProbe();
+  const tools=Array.from({length:80},(_,index)=>({name:index===0?`Read\n${'x'.repeat(200)}`:index===1?{bad:true}:`Tool_${index}`}));
+  const record=sanitizeContractRequest({sequence:-1,method:null,pathname:null,salt:Buffer.alloc(32,8),body:{messages:{bad:true},tools}});
+  assert.equal(record.sequence,0);
+  assert.equal(record.messages_shape,'object');
+  assert.equal(record.tool_count,80);
+  assert.equal(record.tool_names.length,32);
+  assert.ok(record.tool_names[0].length<=64);
+  assert.doesNotMatch(record.tool_names[0],/[\r\n]/);
+  assert.equal(record.tool_names[1],'invalid');
+  assert.doesNotThrow(()=>sanitizeContractRequest({body:null,salt:Buffer.alloc(32,9)}));
+  assert.doesNotThrow(()=>sanitizeContractRequest({body:['unexpected'],salt:Buffer.alloc(32,10)}));
+});
+
+test('Claude contract probe derives Read arguments only from the supplied schema',async()=>{
+  const {deriveReadArguments}=await claudeProbe();
+  assert.deepEqual(deriveReadArguments({input_schema:{type:'object',properties:{file_path:{type:'string'},offset:{type:'number'}}}},'private-path'),{file_path:'private-path'});
+  assert.deepEqual(deriveReadArguments({input_schema:{type:'object',properties:{path:{type:'string'}}}},'private-path'),{path:'private-path'});
+  assert.throws(()=>deriveReadArguments({input_schema:{type:'object',properties:{command:{type:'string'}}}},'private-path'),/supported string path field/);
+});
+
+test('Claude contract mock is loopback-only, bounded and survives logger exceptions',async()=>{
+  const {startContractMockServer}=await claudeProbe();
+  const mock=await startContractMockServer({maxMessageRequests:1,logger:()=>{throw new Error('logger failed');}});
+  try{
+    assert.match(mock.origin,/^http:\/\/127\.0\.0\.1:\d+$/);
+    const body={model:'probe-model',messages:[{role:'user',content:'not logged'}],tools:[{name:'Read',input_schema:{type:'object',properties:{file_path:{type:'string'}}}}]};
+    const first=await fetch(`${mock.origin}/v1/messages`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    assert.equal(first.status,200);
+    const second=await fetch(`${mock.origin}/v1/messages`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    assert.equal(second.status,429);
+    assert.equal(mock.state.messageRequests,2);
+    assert.equal(mock.records.length,2);
+  }finally{await mock.close();}
+});
+
+test('Claude contract mock supports local count_tokens without exposing request content',async()=>{
+  const {startContractMockServer}=await claudeProbe();
+  const lines=[];
+  const mock=await startContractMockServer({logger:line=>lines.push(line)});
+  try{
+    const secret='COUNT_TOKEN_PROMPT_SECRET';
+    const response=await fetch(`${mock.origin}/v1/messages/count_tokens?beta=true`,{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer HEADER_SECRET'},body:JSON.stringify({model:'probe-model',system:secret,messages:[{role:'user',content:secret}],tools:[{name:'Read',description:secret,input_schema:{type:'object',properties:{file_path:{description:secret}}}}]})});
+    assert.equal(response.status,200);
+    assert.deepEqual(await response.json(),{input_tokens:100});
+    assert.equal(mock.state.countTokenRequests,1);
+    assert.equal(mock.records[0].pathname,'/v1/messages/count_tokens');
+    assert.equal(mock.records[0].count_tokens_requested,true);
+    assert.equal(mock.records[0].tools_field_present,true);
+    assert.equal(lines.join('\n').includes(secret),false);
+    assert.equal(lines.join('\n').includes('HEADER_SECRET'),false);
+  }finally{await mock.close();}
+});
+
+test('Claude contract probe timeout is bounded and invokes cleanup callback once',async()=>{
+  const {withTimeout}=await claudeProbe();
+  let cleanups=0;
+  await assert.rejects(withTimeout(new Promise(()=>{}),20,()=>{cleanups+=1;}),/timed out/);
+  assert.equal(cleanups,1);
+});
+
+test('Claude contract probe always removes its temporary marker workspace',async()=>{
+  const {withProbeWorkspace}=await claudeProbe();
+  let directory;
+  await assert.rejects(withProbeWorkspace(async workspace=>{
+    directory=workspace.directory;
+    assert.equal(fs.existsSync(path.join(directory,'marker.txt')),true);
+    assert.equal(fs.existsSync(path.join(directory,'second-marker.txt')),true);
+    throw new Error('intentional offline failure');
+  }),/intentional offline failure/);
+  assert.equal(fs.existsSync(directory),false);
+});
