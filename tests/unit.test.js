@@ -1633,6 +1633,101 @@ test('Claude contract probe always removes its temporary marker workspace',async
   assert.equal(fs.existsSync(directory),false);
 });
 
+let claudeIdentityProbeModule;
+async function claudeIdentityProbe(){return claudeIdentityProbeModule??=await import('../scripts/claude_session_identity_probe.mjs');}
+
+test('Claude identity probe records only safe identifier summaries',async()=>{
+  const {SAFE_IDENTITY_RECORD_FIELDS,sanitizeIdentityRequest}=await claudeIdentityProbe();
+  const salt=Buffer.alloc(32,11);
+  const secrets={
+    auth:'IDENTITY_AUTH_SECRET',cookie:'IDENTITY_COOKIE_SECRET',prompt:'IDENTITY_PROMPT_SECRET',
+    message:'IDENTITY_MESSAGE_SECRET',argument:'IDENTITY_ARGUMENT_SECRET',
+    result:'IDENTITY_RESULT_SECRET',session:'11111111-2222-4333-8444-555555555555',
+    custom:'PROCESS_SCOPED_HEADER_SECRET',
+  };
+  const record=sanitizeIdentityRequest({
+    sequence:1,method:'POST',pathname:'/v1/messages',salt,
+    headers:{
+      authorization:`Bearer ${secrets.auth}`,cookie:secrets.cookie,
+      'x-claude-code-session-id':secrets.session,'x-agent-session':secrets.custom,
+      'x-arbitrary-session-secret':'MUST_NOT_BE_CAPTURED','content-type':'application/json',
+    },
+    body:{
+      prompt:secrets.prompt,session_id:secrets.session,
+      metadata:{user_id:secrets.custom,authorization:secrets.auth},
+      messages:[
+        {role:'user',content:[{type:'text',text:secrets.message}]},
+        {role:'assistant',content:[{type:'tool_use',id:'FULL_TOOL_ID',name:'Read',input:{file_path:secrets.argument}}]},
+        {role:'user',content:[{type:'tool_result',tool_use_id:'FULL_TOOL_ID',content:secrets.result}]},
+      ],
+    },
+  });
+  assert.deepEqual(Object.keys(record),SAFE_IDENTITY_RECORD_FIELDS);
+  assert.equal(record.candidate_headers['x-claude-code-session-id'].present,true);
+  assert.equal(record.candidate_headers['x-claude-code-session-id'].type,'string');
+  assert.equal(record.candidate_headers['x-claude-code-session-id'].length,36);
+  assert.equal(record.candidate_headers['x-claude-code-session-id'].fingerprint.length,12);
+  assert.equal(record.candidate_headers['x-agent-session'].fingerprint.length,12);
+  assert.equal(record.body_candidates.top_level.session_id.present,true);
+  assert.equal(record.body_candidates.metadata.user_id.present,true);
+  assert.equal(record.tool_result_count,1);
+  assert.ok(record.candidate_header_names.includes('x-arbitrary-session-secret'));
+  assert.equal(Object.hasOwn(record.candidate_headers,'x-arbitrary-session-secret'),false);
+  const serialized=JSON.stringify(record);
+  for(const value of Object.values(secrets))assert.equal(serialized.includes(value),false,value);
+  for(const forbidden of ['authorization','cookie','prompt','tool_use_id','file_path'])assert.equal(serialized.includes(forbidden),false,forbidden);
+});
+
+test('Claude identity fingerprints are process-salted, stable and bounded',async()=>{
+  const {summarizeIdentifier}=await claudeIdentityProbe();
+  const value='same-identity-value';
+  const first=summarizeIdentifier(value,Buffer.alloc(32,1));
+  const same=summarizeIdentifier(value,Buffer.alloc(32,1));
+  const differentValue=summarizeIdentifier('different-identity-value',Buffer.alloc(32,1));
+  const differentSalt=summarizeIdentifier(value,Buffer.alloc(32,2));
+  assert.equal(first.fingerprint,same.fingerprint);
+  assert.notEqual(first.fingerprint,differentValue.fingerprint);
+  assert.notEqual(first.fingerprint,differentSalt.fingerprint);
+  assert.equal(summarizeIdentifier('x'.repeat(300),Buffer.alloc(32,1)).fingerprint,'invalid');
+  assert.equal(summarizeIdentifier({bad:true},Buffer.alloc(32,1)).fingerprint,'invalid');
+  assert.doesNotThrow(()=>summarizeIdentifier(null,Buffer.alloc(32,1)));
+  assert.doesNotThrow(()=>summarizeIdentifier(['one','two'],Buffer.alloc(32,1)));
+});
+
+test('Claude identity mock is loopback-only, bounded and omits arbitrary header values',async()=>{
+  const {startIdentityMockServer}=await claudeIdentityProbe();
+  const lines=[];
+  const mock=await startIdentityMockServer({maxMessageRequests:1,logger:line=>lines.push(line)});
+  try{
+    assert.match(mock.origin,/^http:\/\/127\.0\.0\.1:\d+$/);
+    const secret='ARBITRARY_HEADER_VALUE_SECRET';
+    const body={model:'probe-model',messages:[{role:'user',content:'not logged'}],tools:[{name:'Read',input_schema:{type:'object',properties:{file_path:{type:'string'}}}}]};
+    const headers={'content-type':'application/json','x-agent-session':'process-one','x-claude-code-session-id':'session-one','x-arbitrary-session-secret':secret,authorization:'Bearer AUTH_SECRET',cookie:'COOKIE_SECRET'};
+    const first=await fetch(`${mock.origin}/v1/messages`,{method:'POST',headers,body:JSON.stringify(body)});
+    assert.equal(first.status,200);
+    const second=await fetch(`${mock.origin}/v1/messages`,{method:'POST',headers,body:JSON.stringify(body)});
+    assert.equal(second.status,429);
+    const serialized=lines.join('\n');
+    assert.equal(serialized.includes(secret),false);
+    assert.equal(serialized.includes('AUTH_SECRET'),false);
+    assert.equal(serialized.includes('COOKIE_SECRET'),false);
+    assert.equal(serialized.includes('authorization'),false);
+    assert.equal(serialized.includes('cookie'),false);
+  }finally{await mock.close();}
+});
+
+test('Claude identity workspace is always removed',async()=>{
+  const {withIdentityWorkspace}=await claudeIdentityProbe();
+  let directory;
+  await assert.rejects(withIdentityWorkspace(async workspace=>{
+    directory=workspace.directory;
+    assert.equal(fs.existsSync(path.join(directory,'marker.txt')),true);
+    assert.equal(fs.existsSync(path.join(directory,'second-marker.txt')),true);
+    throw new Error('intentional identity probe failure');
+  }),/intentional identity probe failure/);
+  assert.equal(fs.existsSync(directory),false);
+});
+
 let claudeLiveProbeModule;
 async function claudeLiveProbe(){return claudeLiveProbeModule??=await import('../scripts/claude_long_session_live_probe.mjs');}
 
