@@ -304,8 +304,8 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       }
       if (req.method === 'POST' && url.pathname === '/reset-session') {
         const resolution = resolver.resolve({ headers: req.headers, body });
-        sessions.reset(resolution.key);
-        resolver.releaseSession(resolution.key);
+        sessions.reset(resolution.upstreamKey);
+        resolver.releaseSession(resolution.upstreamKey);
         return send(res, 200, { ok: true });
       }
 
@@ -313,16 +313,18 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       const kind = paths[url.pathname];
       if (req.method !== 'POST' || !kind) return sendError(res, 404, 'Not found');
       const resolution = resolver.resolve({ headers: req.headers, body, kind });
-      const agentKey = resolution.key;
-      const session = sessions.get(agentKey);
+      const upstreamKey = resolution.upstreamKey;
+      const session = sessions.get(upstreamKey);
       const toolResults = extractToolResults(body, kind, session).filter(result => result.known);
       const isToolContinuation = toolResults.length > 0;
       diagnosticResponse = toolDiagnostics.request({
         protocol: kind,
         route: url.pathname,
         body,
-        sessionSource: resolution.source,
-        sessionKey: agentKey,
+        upstreamSource: resolution.upstreamSource,
+        upstreamKey,
+        clientSessionSource: resolution.clientSource,
+        clientSessionKey: resolution.clientKey,
         isToolContinuation,
         toolResultCount: toolResults.length,
       });
@@ -405,11 +407,11 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         }
       }
       if (isToolContinuation && !toolCall && output.reasoning) output = { ...output, reasoning: '' };
-      resolver.release(resolution.callIds, agentKey);
+      resolver.release(resolution.callIds, upstreamKey);
       forgetCompletedToolCalls(session, resolution.callIds);
       if (toolCall) {
         rememberToolCall(session, toolCall);
-        resolver.bind(toolCall.id, agentKey);
+        resolver.bind(toolCall.id, upstreamKey);
       }
       if (!toolCall) sessions.add(session, upstreamPrompt, output.content);
       const openaiIdentity = streamIdentity && kind === 'openai' ? streamIdentity : {};
