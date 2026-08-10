@@ -103,6 +103,14 @@ claude --model deepseek-reasoner
 
 `local-key` здесь является локальным служебным значением, а не ключом вашего аккаунта DeepSeek.
 
+Если в Claude Code 2.1.226 нужны только встроенные `Glob` и `Read`, используйте проверенный фрагмент запуска:
+
+```powershell
+claude --model deepseek-reasoner --tools "Glob,Read" --allowedTools "Glob,Read" --permission-mode dontAsk
+```
+
+Не добавляйте `--bare`: в Claude Code 2.1.226 этот флаг включает SIMPLE mode (`CLAUDE_CODE_SIMPLE=1`) и может исключить `Glob` и другие встроенные инструменты из запросов к Bridge.
+
 ## Запуск OpenCode через панель
 
 1. Установите OpenCode.
@@ -193,7 +201,7 @@ $env:BRIDGE_TOOL_DIAGNOSTICS="1"
 npm start
 ```
 
-Диагностика записывает только ограниченные метаданные: наличие и форму `tools`, безопасные имена инструментов, признаки tool continuation/retry и непрозрачные ссылки на сессии. `session_source` и `session_ref` относятся к upstream-сессии; `client_session_source` и `client_session_ref` — только к client correlation. Оба ref создаются через HMAC со случайной солью текущего процесса, поэтому не предназначены для сравнения между перезапусками. Prompt, reasoning, content, tool arguments/results, полные идентификаторы, token, cookie и authorization в эти записи не включаются. Включение диагностики не меняет ответы API.
+Диагностика записывает события `tool_request`, `tool_response`, `upstream_stage` и `upstream_error`. Каждый обрабатываемый API-запрос получает случайный внутренний `request_ref`, который связывает только события этого HTTP-запроса, не отправляется в DeepSeek и не возвращается клиенту. Записи содержат только ограниченные метаданные: наличие и форму `tools`, безопасные имена инструментов, этап upstream-запроса, безопасную категорию ошибки, признаки tool continuation/retry и непрозрачные ссылки на сессии. `session_source` и `session_ref` относятся к upstream-сессии; `client_session_source` и `client_session_ref` — только к client correlation. Оба session ref создаются через HMAC со случайной солью текущего процесса, поэтому не предназначены для сравнения между перезапусками. Prompt, reasoning, content, tool arguments/results, полные идентификаторы, URL, upstream response body, stack trace, token, cookie и authorization в эти записи не включаются. Включение диагностики не меняет ответы API или retry policy.
 
 ## Приблизительный count_tokens
 
