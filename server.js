@@ -251,6 +251,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
     let stream = null;
     let requestPath = '';
     let diagnosticResponse = null;
+    let latestUpstream = { stage: 'unknown', attempt: 1, maxAttempts: 1 };
     let reasoningRetryAttempted = false;
     let repeatedToolRetryAttempted = false;
     try {
@@ -312,6 +313,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       const paths = { '/v1/chat/completions': 'openai', '/v1/responses': 'responses', '/v1/messages': 'anthropic' };
       const kind = paths[url.pathname];
       if (req.method !== 'POST' || !kind) return sendError(res, 404, 'Not found');
+      const requestRef = toolDiagnostics.createRequestRef();
       const resolution = resolver.resolve({ headers: req.headers, body, kind });
       const upstreamKey = resolution.upstreamKey;
       const session = sessions.get(upstreamKey);
@@ -327,7 +329,24 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         clientSessionKey: resolution.clientKey,
         isToolContinuation,
         toolResultCount: toolResults.length,
+        requestRef,
       });
+      const onUpstreamStage = (stage, metadata = {}) => {
+        latestUpstream = {
+          stage,
+          attempt: metadata.attempt,
+          maxAttempts: metadata.maxAttempts,
+        };
+        diagnosticResponse?.stage(stage);
+      };
+      const onUpstreamError = (error, metadata = {}) => {
+        latestUpstream = {
+          stage: metadata.stage,
+          attempt: metadata.attempt,
+          maxAttempts: metadata.maxAttempts,
+        };
+        diagnosticResponse?.upstreamError(error, latestUpstream);
+      };
       const input = normalize(body, kind, session);
       const modelName = String(input.model || 'deepseek-chat').toLowerCase();
       const model = MODELS[modelName];
@@ -365,6 +384,8 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         model,
         timeoutMs: config.timeoutMs,
         onDelta: input.stream ? delta => stream.delta(delta) : undefined,
+        onStage: onUpstreamStage,
+        onError: onUpstreamError,
       });
       let toolCall = parseToolCallFromOutput(output, allowedTools);
       let correctiveAttempted = false;
@@ -379,6 +400,8 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
           model: MODELS['deepseek-chat'],
           timeoutMs: config.timeoutMs,
           onDelta: input.stream ? delta => stream.delta(delta) : undefined,
+          onStage: onUpstreamStage,
+          onError: onUpstreamError,
         });
         toolCall = parseToolCallFromOutput(output, allowedTools);
         safeFailure = !toolCall && !String(output?.content || '').trim();
@@ -395,6 +418,8 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
             model: MODELS['deepseek-chat'],
             timeoutMs: config.timeoutMs,
             onDelta: input.stream ? delta => stream.delta(delta) : undefined,
+            onStage: onUpstreamStage,
+            onError: onUpstreamError,
           });
           toolCall = parseToolCallFromOutput(output, allowedTools);
           if (!toolCall) output = { ...output, reasoning: '' };
@@ -430,6 +455,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       if (stream) return stream.finish({ output, toolCall, finalResponse });
       return send(res, 200, finalResponse);
     } catch (error) {
+      diagnosticResponse?.upstreamError(error, latestUpstream);
       diagnosticResponse?.response({ reasoningRetryAttempted, repeatedToolRetryAttempted, outcome: 'upstream_error' });
       logSafeError(error, logger);
       if (stream) return stream.fail('DeepSeek streaming request failed. Run npm run doctor or re-authenticate.');

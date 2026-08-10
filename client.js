@@ -44,8 +44,8 @@ function parseRetryAfter(value, now = Date.now()) {
   return Number.isFinite(date) ? Math.max(0, date - now) : 0;
 }
 
-function upstreamError(status, retryAfter, detail = '') {
-  const error = new Error(`DeepSeek Web HTTP ${status}${detail ? `: ${detail}` : ''}`);
+function upstreamError(status, retryAfter) {
+  const error = new Error(`DeepSeek Web HTTP ${status}`);
   error.name = 'DeepSeekUpstreamError';
   error.status = status;
   error.retryAfterMs = parseRetryAfter(retryAfter);
@@ -58,16 +58,23 @@ async function checked(url, options, timeoutMs, fetchImpl = fetch) {
   try {
     response = await fetchImpl(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
   } catch (error) {
-    if (error.name === 'TimeoutError' || error.name === 'AbortError') {
-      error.status = 504;
-      error.retryable = true;
+    const causeCode = error?.cause?.code ?? error?.code;
+    const timeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+    const safe = new Error(timeout ? 'Upstream request timed out' : 'fetch failed');
+    safe.name = typeof error?.name === 'string' ? error.name : 'Error';
+    if (typeof causeCode === 'string' && /^[A-Z0-9_]{1,64}$/.test(causeCode)) safe.causeCode = causeCode;
+    if (Number.isInteger(error?.status)) safe.status = error.status;
+    if (error?.retryable === true) safe.retryable = true;
+    if (Number.isFinite(error?.retryAfterMs)) safe.retryAfterMs = error.retryAfterMs;
+    if (timeout) {
+      safe.status = 504;
+      safe.retryable = true;
     }
-    throw error;
+    throw safe;
   }
   if (!response.ok) {
-    let detail = '';
-    try { detail = String(await response.text()).replace(/\s+/g, ' ').slice(0, 200); } catch {}
-    throw upstreamError(response.status, response.headers.get('retry-after'), detail);
+    try { await response.body?.cancel(); } catch {}
+    throw upstreamError(response.status, response.headers.get('retry-after'));
   }
   return response;
 }
@@ -181,7 +188,11 @@ function resetRemoteSession(session) {
 
 async function completeOnce({ prompt, session, model, onDelta, onStage, timeoutMs, auth, fetchImpl, solvePow }) {
   const baseHeaders = headers(auth);
-  if (!session.id) session.id = await createRemoteSession(auth, timeoutMs, fetchImpl);
+  if (!session.id) {
+    onStage?.('remote_session_start');
+    session.id = await createRemoteSession(auth, timeoutMs, fetchImpl);
+    onStage?.('remote_session_created');
+  }
   onStage?.('challenge_start');
   const challengeResponse = await checked(`${BASE_URL}/api/v0/chat/create_pow_challenge`, {
     method: 'POST', headers: baseHeaders, body: JSON.stringify({ target_path: COMPLETION_PATH }),
@@ -218,6 +229,7 @@ async function completeOnce({ prompt, session, model, onDelta, onStage, timeoutM
   onStage?.('completion_completed');
   if (!response.body) throw new Error('DeepSeek returned an empty response body.');
   onStage?.('stream_received');
+  onStage?.('stream_read');
   const result = await parseStream(response.body, onDelta);
   onStage?.('stream_parsed');
   if (result.parentMessageId) session.parentMessageId = result.parentMessageId;
@@ -230,6 +242,7 @@ async function complete({
   model,
   onDelta,
   onStage,
+  onError,
   timeoutMs = 120_000,
   maxRetries = 2,
   maxRetryDelayMs = 10_000,
@@ -239,11 +252,19 @@ async function complete({
   sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms)),
 }) {
   let lastError;
+  const maxAttempts = Number(maxRetries) + 1;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    const attemptNumber = attempt + 1;
+    let currentStage = 'unknown';
+    const attemptStage = stage => {
+      currentStage = stage;
+      onStage?.(stage, { attempt: attemptNumber, maxAttempts });
+    };
     try {
-      return await completeOnce({ prompt, session, model, onDelta, onStage, timeoutMs, auth, fetchImpl, solvePow });
+      return await completeOnce({ prompt, session, model, onDelta, onStage: attemptStage, timeoutMs, auth, fetchImpl, solvePow });
     } catch (error) {
       lastError = error;
+      try { onError?.(error, { stage: currentStage, attempt: attemptNumber, maxAttempts }); } catch {}
       if (error.status === 401 || error.status === 403) resetRemoteSession(session);
       if (!error.retryable || attempt === maxRetries) throw error;
       resetRemoteSession(session);
