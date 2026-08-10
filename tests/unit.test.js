@@ -1,8 +1,9 @@
 'use strict';
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
-const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { complete, loadAuth, parseRetryAfter, parseStream }=client; const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
+const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,clientSessionKey,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { complete, loadAuth, parseRetryAfter, parseStream }=client; const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
 const {TOOL_RETRY_FAILURE_MESSAGE,createToolRetryPrompt,hideRetryReasoning,shouldRetryToolResponse}=require('../lib/tool_retry');
 const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
+const {MAX_TOOL_NAMES,MAX_TOOL_NAME_CHARS,createToolDiagnostics}=require('../lib/tool_diagnostics');
 const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory,readAuthStatus}=require('../lib/setup');
 const {runDiagnostics,boundedTimeout}=require('../scripts/doctor');
 test('loopback and external bind security',()=>{assert.equal(isLoopback('127.0.0.1'),true);assert.equal(isLoopback('0.0.0.0'),false);assert.throws(()=>assertConfig({HOST:'0.0.0.0'}));assert.equal(assertConfig({HOST:'0.0.0.0',PROXY_API_KEY:'x'.repeat(24)}).host,'0.0.0.0');});
@@ -97,12 +98,96 @@ test('session resolver prioritizes and hashes explicit identifiers',()=>{
   const header=resolver.resolve({headers:{'x-agent-session':'agent-header'},body:{metadata:{user_id:'metadata-user'},user:'body-user'},kind:'openai'});
   const metadata=resolver.resolve({body:{metadata:{user_id:'metadata-user'},user:'body-user'},kind:'openai'});
   const user=resolver.resolve({body:{user:'body-user'},kind:'openai'});
-  assert.equal(header.key,explicitSessionKey('header','agent-header'));
-  assert.equal(metadata.key,explicitSessionKey('metadata','metadata-user'));
-  assert.equal(user.key,explicitSessionKey('user','body-user'));
-  assert.notEqual(header.key,metadata.key);
-  assert.doesNotMatch(`${header.key}${metadata.key}${user.key}`,/agent-header|metadata-user|body-user/);
-  assert.equal(resolver.resolve({body:{metadata:{user_id:'metadata-user'}},kind:'openai'}).key,metadata.key);
+  assert.equal(header.upstreamKey,explicitSessionKey('header','agent-header'));
+  assert.equal(metadata.upstreamKey,explicitSessionKey('metadata','metadata-user'));
+  assert.equal(user.upstreamKey,explicitSessionKey('user','body-user'));
+  assert.notEqual(header.upstreamKey,metadata.upstreamKey);
+  assert.doesNotMatch(`${header.upstreamKey}${metadata.upstreamKey}${user.upstreamKey}`,/agent-header|metadata-user|body-user/);
+  assert.equal(resolver.resolve({body:{metadata:{user_id:'metadata-user'}},kind:'openai'}).upstreamKey,metadata.upstreamKey);
+});
+
+test('Claude session header creates stable client identity without stateful upstream routing',()=>{
+  let sequence=0;
+  const resolver=new SessionResolver({randomUUID:()=>`claude-turn-${++sequence}`});
+  const first=resolver.resolve({headers:{'x-claude-code-session-id':'claude-session-one'},kind:'anthropic'});
+  const second=resolver.resolve({headers:{'x-claude-code-session-id':'claude-session-one'},kind:'anthropic'});
+  const other=resolver.resolve({headers:{'x-claude-code-session-id':'claude-session-two'},kind:'anthropic'});
+  assert.equal(first.clientSource,'claude_header');
+  assert.equal(first.clientKey,second.clientKey);
+  assert.notEqual(first.clientKey,other.clientKey);
+  assert.match(first.clientKey,/^client:claude:[a-f0-9]{64}$/);
+  assert.doesNotMatch(first.clientKey,/claude-session-one/);
+  assert.equal(first.upstreamSource,'anonymous');
+  assert.equal(second.upstreamSource,'anonymous');
+  assert.notEqual(first.upstreamKey,second.upstreamKey);
+  assert.equal(first.upstreamKey,'anonymous:claude-turn-1');
+  assert.equal(second.upstreamKey,'anonymous:claude-turn-2');
+});
+
+test('client identity validates Claude headers and follows Node lowercase header names',()=>{
+  const invalidValues=['','   ','x'.repeat(129),123,{value:'object'}];
+  for(const value of invalidValues){
+    const resolution=new SessionResolver().resolve({headers:{'x-claude-code-session-id':value},kind:'anthropic'});
+    assert.equal(resolution.clientSource,'unavailable');
+    assert.equal(resolution.clientKey,null);
+    assert.equal(resolution.upstreamSource,'anonymous');
+  }
+  const wrongCase=new SessionResolver().resolve({headers:{'X-Claude-Code-Session-Id':'not-a-real-node-header-key'},kind:'anthropic'});
+  assert.equal(wrongCase.clientSource,'unavailable');
+  assert.equal(wrongCase.clientKey,null);
+  assert.equal(clientSessionKey('claude',''),null);
+  assert.equal(clientSessionKey('claude',123),null);
+  assert.doesNotThrow(()=>new SessionResolver().resolve({headers:null,body:null,kind:'anthropic'}));
+});
+
+test('client and upstream identity use independent precedence rules',()=>{
+  const resolver=new SessionResolver({randomUUID:()=> 'unused'});
+  const both=resolver.resolve({
+    headers:{'x-claude-code-session-id':'claude-client','x-agent-session':'explicit-upstream'},
+    body:{metadata:{user_id:'metadata-id'},user:'user-id'},
+    kind:'anthropic',
+  });
+  assert.equal(both.clientSource,'claude_header');
+  assert.equal(both.clientKey,clientSessionKey('claude','claude-client'));
+  assert.equal(both.upstreamSource,'explicit_header');
+  assert.equal(both.upstreamKey,explicitSessionKey('header','explicit-upstream'));
+
+  const headerOnly=resolver.resolve({headers:{'x-agent-session':'explicit-upstream'},kind:'anthropic'});
+  assert.equal(headerOnly.clientSource,'explicit_header');
+  assert.equal(headerOnly.clientKey,clientSessionKey('header','explicit-upstream'));
+  assert.equal(headerOnly.upstreamKey,both.upstreamKey);
+
+  const metadata=resolver.resolve({body:{metadata:{user_id:'metadata-id'},user:'user-id'},kind:'anthropic'});
+  assert.equal(metadata.clientSource,'explicit_metadata');
+  assert.equal(metadata.clientKey,clientSessionKey('metadata','metadata-id'));
+  assert.equal(metadata.upstreamSource,'explicit_metadata');
+  assert.equal(metadata.upstreamKey,explicitSessionKey('metadata','metadata-id'));
+
+  const user=resolver.resolve({body:{user:'user-id'},kind:'anthropic'});
+  assert.equal(user.clientSource,'explicit_user');
+  assert.equal(user.upstreamSource,'explicit_user');
+  const unavailable=resolver.resolve({kind:'anthropic'});
+  assert.equal(unavailable.clientSource,'unavailable');
+  assert.equal(unavailable.clientKey,null);
+});
+
+test('tool results retain upstream linkage while Claude client identity stays stable',()=>{
+  let sequence=0;
+  const resolver=new SessionResolver({randomUUID:()=>`tool-turn-${++sequence}`});
+  const headers={'x-claude-code-session-id':'claude-tool-session'};
+  const first=resolver.resolve({headers,kind:'anthropic'});
+  assert.equal(resolver.bind('call-claude-tool',first.upstreamKey),true);
+  const continuation=resolver.resolve({
+    headers,
+    body:{messages:[{role:'user',content:[{type:'tool_result',tool_use_id:'call-claude-tool'}]}]},
+    kind:'anthropic',
+  });
+  const nextTurn=resolver.resolve({headers,kind:'anthropic'});
+  assert.equal(continuation.upstreamSource,'tool_result');
+  assert.equal(continuation.upstreamKey,first.upstreamKey);
+  assert.equal(continuation.clientKey,first.clientKey);
+  assert.equal(nextTurn.clientKey,first.clientKey);
+  assert.notEqual(nextTurn.upstreamKey,first.upstreamKey);
 });
 
 test('anonymous session resolution is unique and never uses default',()=>{
@@ -110,11 +195,11 @@ test('anonymous session resolution is unique and never uses default',()=>{
   const resolver=new SessionResolver({randomUUID:()=>`request-${++sequence}`});
   const first=resolver.resolve({kind:'openai'});
   const second=resolver.resolve({kind:'openai'});
-  assert.equal(first.key,'anonymous:request-1');
-  assert.equal(second.key,'anonymous:request-2');
-  assert.notEqual(first.key,second.key);
-  assert.notEqual(first.key,'default');
-  assert.notEqual(second.key,'default');
+  assert.equal(first.upstreamKey,'anonymous:request-1');
+  assert.equal(second.upstreamKey,'anonymous:request-2');
+  assert.notEqual(first.upstreamKey,second.upstreamKey);
+  assert.notEqual(first.upstreamKey,'default');
+  assert.notEqual(second.upstreamKey,'default');
 });
 
 test('tool result call ids are extracted only from their supported protocols',()=>{
@@ -124,25 +209,38 @@ test('tool result call ids are extracted only from their supported protocols',()
   assert.deepEqual(extractToolResultCallIds({messages:[{role:'user',tool_call_id:'ignored'}]},'openai'),[]);
 });
 
+test('explicit upstream identity keeps precedence over a conflicting tool-result link',()=>{
+  const resolver=new SessionResolver({randomUUID:()=> 'unused'});
+  resolver.bind('call-linked','anonymous:linked-session');
+  const resolution=resolver.resolve({
+    headers:{'x-agent-session':'explicit-session'},
+    body:{messages:[{role:'tool',tool_call_id:'call-linked'}]},
+    kind:'openai',
+  });
+  assert.equal(resolution.upstreamKey,explicitSessionKey('header','explicit-session'));
+  assert.equal(resolution.upstreamSource,'explicit_header');
+  assert.deepEqual(resolution.callIds,['call-linked']);
+});
+
 test('call-id links expire, are bounded and reject unsafe identifiers',()=>{
   let now=100;
   let sequence=0;
   const resolver=new SessionResolver({ttlMs:10,maxLinks:2,now:()=>now,randomUUID:()=>`fresh-${++sequence}`});
   assert.equal(resolver.bind('call-a','anonymous:one'),true);
-  assert.equal(resolver.resolve({kind:'openai',body:{messages:[{role:'tool',tool_call_id:'call-a'}]}}).key,'anonymous:one');
+  assert.equal(resolver.resolve({kind:'openai',body:{messages:[{role:'tool',tool_call_id:'call-a'}]}}).upstreamKey,'anonymous:one');
   resolver.bind('call-b','anonymous:two');
   resolver.bind('call-c','anonymous:three');
   assert.equal(resolver.size,2);
-  assert.equal(resolver.resolve({kind:'openai',body:{messages:[{role:'tool',tool_call_id:'call-a'}]}}).source,'anonymous');
+  assert.equal(resolver.resolve({kind:'openai',body:{messages:[{role:'tool',tool_call_id:'call-a'}]}}).upstreamSource,'anonymous');
   now=111;
-  assert.equal(resolver.resolve({kind:'openai',body:{messages:[{role:'tool',tool_call_id:'call-b'}]}}).source,'anonymous');
+  assert.equal(resolver.resolve({kind:'openai',body:{messages:[{role:'tool',tool_call_id:'call-b'}]}}).upstreamSource,'anonymous');
   assert.equal(resolver.size,0);
   assert.equal(normalizeCallId('x'.repeat(129)),null);
   assert.equal(normalizeCallId('../unsafe'),null);
   assert.equal(resolver.bind('x'.repeat(129),'anonymous:four'),false);
   const oversizedSession=resolver.resolve({headers:{'x-agent-session':'s'.repeat(129)},body:{metadata:{user_id:'must-not-fallback'}},kind:'openai'});
-  assert.equal(oversizedSession.source,'anonymous');
-  assert.doesNotMatch(oversizedSession.key,/must-not-fallback|s{20}/);
+  assert.equal(oversizedSession.upstreamSource,'anonymous');
+  assert.doesNotMatch(oversizedSession.upstreamKey,/must-not-fallback|s{20}/);
 });
 
 test('session store has bounded memory and no implicit default key',()=>{
@@ -1357,4 +1455,552 @@ test('setup folder selection and working-directory validation are bounded',async
   const invalid=await noLaunch.action('claude',{model:'deepseek-reasoner',workingDirectory:'Z:\\missing-deepseek-bridge-folder'});
   assert.equal(invalid.ok,false);
   assert.match(invalid.message,/Папка проекта/);
+});
+
+const diagnosticConfig={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+function diagnosticRecords(lines){return lines.flatMap(line=>{try{const record=JSON.parse(line);return record?.event?[record]:[];}catch{return [];}});}
+function createDiagnosticsEnabledServer(options){
+  const previous=process.env.BRIDGE_TOOL_DIAGNOSTICS;
+  process.env.BRIDGE_TOOL_DIAGNOSTICS='1';
+  try{return createProxyServer({config:diagnosticConfig,...options});}
+  finally{if(previous===undefined)delete process.env.BRIDGE_TOOL_DIAGNOSTICS;else process.env.BRIDGE_TOOL_DIAGNOSTICS=previous;}
+}
+async function withDiagnosticsServer(options,run){
+  const server=createDiagnosticsEnabledServer(options);
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const post=async(route,body,headers={})=>{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}${route}`,{method:'POST',headers:{'content-type':'application/json',...headers},body:JSON.stringify(body)});
+    const responseText=await response.text();
+    assert.equal(response.status,200,responseText);
+    return {contentType:response.headers.get('content-type'),text:responseText,json:()=>JSON.parse(responseText)};
+  };
+  try{return await run(post);}
+  finally{server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
+}
+
+test('tool diagnostics are disabled by default',async()=>{
+  const previous=process.env.BRIDGE_TOOL_DIAGNOSTICS;
+  delete process.env.BRIDGE_TOOL_DIAGNOSTICS;
+  const lines=[];
+  let server;
+  try{server=createProxyServer({config:diagnosticConfig,logger:line=>lines.push(line),completeImpl:async()=>({content:'ordinary final',reasoning:'',parentMessageId:null})});}
+  finally{if(previous===undefined)delete process.env.BRIDGE_TOOL_DIAGNOSTICS;else process.env.BRIDGE_TOOL_DIAGNOSTICS=previous;}
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content:'offline'}]})});
+    assert.equal(response.status,200);
+    assert.equal(diagnosticRecords(lines).length,0);
+  }finally{server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
+});
+
+test('tool diagnostics are bounded and never break requests when logging fails',()=>{
+  const lines=[];
+  const diagnostics=createToolDiagnostics({enabled:true,logger:line=>lines.push(line)});
+  const manyTools=Array.from({length:MAX_TOOL_NAMES+10},(_,index)=>({function:{name:index===0?`Read\n${'x'.repeat(MAX_TOOL_NAME_CHARS+20)}`:index===1?{invalid:true}:`tool_${index}`}}));
+  const response=diagnostics.request({protocol:'openai',route:'/v1/chat/completions',body:{model:'deepseek-chat',tools:manyTools},upstreamSource:'anonymous',upstreamKey:'anonymous:private',clientSessionSource:'unavailable',clientSessionKey:null,toolResultCount:0});
+  response.response({outcome:'final_text',contentNonempty:true});
+  const records=diagnosticRecords(lines);
+  assert.equal(records[0].tool_names.length,MAX_TOOL_NAMES);
+  assert.ok(records[0].tool_names[0].length<=MAX_TOOL_NAME_CHARS);
+  assert.doesNotMatch(records[0].tool_names[0],/[\r\n]/);
+  assert.equal(records[0].tool_names[1],'invalid');
+  assert.equal(records[0].client_session_source,'unavailable');
+  assert.equal(records[0].client_session_ref,null);
+  const wrongLines=[];
+  const wrong=createToolDiagnostics({enabled:true,logger:line=>wrongLines.push(line)});
+  assert.doesNotThrow(()=>wrong.request({protocol:'anthropic',route:'/v1/messages',body:{model:'deepseek-chat',tools:{unexpected:true}},upstreamSource:'anonymous',upstreamKey:'private',clientSessionSource:'unavailable',clientSessionKey:null}));
+  assert.equal(diagnosticRecords(wrongLines)[0].tools_field_shape,'object');
+  assert.equal(diagnosticRecords(wrongLines)[0].raw_tool_count,0);
+  const failing=createToolDiagnostics({enabled:true,logger:()=>{throw new Error('logger failed');}});
+  assert.doesNotThrow(()=>failing.request({protocol:'anthropic',route:'/v1/messages',body:{model:'deepseek-chat',tools:[]},upstreamSource:'anonymous',upstreamKey:'private',clientSessionSource:'unavailable',clientSessionKey:null}));
+});
+
+test('Claude client correlation stays stable while ordinary upstream turns remain stateless',async()=>{
+  const lines=[];
+  const calls=[];
+  let remoteSequence=0;
+  const outputs=[
+    {content:jsonToolCall('Read',{file_path:'synthetic-one.txt'}),reasoning:'',parentMessageId:'parent-1'},
+    {content:'first final',reasoning:'',parentMessageId:'parent-2'},
+    {content:jsonToolCall('Read',{file_path:'synthetic-two.txt'}),reasoning:'',parentMessageId:'parent-3'},
+    {content:'second final',reasoning:'',parentMessageId:'parent-4'},
+  ];
+  const readTool={name:'Read',description:'read synthetic file',input_schema:{type:'object',properties:{file_path:{type:'string'}}}};
+  const headers={'x-claude-code-session-id':'claude-client-correlation'};
+  const toolUseFromSse=text=>{
+    const values=text.split(/\r?\n/).filter(line=>line.startsWith('data: ')).flatMap(line=>{
+      try{return [JSON.parse(line.slice(6))];}catch{return [];}
+    });
+    return values.find(value=>value?.content_block?.type==='tool_use')?.content_block;
+  };
+  await withDiagnosticsServer({
+    logger:line=>lines.push(line),
+    completeImpl:async options=>{
+      calls.push(options);
+      if(!options.session.id)options.session.id=`remote-${++remoteSequence}`;
+      options.session.parentMessageId=`mock-parent-${calls.length}`;
+      return outputs.shift();
+    },
+  },async post=>{
+    const firstMessages=[{role:'user',content:'first synthetic task'}];
+    const first=await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,stream:true,messages:firstMessages,tools:[readTool]},headers);
+    assert.match(first.text,/event: message_stop/);
+    const firstCall=toolUseFromSse(first.text);
+    assert.equal(firstCall.name,'Read');
+
+    const firstTranscript=[
+      ...firstMessages,
+      {role:'assistant',content:[{type:'tool_use',id:firstCall.id,name:'Read',input:{file_path:'synthetic-one.txt'}}]},
+      {role:'user',content:[{type:'tool_result',tool_use_id:firstCall.id,content:'synthetic result one'}]},
+    ];
+    const second=await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,stream:true,messages:firstTranscript,tools:[readTool]},headers);
+    assert.match(second.text,/event: message_stop/);
+
+    const nextMessages=[...firstTranscript,{role:'assistant',content:[{type:'text',text:'first final'}]},{role:'user',content:'second synthetic task'}];
+    const third=await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,stream:true,messages:nextMessages,tools:[readTool]},headers);
+    const secondCall=toolUseFromSse(third.text);
+    assert.equal(secondCall.name,'Read');
+
+    const fourthMessages=[
+      ...nextMessages,
+      {role:'assistant',content:[{type:'tool_use',id:secondCall.id,name:'Read',input:{file_path:'synthetic-two.txt'}}]},
+      {role:'user',content:[{type:'tool_result',tool_use_id:secondCall.id,content:'synthetic result two'}]},
+    ];
+    const fourth=await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,stream:true,messages:fourthMessages,tools:[readTool]},headers);
+    assert.match(fourth.text,/event: message_stop/);
+  });
+  assert.equal(calls.length,4);
+  assert.equal(calls[0].session,calls[1].session);
+  assert.equal(calls[2].session,calls[3].session);
+  assert.notEqual(calls[0].session,calls[2].session);
+  assert.notEqual(calls[0].session.id,calls[2].session.id);
+  assert.match(calls[1].prompt,/TOOL RESULT CONTINUATION/);
+  assert.match(calls[3].prompt,/TOOL RESULT CONTINUATION/);
+  assert.doesNotMatch(calls[1].prompt,/first synthetic task/);
+  assert.doesNotMatch(calls[3].prompt,/second synthetic task/);
+  const requests=diagnosticRecords(lines).filter(record=>record.event==='tool_request');
+  assert.equal(requests.length,4);
+  assert.ok(requests.every(record=>record.client_session_source==='claude_header'));
+  assert.equal(new Set(requests.map(record=>record.client_session_ref)).size,1);
+  assert.equal(requests[0].session_ref,requests[1].session_ref);
+  assert.notEqual(requests[0].session_ref,requests[2].session_ref);
+  assert.equal(requests[2].session_ref,requests[3].session_ref);
+  assert.deepEqual(requests.map(record=>record.session_source),['anonymous','tool_result','anonymous','tool_result']);
+  assert.deepEqual(requests.map(record=>record.is_tool_continuation),[false,true,false,true]);
+});
+
+test('explicit x-agent-session remains opt-in stateful upstream beside Claude client identity',async()=>{
+  const lines=[];
+  const calls=[];
+  await withDiagnosticsServer({
+    logger:line=>lines.push(line),
+    completeImpl:async options=>{calls.push(options);return {content:'explicit final',reasoning:'',parentMessageId:`parent-${calls.length}`};},
+  },async post=>{
+    const headers={'x-claude-code-session-id':'claude-explicit-client','x-agent-session':'explicit-upstream-session'};
+    await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'explicit first'}]},headers);
+    await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'explicit second'}]},headers);
+  });
+  assert.equal(calls.length,2);
+  assert.equal(calls[0].session,calls[1].session);
+  const requests=diagnosticRecords(lines).filter(record=>record.event==='tool_request');
+  assert.equal(requests.length,2);
+  assert.ok(requests.every(record=>record.session_source==='explicit_header'));
+  assert.ok(requests.every(record=>record.client_session_source==='claude_header'));
+  assert.equal(new Set(requests.map(record=>record.session_ref)).size,1);
+  assert.equal(new Set(requests.map(record=>record.client_session_ref)).size,1);
+});
+
+test('client diagnostic fingerprints are process-scoped and never expose stable identities',()=>{
+  const rawClaude='CLAUDE_SESSION_VALUE_MUST_NOT_LEAK';
+  const rawAgent='AGENT_SESSION_VALUE_MUST_NOT_LEAK';
+  const rawMetadata='METADATA_VALUE_MUST_NOT_LEAK';
+  const rawUser='USER_VALUE_MUST_NOT_LEAK';
+  const clientKey=clientSessionKey('claude',rawClaude);
+  const permanentDigest=clientKey.split(':').at(-1);
+  const makeRecord=salt=>{
+    const lines=[];
+    const diagnostics=createToolDiagnostics({enabled:true,processSalt:salt,logger:line=>lines.push(line)});
+    diagnostics.request({
+      protocol:'anthropic',
+      route:'/v1/messages',
+      body:{
+        model:'deepseek-chat',
+        prompt:'PROMPT_VALUE_MUST_NOT_LEAK',
+        messages:[{role:'user',content:'MESSAGE_VALUE_MUST_NOT_LEAK'}],
+        metadata:{user_id:rawMetadata},
+        user:rawUser,
+        authorization:'AUTH_VALUE_MUST_NOT_LEAK',
+        cookie:'COOKIE_VALUE_MUST_NOT_LEAK',
+        token:'TOKEN_VALUE_MUST_NOT_LEAK',
+      },
+      upstreamSource:'explicit_header',
+      upstreamKey:explicitSessionKey('header',rawAgent),
+      clientSessionSource:'claude_header',
+      clientSessionKey:clientKey,
+      toolResultCount:1,
+    });
+    return {line:lines[0],record:diagnosticRecords(lines)[0]};
+  };
+  const first=makeRecord(Buffer.alloc(32,1));
+  const same=makeRecord(Buffer.alloc(32,1));
+  const differentSalt=makeRecord(Buffer.alloc(32,2));
+  assert.equal(first.record.client_session_ref,same.record.client_session_ref);
+  assert.notEqual(first.record.client_session_ref,differentSalt.record.client_session_ref);
+  assert.equal(first.record.client_session_ref.length,12);
+  for(const secret of [
+    rawClaude,rawAgent,rawMetadata,rawUser,clientKey,permanentDigest,
+    'PROMPT_VALUE_MUST_NOT_LEAK','MESSAGE_VALUE_MUST_NOT_LEAK',
+    'AUTH_VALUE_MUST_NOT_LEAK','COOKIE_VALUE_MUST_NOT_LEAK','TOKEN_VALUE_MUST_NOT_LEAK',
+  ])assert.equal(first.line.includes(secret),false,secret);
+});
+
+test('long session diagnostics show tool presence, continuation, retry and safe outcomes without payloads',async()=>{
+  const lines=[];
+  const calls=[];
+  const secret={
+    prompt:'PROMPT_SECRET_LOCAL_PATH_C:\\private\\marker.txt',reasoning:'REASONING_SECRET',content:'CONTENT_SECRET',
+    argument:'ARGUMENT_SECRET',result:'TOOL_RESULT_SECRET',description:'DESCRIPTION_SECRET',schema:'SCHEMA_SECRET',
+    session:'SESSION_SECRET_FULL_VALUE',metadata:'METADATA_SECRET',call:'',token:'TOKEN_SECRET',cookie:'COOKIE_SECRET',authorization:'AUTHORIZATION_SECRET',
+  };
+  const tools=['Read','Write','Edit','Grep','Glob'].map((name,index)=>({type:'function',function:{name,description:index===0?secret.description:'safe',parameters:{type:'object',properties:{marker:{description:index===0?secret.schema:'safe'}}}}}));
+  const outputs=[
+    {content:secret.content,reasoning:'',parentMessageId:'p1'},
+    {content:jsonToolCall('Read',{file_path:secret.argument}),reasoning:'',parentMessageId:'p2'},
+    {content:'after tool result',reasoning:'',parentMessageId:'p3'},
+    {content:jsonToolCall('Read',{file_path:'recap.json'}),reasoning:'',parentMessageId:'p4'},
+    {content:'',reasoning:secret.reasoning,parentMessageId:'p5'},
+    {content:'after reasoning retry',reasoning:'',parentMessageId:'p6'},
+    {content:'other session final',reasoning:'',parentMessageId:'p7'},
+  ];
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{calls.push(options);return outputs.shift();}},async post=>{
+    const headers={'x-agent-session':secret.session,authorization:`Bearer ${secret.authorization}`,cookie:`session=${secret.cookie}`};
+    const base={model:'deepseek-reasoner',metadata:{user_id:secret.metadata},token:secret.token,messages:[{role:'user',content:secret.prompt}]};
+    await post('/v1/chat/completions',{...base,tools},headers);
+    const toolResponse=(await post('/v1/chat/completions',{...base,tools},headers)).json();
+    const call=toolResponse.choices[0].message.tool_calls[0];
+    secret.call=call.id;
+    await post('/v1/chat/completions',{...base,messages:[...base.messages,{role:'assistant',content:null,tool_calls:[call]},{role:'tool',name:'Read',tool_call_id:call.id,content:secret.result}],tools},headers);
+    const recap=(await post('/v1/chat/completions',{...base,messages:[{role:'user',content:'recap request'}]},headers)).json();
+    assert.equal(recap.choices[0].message.tool_calls,undefined);
+    assert.match(recap.choices[0].message.content,/^\{"tool_call"/);
+    await post('/v1/chat/completions',{...base,messages:[{role:'user',content:'retry request'}],tools},headers);
+    await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'other'}],tools},{'x-agent-session':'OTHER_SESSION_SECRET'});
+  });
+  const records=diagnosticRecords(lines);
+  const requests=records.filter(record=>record.event==='tool_request');
+  const responses=records.filter(record=>record.event==='tool_response');
+  assert.equal(requests.length,6);
+  assert.equal(responses.length,6);
+  assert.deepEqual(requests[0].tool_names,['Read','Write','Edit','Grep','Glob']);
+  assert.equal(requests[0].raw_tool_count,5);
+  assert.equal(requests[0].normalized_tool_count,5);
+  assert.equal(requests[3].tools_field_present,false);
+  assert.equal(requests[3].tools_field_shape,'absent');
+  assert.equal(requests[3].raw_tool_count,0);
+  assert.equal(requests[3].normalized_tool_count,0);
+  assert.deepEqual(requests[3].tool_names,[]);
+  assert.equal(new Set(requests.slice(0,5).map(record=>record.session_ref)).size,1);
+  assert.notEqual(requests[0].session_ref,requests[5].session_ref);
+  assert.equal(requests[2].is_tool_continuation,true);
+  assert.equal(requests[2].tool_result_count,1);
+  assert.equal(responses[1].strict_tool_call_detected,true);
+  assert.equal(responses[1].outcome,'tool_call');
+  assert.equal(responses[3].strict_tool_call_detected,false);
+  assert.equal(responses[3].outcome,'final_text');
+  assert.equal(responses[4].reasoning_retry_attempted,true);
+  assert.equal(responses[4].outcome,'final_text');
+  assert.equal(calls.length,7);
+  const journal=lines.join('\n');
+  for(const value of Object.values(secret).filter(Boolean))assert.equal(journal.includes(value),false,value);
+});
+
+test('OpenAI, Anthropic and Responses diagnostics preserve protocol signs and streaming',async()=>{
+  const lines=[];
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async({onDelta})=>{onDelta?.({content:'stream final'});return {content:'stream final',reasoning:'',parentMessageId:null};}},async post=>{
+    const openai=await post('/v1/chat/completions',{model:'deepseek-chat',stream:true,messages:[{role:'user',content:'probe'}],tools:[{type:'function',function:{name:'Read'}}]},{'x-agent-session':'protocol-openai'});
+    const anthropic=await post('/v1/messages',{model:'deepseek-chat',stream:true,messages:[{role:'user',content:'probe'}],tools:[{name:'Grep',input_schema:{type:'object'}}]},{'x-agent-session':'protocol-anthropic'});
+    const responses=await post('/v1/responses',{model:'deepseek-chat',stream:true,input:'probe',tools:[{type:'function',name:'Glob',parameters:{type:'object'}},{type:'other',name:'ignored'}]},{'x-agent-session':'protocol-responses'});
+    assert.match(openai.text,/data: \[DONE\]/);
+    assert.match(anthropic.text,/event: message_stop/);
+    assert.match(responses.text,/event: response\.completed/);
+  });
+  const requests=diagnosticRecords(lines).filter(record=>record.event==='tool_request');
+  assert.deepEqual(requests.map(record=>record.protocol),['openai','anthropic','responses']);
+  assert.deepEqual(requests.map(record=>record.tool_names),[['Read'],['Grep'],['Glob']]);
+  assert.deepEqual(requests.map(record=>record.normalized_tool_count),[1,1,1]);
+  assert.deepEqual(requests.map(record=>record.raw_tool_count),[1,1,2]);
+  assert.ok(requests.every(record=>record.stream===true));
+});
+
+test('diagnostic logger failures do not break an HTTP request',async()=>{
+  await withDiagnosticsServer({logger:()=>{throw new Error('logger failed');},completeImpl:async()=>({content:'safe final',reasoning:'',parentMessageId:null})},async post=>{
+    const response=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'probe'}],tools:[{type:'function',function:{name:'Read'}}]},{'x-agent-session':'private-session'})).json();
+    assert.equal(response.choices[0].message.content,'safe final');
+  });
+});
+
+test('repeated completed tool correction is visible only as a bounded diagnostic flag',async()=>{
+  const lines=[];
+  let calls=0;
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+    calls+=1;
+    if(calls<=2)return {content:jsonToolCall('echo',{text:'same'}),reasoning:'',parentMessageId:`p${calls}`};
+    return {content:'corrected final',reasoning:'',parentMessageId:'p3'};
+  }},async post=>{
+    const tools=[{type:'function',function:{name:'echo',parameters:{type:'object'}}}];
+    const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'echo once'}],tools},{'x-agent-session':'repeat-diagnostic'})).json();
+    const call=first.choices[0].message.tool_calls[0];
+    const second=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'tool',name:'echo',tool_call_id:call.id,content:'same'}],tools},{'x-agent-session':'repeat-diagnostic'})).json();
+    assert.equal(second.choices[0].message.content,'corrected final');
+  });
+  assert.equal(calls,3);
+  const responses=diagnosticRecords(lines).filter(record=>record.event==='tool_response');
+  assert.equal(responses[1].repeated_tool_retry_attempted,true);
+  assert.equal(responses[1].outcome,'final_text');
+});
+
+let claudeProbeModule;
+async function claudeProbe(){return claudeProbeModule??=await import('../scripts/claude_contract_probe.mjs');}
+
+test('Claude contract probe records only its explicit safe field allowlist',async()=>{
+  const {SAFE_RECORD_FIELDS,sanitizeContractRequest}=await claudeProbe();
+  const secretValues=[
+    'PROMPT_CONTRACT_SECRET','SYSTEM_CONTRACT_SECRET','MESSAGE_CONTRACT_SECRET',
+    'ARGUMENT_CONTRACT_SECRET','RESULT_CONTRACT_SECRET','SCHEMA_CONTRACT_SECRET',
+    'AUTH_CONTRACT_SECRET','Z:\\contract-probe-private\\marker.txt','toolu_full_private_identifier',
+  ];
+  const record=sanitizeContractRequest({
+    sequence:1,method:'POST',pathname:'/v1/messages',salt:Buffer.alloc(32,7),
+    body:{
+      model:'probe-model',stream:true,prompt:secretValues[0],authorization:secretValues[6],
+      system:secretValues[1],metadata:{safe_key:'value',authorization:secretValues[6]},
+      messages:[
+        {role:'user',content:[{type:'text',text:secretValues[2]}]},
+        {role:'assistant',content:[{type:'tool_use',id:secretValues[8],name:'Read',input:{file_path:secretValues[7],secret:secretValues[3]}}]},
+        {role:'user',content:[{type:'tool_result',tool_use_id:secretValues[8],content:secretValues[4]}]},
+      ],
+      tools:[{name:'Read',description:'private description',input_schema:{type:'object',properties:{file_path:{type:'string',description:secretValues[5]}}}}],
+    },
+  });
+  assert.deepEqual(Object.keys(record),SAFE_RECORD_FIELDS);
+  assert.deepEqual(record.tool_names,['Read']);
+  assert.equal(record.tool_result_count,1);
+  assert.equal(record.tool_use_count,1);
+  assert.deepEqual(record.content_block_types,['text','tool_use','tool_result']);
+  assert.deepEqual(record.tool_object_keys,[['description','input_schema','name']]);
+  assert.equal(record.tool_schema_present,true);
+  assert.equal(record.tool_result_id_fingerprint.length,1);
+  assert.notEqual(record.tool_result_id_fingerprint[0],secretValues[8]);
+  const serialized=JSON.stringify(record);
+  for(const value of secretValues)assert.equal(serialized.includes(value),false,value);
+  assert.equal(serialized.includes('private description'),false);
+  assert.equal(serialized.includes('authorization'),false);
+});
+
+test('Claude contract probe bounds tool names and tolerates unexpected body shapes',async()=>{
+  const {sanitizeContractRequest}=await claudeProbe();
+  const tools=Array.from({length:80},(_,index)=>({name:index===0?`Read\n${'x'.repeat(200)}`:index===1?{bad:true}:`Tool_${index}`}));
+  const record=sanitizeContractRequest({sequence:-1,method:null,pathname:null,salt:Buffer.alloc(32,8),body:{messages:{bad:true},tools}});
+  assert.equal(record.sequence,0);
+  assert.equal(record.messages_shape,'object');
+  assert.equal(record.tool_count,80);
+  assert.equal(record.tool_names.length,32);
+  assert.ok(record.tool_names[0].length<=64);
+  assert.doesNotMatch(record.tool_names[0],/[\r\n]/);
+  assert.equal(record.tool_names[1],'invalid');
+  assert.doesNotThrow(()=>sanitizeContractRequest({body:null,salt:Buffer.alloc(32,9)}));
+  assert.doesNotThrow(()=>sanitizeContractRequest({body:['unexpected'],salt:Buffer.alloc(32,10)}));
+});
+
+test('Claude contract probe derives Read arguments only from the supplied schema',async()=>{
+  const {deriveReadArguments}=await claudeProbe();
+  assert.deepEqual(deriveReadArguments({input_schema:{type:'object',properties:{file_path:{type:'string'},offset:{type:'number'}}}},'private-path'),{file_path:'private-path'});
+  assert.deepEqual(deriveReadArguments({input_schema:{type:'object',properties:{path:{type:'string'}}}},'private-path'),{path:'private-path'});
+  assert.throws(()=>deriveReadArguments({input_schema:{type:'object',properties:{command:{type:'string'}}}},'private-path'),/supported string path field/);
+});
+
+test('Claude contract mock is loopback-only, bounded and survives logger exceptions',async()=>{
+  const {startContractMockServer}=await claudeProbe();
+  const mock=await startContractMockServer({maxMessageRequests:1,logger:()=>{throw new Error('logger failed');}});
+  try{
+    assert.match(mock.origin,/^http:\/\/127\.0\.0\.1:\d+$/);
+    const body={model:'probe-model',messages:[{role:'user',content:'not logged'}],tools:[{name:'Read',input_schema:{type:'object',properties:{file_path:{type:'string'}}}}]};
+    const first=await fetch(`${mock.origin}/v1/messages`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    assert.equal(first.status,200);
+    const second=await fetch(`${mock.origin}/v1/messages`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    assert.equal(second.status,429);
+    assert.equal(mock.state.messageRequests,2);
+    assert.equal(mock.records.length,2);
+  }finally{await mock.close();}
+});
+
+test('Claude contract mock supports local count_tokens without exposing request content',async()=>{
+  const {startContractMockServer}=await claudeProbe();
+  const lines=[];
+  const mock=await startContractMockServer({logger:line=>lines.push(line)});
+  try{
+    const secret='COUNT_TOKEN_PROMPT_SECRET';
+    const response=await fetch(`${mock.origin}/v1/messages/count_tokens?beta=true`,{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer HEADER_SECRET'},body:JSON.stringify({model:'probe-model',system:secret,messages:[{role:'user',content:secret}],tools:[{name:'Read',description:secret,input_schema:{type:'object',properties:{file_path:{description:secret}}}}]})});
+    assert.equal(response.status,200);
+    assert.deepEqual(await response.json(),{input_tokens:100});
+    assert.equal(mock.state.countTokenRequests,1);
+    assert.equal(mock.records[0].pathname,'/v1/messages/count_tokens');
+    assert.equal(mock.records[0].count_tokens_requested,true);
+    assert.equal(mock.records[0].tools_field_present,true);
+    assert.equal(lines.join('\n').includes(secret),false);
+    assert.equal(lines.join('\n').includes('HEADER_SECRET'),false);
+  }finally{await mock.close();}
+});
+
+test('Claude contract probe timeout is bounded and invokes cleanup callback once',async()=>{
+  const {withTimeout}=await claudeProbe();
+  let cleanups=0;
+  await assert.rejects(withTimeout(new Promise(()=>{}),20,()=>{cleanups+=1;}),/timed out/);
+  assert.equal(cleanups,1);
+});
+
+test('Claude contract probe always removes its temporary marker workspace',async()=>{
+  const {withProbeWorkspace}=await claudeProbe();
+  let directory;
+  await assert.rejects(withProbeWorkspace(async workspace=>{
+    directory=workspace.directory;
+    assert.equal(fs.existsSync(path.join(directory,'marker.txt')),true);
+    assert.equal(fs.existsSync(path.join(directory,'second-marker.txt')),true);
+    throw new Error('intentional offline failure');
+  }),/intentional offline failure/);
+  assert.equal(fs.existsSync(directory),false);
+});
+
+let claudeIdentityProbeModule;
+async function claudeIdentityProbe(){return claudeIdentityProbeModule??=await import('../scripts/claude_session_identity_probe.mjs');}
+
+test('Claude identity probe records only safe identifier summaries',async()=>{
+  const {SAFE_IDENTITY_RECORD_FIELDS,sanitizeIdentityRequest}=await claudeIdentityProbe();
+  const salt=Buffer.alloc(32,11);
+  const secrets={
+    auth:'IDENTITY_AUTH_SECRET',cookie:'IDENTITY_COOKIE_SECRET',prompt:'IDENTITY_PROMPT_SECRET',
+    message:'IDENTITY_MESSAGE_SECRET',argument:'IDENTITY_ARGUMENT_SECRET',
+    result:'IDENTITY_RESULT_SECRET',session:'11111111-2222-4333-8444-555555555555',
+    custom:'PROCESS_SCOPED_HEADER_SECRET',
+  };
+  const record=sanitizeIdentityRequest({
+    sequence:1,method:'POST',pathname:'/v1/messages',salt,
+    headers:{
+      authorization:`Bearer ${secrets.auth}`,cookie:secrets.cookie,
+      'x-claude-code-session-id':secrets.session,'x-agent-session':secrets.custom,
+      'x-arbitrary-session-secret':'MUST_NOT_BE_CAPTURED','content-type':'application/json',
+    },
+    body:{
+      prompt:secrets.prompt,session_id:secrets.session,
+      metadata:{user_id:secrets.custom,authorization:secrets.auth},
+      messages:[
+        {role:'user',content:[{type:'text',text:secrets.message}]},
+        {role:'assistant',content:[{type:'tool_use',id:'FULL_TOOL_ID',name:'Read',input:{file_path:secrets.argument}}]},
+        {role:'user',content:[{type:'tool_result',tool_use_id:'FULL_TOOL_ID',content:secrets.result}]},
+      ],
+    },
+  });
+  assert.deepEqual(Object.keys(record),SAFE_IDENTITY_RECORD_FIELDS);
+  assert.equal(record.candidate_headers['x-claude-code-session-id'].present,true);
+  assert.equal(record.candidate_headers['x-claude-code-session-id'].type,'string');
+  assert.equal(record.candidate_headers['x-claude-code-session-id'].length,36);
+  assert.equal(record.candidate_headers['x-claude-code-session-id'].fingerprint.length,12);
+  assert.equal(record.candidate_headers['x-agent-session'].fingerprint.length,12);
+  assert.equal(record.body_candidates.top_level.session_id.present,true);
+  assert.equal(record.body_candidates.metadata.user_id.present,true);
+  assert.equal(record.tool_result_count,1);
+  assert.ok(record.candidate_header_names.includes('x-arbitrary-session-secret'));
+  assert.equal(Object.hasOwn(record.candidate_headers,'x-arbitrary-session-secret'),false);
+  const serialized=JSON.stringify(record);
+  for(const value of Object.values(secrets))assert.equal(serialized.includes(value),false,value);
+  for(const forbidden of ['authorization','cookie','prompt','tool_use_id','file_path'])assert.equal(serialized.includes(forbidden),false,forbidden);
+});
+
+test('Claude identity fingerprints are process-salted, stable and bounded',async()=>{
+  const {summarizeIdentifier}=await claudeIdentityProbe();
+  const value='same-identity-value';
+  const first=summarizeIdentifier(value,Buffer.alloc(32,1));
+  const same=summarizeIdentifier(value,Buffer.alloc(32,1));
+  const differentValue=summarizeIdentifier('different-identity-value',Buffer.alloc(32,1));
+  const differentSalt=summarizeIdentifier(value,Buffer.alloc(32,2));
+  assert.equal(first.fingerprint,same.fingerprint);
+  assert.notEqual(first.fingerprint,differentValue.fingerprint);
+  assert.notEqual(first.fingerprint,differentSalt.fingerprint);
+  assert.equal(summarizeIdentifier('x'.repeat(300),Buffer.alloc(32,1)).fingerprint,'invalid');
+  assert.equal(summarizeIdentifier({bad:true},Buffer.alloc(32,1)).fingerprint,'invalid');
+  assert.doesNotThrow(()=>summarizeIdentifier(null,Buffer.alloc(32,1)));
+  assert.doesNotThrow(()=>summarizeIdentifier(['one','two'],Buffer.alloc(32,1)));
+});
+
+test('Claude identity mock is loopback-only, bounded and omits arbitrary header values',async()=>{
+  const {startIdentityMockServer}=await claudeIdentityProbe();
+  const lines=[];
+  const mock=await startIdentityMockServer({maxMessageRequests:1,logger:line=>lines.push(line)});
+  try{
+    assert.match(mock.origin,/^http:\/\/127\.0\.0\.1:\d+$/);
+    const secret='ARBITRARY_HEADER_VALUE_SECRET';
+    const body={model:'probe-model',messages:[{role:'user',content:'not logged'}],tools:[{name:'Read',input_schema:{type:'object',properties:{file_path:{type:'string'}}}}]};
+    const headers={'content-type':'application/json','x-agent-session':'process-one','x-claude-code-session-id':'session-one','x-arbitrary-session-secret':secret,authorization:'Bearer AUTH_SECRET',cookie:'COOKIE_SECRET'};
+    const first=await fetch(`${mock.origin}/v1/messages`,{method:'POST',headers,body:JSON.stringify(body)});
+    assert.equal(first.status,200);
+    const second=await fetch(`${mock.origin}/v1/messages`,{method:'POST',headers,body:JSON.stringify(body)});
+    assert.equal(second.status,429);
+    const serialized=lines.join('\n');
+    assert.equal(serialized.includes(secret),false);
+    assert.equal(serialized.includes('AUTH_SECRET'),false);
+    assert.equal(serialized.includes('COOKIE_SECRET'),false);
+    assert.equal(serialized.includes('authorization'),false);
+    assert.equal(serialized.includes('cookie'),false);
+  }finally{await mock.close();}
+});
+
+test('Claude identity workspace is always removed',async()=>{
+  const {withIdentityWorkspace}=await claudeIdentityProbe();
+  let directory;
+  await assert.rejects(withIdentityWorkspace(async workspace=>{
+    directory=workspace.directory;
+    assert.equal(fs.existsSync(path.join(directory,'marker.txt')),true);
+    assert.equal(fs.existsSync(path.join(directory,'second-marker.txt')),true);
+    throw new Error('intentional identity probe failure');
+  }),/intentional identity probe failure/);
+  assert.equal(fs.existsSync(directory),false);
+});
+
+let claudeLiveProbeModule;
+async function claudeLiveProbe(){return claudeLiveProbeModule??=await import('../scripts/claude_long_session_live_probe.mjs');}
+
+test('Claude live probe reduces structured output to safe event flags',async()=>{
+  const {summarizeClaudeEvent}=await claudeLiveProbe();
+  const raw='{"tool_call":{"name":"Read","arguments":{"file_path":"PRIVATE_PATH"}}}';
+  const summary=summarizeClaudeEvent({type:'assistant',subtype:'message',authorization:'AUTH_SECRET',message:{content:[{type:'tool_use',id:'FULL_CALL_ID',name:'Read',input:{file_path:'ARG_SECRET'}},{type:'text',text:raw}]}},['MARKER_SECRET']);
+  assert.deepEqual(summary.tool_use_names,['Read']);assert.equal(summary.raw_tool_json_as_text,true);
+  const serialized=JSON.stringify(summary);for(const value of [raw,'PRIVATE_PATH','AUTH_SECRET','FULL_CALL_ID','ARG_SECRET','MARKER_SECRET'])assert.equal(serialized.includes(value),false,value);
+});
+
+test('Claude live probe recognizes only explicit structured lifecycle events',async()=>{
+  const {summarizeClaudeEvent}=await claudeLiveProbe();
+  assert.equal(summarizeClaudeEvent({type:'system',subtype:'compact_boundary'}).explicit_compaction,true);
+  assert.equal(summarizeClaudeEvent({type:'system',subtype:'recap'}).explicit_recap,true);
+  const ordinary=summarizeClaudeEvent({type:'assistant',subtype:'message',message:{content:[{type:'text',text:'short summary and compact prose'}]}});
+  assert.equal(ordinary.explicit_compaction,false);assert.equal(ordinary.explicit_recap,false);
+});
+
+test('Claude live probe sanitizes Bridge diagnostic records',async()=>{
+  const {parseBridgeDiagnostics,sanitizeBridgeDiagnostic}=await claudeLiveProbe();
+  const safe=sanitizeBridgeDiagnostic({event:'tool_request',protocol:'anthropic',route:'/v1/messages',model:'deepseek-reasoner',stream:true,session_source:'explicit_metadata',session_ref:'FULL_SESSION_ID',tools_field_present:true,tools_field_shape:'array',raw_tool_count:3,normalized_tool_count:3,tool_names:['Read','Glob','Grep'],is_tool_continuation:false,tool_result_count:0,prompt:'PROMPT_SECRET'});
+  assert.equal(safe.session_ref,'invalid');assert.deepEqual(safe.tool_names,['Read','Glob','Grep']);assert.equal(JSON.stringify(safe).includes('PROMPT_SECRET'),false);assert.equal(JSON.stringify(safe).includes('FULL_SESSION_ID'),false);
+  assert.equal(parseBridgeDiagnostics(`bad\n${JSON.stringify({...safe,session_ref:'abcdef012345'})}`).length,1);
+});
+
+test('Claude live probe workspace is bounded, unchanged and removed',async()=>{
+  const {withSyntheticWorkspace}=await claudeLiveProbe();let directory;
+  const result=await withSyntheticWorkspace(async value=>{directory=value.directory;assert.equal(value.markers.length,12);assert.ok(value.totalBytes<=160*1024);assert.equal(fs.readdirSync(directory).filter(name=>/^part-\d{2}\.txt$/.test(name)).length,12);return {ok:true};});
+  assert.equal(result.ok,true);assert.equal(result.temporary_files_unchanged,true);assert.equal(fs.existsSync(directory),false);
+});
+
+test('Claude live probe uses confirmed resume and read-only tool flags',async()=>{
+  const {buildClaudeArgs}=await claudeLiveProbe();const session='11111111-1111-4111-8111-111111111111';
+  const first=buildClaudeArgs({sessionId:session,first:true,prompt:'synthetic'}),next=buildClaudeArgs({sessionId:session,first:false,prompt:'synthetic'});
+  assert.ok(first.includes('--print'));assert.ok(first.includes('stream-json'));assert.equal(first[first.indexOf('--tools')+1],'Read,Glob,Grep');assert.equal(first[first.indexOf('--allowedTools')+1],'Read,Glob,Grep');assert.match(first[first.indexOf('--disallowedTools')+1],/Write.*Edit.*Bash/);
+  assert.deepEqual(first.slice(first.indexOf('--session-id'),first.indexOf('--session-id')+2),['--session-id',session]);assert.deepEqual(next.slice(next.indexOf('--resume'),next.indexOf('--resume')+2),['--resume',session]);
 });

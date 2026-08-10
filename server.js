@@ -18,6 +18,7 @@ const {
   repeatedToolFailure,
 } = require('./lib/tool_continuation');
 const { createProtocolStream } = require('./lib/api_stream');
+const { createToolDiagnostics } = require('./lib/tool_diagnostics');
 const { estimateTokenCount, validateCountTokensBody } = require('./lib/token_count');
 const { createSetupController } = require('./lib/setup');
 const { MODELS } = require('./lib/models');
@@ -244,10 +245,14 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
   const sessions = sessionStore || new SessionStore({ ttlMs: Number(process.env.SESSION_TTL_MS || 1_800_000) });
   const resolver = sessionResolver || new SessionResolver();
   const setup = setupController || createSetupController();
+  const toolDiagnostics = createToolDiagnostics({ logger });
 
   const server = http.createServer(async (req, res) => {
     let stream = null;
     let requestPath = '';
+    let diagnosticResponse = null;
+    let reasoningRetryAttempted = false;
+    let repeatedToolRetryAttempted = false;
     try {
       const url = new URL(req.url, 'http://localhost');
       requestPath = url.pathname;
@@ -299,8 +304,8 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       }
       if (req.method === 'POST' && url.pathname === '/reset-session') {
         const resolution = resolver.resolve({ headers: req.headers, body });
-        sessions.reset(resolution.key);
-        resolver.releaseSession(resolution.key);
+        sessions.reset(resolution.upstreamKey);
+        resolver.releaseSession(resolution.upstreamKey);
         return send(res, 200, { ok: true });
       }
 
@@ -308,16 +313,36 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       const kind = paths[url.pathname];
       if (req.method !== 'POST' || !kind) return sendError(res, 404, 'Not found');
       const resolution = resolver.resolve({ headers: req.headers, body, kind });
-      const agentKey = resolution.key;
-      const session = sessions.get(agentKey);
-      const input = normalize(body, kind, session);
+      const upstreamKey = resolution.upstreamKey;
+      const session = sessions.get(upstreamKey);
       const toolResults = extractToolResults(body, kind, session).filter(result => result.known);
       const isToolContinuation = toolResults.length > 0;
+      diagnosticResponse = toolDiagnostics.request({
+        protocol: kind,
+        route: url.pathname,
+        body,
+        upstreamSource: resolution.upstreamSource,
+        upstreamKey,
+        clientSessionSource: resolution.clientSource,
+        clientSessionKey: resolution.clientKey,
+        isToolContinuation,
+        toolResultCount: toolResults.length,
+      });
+      const input = normalize(body, kind, session);
       const modelName = String(input.model || 'deepseek-chat').toLowerCase();
       const model = MODELS[modelName];
-      if (!model) return sendError(res, 400, 'Unsupported model. See GET /v1/models.');
-      if (!model.available) return sendError(res, 400, 'This DeepSeek Web mode is currently unavailable. See GET /v1/model-capabilities.');
-      if (!input.prompt.trim()) return sendError(res, 400, 'A user input/message is required');
+      if (!model) {
+        diagnosticResponse?.response({ outcome: 'safe_failure' });
+        return sendError(res, 400, 'Unsupported model. See GET /v1/models.');
+      }
+      if (!model.available) {
+        diagnosticResponse?.response({ outcome: 'safe_failure' });
+        return sendError(res, 400, 'This DeepSeek Web mode is currently unavailable. See GET /v1/model-capabilities.');
+      }
+      if (!input.prompt.trim()) {
+        diagnosticResponse?.response({ outcome: 'safe_failure' });
+        return sendError(res, 400, 'A user input/message is required');
+      }
 
       const allowedTools = input.tools.map(tool => tool?.function?.name).filter(Boolean);
       const hasTools = allowedTools.length > 0;
@@ -343,8 +368,10 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       });
       let toolCall = parseToolCallFromOutput(output, allowedTools);
       let correctiveAttempted = false;
+      let safeFailure = false;
       if (shouldRetryToolResponse({ hasTools, output, toolCall, retryCount: 0 })) {
         correctiveAttempted = true;
+        reasoningRetryAttempted = true;
         logToolRetry(logger);
         output = await completeImpl({
           prompt: createToolRetryPrompt(allowedTools),
@@ -354,11 +381,13 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
           onDelta: input.stream ? delta => stream.delta(delta) : undefined,
         });
         toolCall = parseToolCallFromOutput(output, allowedTools);
+        safeFailure = !toolCall && !String(output?.content || '').trim();
         output = hideRetryReasoning(output, toolCall);
       }
       if (isToolContinuation && isExactCompletedToolCall(toolCall, toolResults)) {
         if (!correctiveAttempted) {
           correctiveAttempted = true;
+          repeatedToolRetryAttempted = true;
           logRepeatedToolRetry(logger);
           output = await completeImpl({
             prompt: createRepeatedToolCorrectionPrompt(toolResults, input.tools),
@@ -372,16 +401,17 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         }
         if (isExactCompletedToolCall(toolCall, toolResults)
           || (!toolCall && !String(output?.content || '').trim())) {
+          safeFailure = true;
           output = repeatedToolFailure(output);
           toolCall = null;
         }
       }
       if (isToolContinuation && !toolCall && output.reasoning) output = { ...output, reasoning: '' };
-      resolver.release(resolution.callIds, agentKey);
+      resolver.release(resolution.callIds, upstreamKey);
       forgetCompletedToolCalls(session, resolution.callIds);
       if (toolCall) {
         rememberToolCall(session, toolCall);
-        resolver.bind(toolCall.id, agentKey);
+        resolver.bind(toolCall.id, upstreamKey);
       }
       if (!toolCall) sessions.add(session, upstreamPrompt, output.content);
       const openaiIdentity = streamIdentity && kind === 'openai' ? streamIdentity : {};
@@ -389,9 +419,18 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       const finalResponse = kind === 'anthropic'
         ? toAnthropic(openaiResponse, streamIdentity || {})
         : kind === 'responses' ? toResponses(openaiResponse, streamIdentity || {}) : openaiResponse;
+      diagnosticResponse?.response({
+        strictToolCallDetected: Boolean(toolCall),
+        reasoningNonempty: Boolean(String(output?.reasoning || '').trim()),
+        contentNonempty: Boolean(String(output?.content || '').trim()),
+        reasoningRetryAttempted,
+        repeatedToolRetryAttempted,
+        outcome: toolCall ? 'tool_call' : safeFailure || !String(output?.content || '').trim() ? 'safe_failure' : 'final_text',
+      });
       if (stream) return stream.finish({ output, toolCall, finalResponse });
       return send(res, 200, finalResponse);
     } catch (error) {
+      diagnosticResponse?.response({ reasoningRetryAttempted, repeatedToolRetryAttempted, outcome: 'upstream_error' });
       logSafeError(error, logger);
       if (stream) return stream.fail('DeepSeek streaming request failed. Run npm run doctor or re-authenticate.');
       const status = error.status || (error.name === 'TimeoutError' ? 504 : 502);
