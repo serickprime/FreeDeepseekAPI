@@ -1,6 +1,6 @@
 'use strict';
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
-const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,clientSessionKey,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { checked, complete, loadAuth, parseRetryAfter, parseStream }=client; const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
+const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,clientSessionKey,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,inspectToolCall,inspectToolCallFromOutput,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { checked, complete, loadAuth, parseRetryAfter, parseStream }=client; const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
 const {TOOL_RETRY_FAILURE_MESSAGE,createToolRetryPrompt,hideRetryReasoning,shouldRetryToolResponse}=require('../lib/tool_retry');
 const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
 const {MAX_TOOL_NAMES,MAX_TOOL_NAME_CHARS,classifyUpstreamError,createToolDiagnostics}=require('../lib/tool_diagnostics');
@@ -400,6 +400,110 @@ test('tool argument nesting is bounded while safe objects and arrays remain vali
   const safe={path:'package.json',options:{encoding:'utf8',ranges:[{start:1,end:3},['a','b'],null,true]}};
   const call=parseToolCall(jsonToolCall('read_file',safe),['read_file']);
   assert.deepEqual(JSON.parse(call.function.arguments),safe);
+});
+
+test('tool inspection accepts the observed Glob JSON and preserves current source priority',()=>{
+  const observed='{"tool_call":{"name":"Glob","arguments":{"pattern":"**/InteractiveStars.tsx"}}}';
+  const allowed=['Glob','Read','Grep'];
+  const content=inspectToolCallFromOutput({content:observed,reasoning:'arbitrary reasoning text'},allowed);
+  assert.equal(content.reason,'accepted');
+  assert.equal(content.source,'content');
+  assert.equal(content.toolCall.function.name,'Glob');
+  assert.deepEqual(JSON.parse(content.toolCall.function.arguments),{pattern:'**/InteractiveStars.tsx'});
+  assert.equal(parseToolCallFromOutput({content:observed,reasoning:'arbitrary reasoning text'},allowed).function.name,'Glob');
+  const padded=inspectToolCallFromOutput({content:` \r\n${observed}\n\t`,reasoning:''},allowed);
+  assert.equal(padded.reason,'accepted');
+  assert.equal(padded.source,'content');
+
+  const shadowed=inspectToolCallFromOutput({content:'ordinary final prose',reasoning:observed},allowed);
+  assert.equal(shadowed.toolCall,null);
+  assert.equal(shadowed.source,'content');
+  assert.equal(shadowed.reason,'invalid_json');
+  assert.equal(shadowed.metadata.reasoning_contains_tool_call_marker,true);
+  assert.equal(parseToolCallFromOutput({content:'ordinary final prose',reasoning:observed},allowed),null);
+
+  const reasoning=inspectToolCallFromOutput({content:'  \r\n ',reasoning:observed},allowed);
+  assert.equal(reasoning.reason,'accepted');
+  assert.equal(reasoning.source,'reasoning');
+  assert.equal(reasoning.toolCall.function.name,'Glob');
+
+  const invalidOutput=inspectToolCallFromOutput(null,allowed);
+  assert.equal(invalidOutput.source,'none');
+  assert.equal(invalidOutput.reason,'invalid_output');
+  const invalidContent=inspectToolCallFromOutput({content:{},reasoning:observed},allowed);
+  assert.equal(invalidContent.source,'none');
+  assert.equal(invalidContent.reason,'input_not_string');
+});
+
+test('tool inspection reports exact basic and extra-text rejection reasons',()=>{
+  const strict=jsonToolCall('Glob',{pattern:'**/*.tsx'});
+  const cases=[
+    [null,'input_not_string'],
+    ['', 'empty_input'],
+    ['   \r\n', 'empty_input'],
+    ['{broken', 'invalid_json'],
+    [`prefix prose ${strict}`, 'invalid_json'],
+    [`${strict} suffix prose`, 'invalid_json'],
+    [`[调用 Glob] ${strict}`, 'invalid_json'],
+  ];
+  for(const [source,reason] of cases)assert.equal(inspectToolCall(source,['Glob']).reason,reason);
+});
+
+test('tool inspection reports strict envelope and tool-shape rejection reasons',()=>{
+  const cases=[
+    [{tool_call:{name:'Glob',arguments:{}},extra:1},'unexpected_envelope_keys'],
+    [{name:'Glob',arguments:{}},'unexpected_envelope_keys'],
+    [{tool_call:{name:'Glob',arguments:{},extra:1}},'invalid_tool_shape'],
+    [{tool_call:[]},'invalid_tool_shape'],
+    [[], 'invalid_envelope'],
+    [null, 'invalid_envelope'],
+    ['json string', 'invalid_envelope'],
+  ];
+  for(const [value,reason] of cases){
+    const source=JSON.stringify(value);
+    assert.equal(inspectToolCall(source,['Glob']).reason,reason,source);
+  }
+});
+
+test('tool inspection distinguishes name, allowlist and argument failures',()=>{
+  assert.equal(inspectToolCall(jsonToolCall('UnknownTool',{}),['Glob']).reason,'tool_not_allowed');
+  for(const name of ['bad name','bad/name'])assert.equal(inspectToolCall(jsonToolCall(name,{}),[name]).reason,'invalid_tool_name');
+  for(const args of [[],null,'x'])assert.equal(inspectToolCall(jsonToolCall('Glob',args),['Glob']).reason,'arguments_not_object');
+  for(const rawArgs of [
+    '{"__proto__":{"polluted":true}}',
+    '{"safe":{"constructor":{"polluted":true}}}',
+    '{"items":[{"prototype":{"polluted":true}}]}',
+  ])assert.equal(inspectToolCall(`{"tool_call":{"name":"Glob","arguments":${rawArgs}}}`,['Glob']).reason,'unsafe_arguments');
+});
+
+test('tool inspection distinguishes excessive nesting and both byte limits',()=>{
+  let tooDeep={value:'ok'};
+  for(let index=0;index<MAX_NESTING_DEPTH+1;index+=1)tooDeep={next:tooDeep};
+  assert.equal(inspectToolCall(jsonToolCall('Glob',tooDeep),['Glob']).reason,'excessive_nesting');
+  assert.equal(inspectToolCall('x'.repeat(MAX_TOOL_BYTES+1),['Glob']).reason,'input_too_large');
+
+  const loneSurrogates='\ud800'.repeat(Math.floor(MAX_TOOL_BYTES/3)-100);
+  const expandingArguments=`{"tool_call":{"name":"Glob","arguments":{"value":"${loneSurrogates}"}}}`;
+  assert.ok(Buffer.byteLength(expandingArguments)<=MAX_TOOL_BYTES);
+  assert.equal(inspectToolCall(expandingArguments,['Glob']).reason,'arguments_too_large');
+});
+
+test('tool output inspection exposes only structural byte and marker signals',()=>{
+  const strict=jsonToolCall('Glob',{pattern:'**/*.tsx'});
+  const fenced=`\n\`\`\`json\n${strict}\n\`\`\`\n`;
+  const fence=inspectToolCallFromOutput({content:fenced,reasoning:''},['Glob']);
+  assert.equal(fence.reason,'invalid_json');
+  assert.equal(fence.source,'content');
+  assert.equal(fence.metadata.content_starts_with_code_fence,true);
+  assert.equal(fence.metadata.content_contains_tool_call_marker,true);
+  assert.equal(fence.metadata.content_bytes,Buffer.byteLength(fenced));
+  assert.equal(fence.metadata.content_trimmed_bytes,Buffer.byteLength(fenced.trim()));
+
+  const marked=inspectToolCallFromOutput({content:`[调用 Glob] ${strict}`,reasoning:'ordinary'},['Glob']);
+  assert.equal(marked.reason,'invalid_json');
+  assert.equal(marked.metadata.content_starts_with_brace,false);
+  assert.equal(marked.metadata.content_ends_with_brace,true);
+  assert.equal(marked.metadata.content_contains_tool_call_marker,true);
 });
 test('tool retry decision is limited to the first reasoning-only result with tools',()=>{
   const output={content:' ',reasoning:'I need a file'};
@@ -2251,6 +2355,69 @@ test('client diagnostic fingerprints are process-scoped and never expose stable 
   ])assert.equal(first.line.includes(secret),false,secret);
 });
 
+test('server tool_response correlates accepted and content-shadowed parser inspection',async()=>{
+  const lines=[];
+  const strict=jsonToolCall('Glob',{pattern:'**/InteractiveStars.tsx'});
+  const outputs=[
+    {content:strict,reasoning:'nonempty reasoning',parentMessageId:'accepted-parent'},
+    {content:'ordinary final prose',reasoning:strict,parentMessageId:'shadowed-parent'},
+  ];
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>outputs.shift()},async post=>{
+    const body={model:'deepseek-reasoner',messages:[{role:'user',content:'offline parser inspection'}],tools:[{type:'function',function:{name:'Glob',parameters:{type:'object'}}}]};
+    const accepted=(await post('/v1/chat/completions',body)).json();
+    assert.equal(accepted.choices[0].finish_reason,'tool_calls');
+    assert.equal(accepted.choices[0].message.tool_calls[0].function.name,'Glob');
+    const shadowed=(await post('/v1/chat/completions',body)).json();
+    assert.equal(shadowed.choices[0].finish_reason,'stop');
+    assert.equal(shadowed.choices[0].message.content,'ordinary final prose');
+    assert.equal(shadowed.choices[0].message.tool_calls,undefined);
+  });
+  const records=diagnosticRecords(lines);
+  const requests=records.filter(record=>record.event==='tool_request');
+  const responses=records.filter(record=>record.event==='tool_response');
+  assert.equal(requests.length,2);
+  assert.equal(responses.length,2);
+  assert.equal(responses[0].request_ref,requests[0].request_ref);
+  assert.equal(responses[0].strict_tool_call_detected,true);
+  assert.equal(responses[0].tool_parse_source,'content');
+  assert.equal(responses[0].tool_parse_reason,'accepted');
+  assert.equal(Object.prototype.hasOwnProperty.call(responses[0],'content_bytes'),false);
+  assert.equal(responses[1].request_ref,requests[1].request_ref);
+  assert.equal(responses[1].strict_tool_call_detected,false);
+  assert.equal(responses[1].tool_parse_source,'content');
+  assert.equal(responses[1].tool_parse_reason,'invalid_json');
+  assert.equal(responses[1].content_starts_with_brace,false);
+  assert.equal(responses[1].content_contains_tool_call_marker,false);
+  assert.equal(responses[1].reasoning_starts_with_brace,true);
+  assert.equal(responses[1].reasoning_ends_with_brace,true);
+  assert.equal(responses[1].reasoning_contains_tool_call_marker,true);
+  assert.equal(responses[1].outcome,'final_text');
+});
+
+test('rejected parser diagnostics expose no content, paths, URLs or tool arguments',async()=>{
+  const lines=[];
+  const rejected=[
+    '[https://secret.example/private?token=TOPSECRET](https://secret.example/private?token=TOPSECRET)',
+    'C:\\Users\\Sensitive\\private.txt',
+    'Bearer VERYSECRET',
+    '{"tool_call":{"name":"Glob","arguments":{"path":"D:\\\\secret-project"}}}',
+  ].join('\n');
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>({content:rejected,reasoning:'',parentMessageId:null})},async post=>{
+    const response=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}],tools:[{type:'function',function:{name:'Glob',parameters:{type:'object'}}}]})).json();
+    assert.equal(response.choices[0].message.content,rejected);
+  });
+  const records=diagnosticRecords(lines);
+  const response=records.find(record=>record.event==='tool_response');
+  assert.equal(response.tool_parse_source,'content');
+  assert.equal(response.tool_parse_reason,'invalid_json');
+  assert.equal(response.content_contains_tool_call_marker,true);
+  assert.ok(response.content_bytes>0);
+  const journal=lines.join('\n');
+  for(const forbidden of ['TOPSECRET','Sensitive','VERYSECRET','secret-project','secret.example','Bearer']){
+    assert.equal(journal.includes(forbidden),false,forbidden);
+  }
+});
+
 test('long session diagnostics show tool presence, continuation, retry and safe outcomes without payloads',async()=>{
   const lines=[];
   const calls=[];
@@ -2329,10 +2496,11 @@ test('OpenAI, Anthropic and Responses diagnostics preserve protocol signs and st
   assert.ok(requests.every(record=>record.stream===true));
 });
 
-test('diagnostic logger failures do not break an HTTP request',async()=>{
-  await withDiagnosticsServer({logger:()=>{throw new Error('logger failed');},completeImpl:async()=>({content:'safe final',reasoning:'',parentMessageId:null})},async post=>{
+test('diagnostic logger failures do not break a parser rejection or HTTP request',async()=>{
+  await withDiagnosticsServer({logger:()=>{throw new Error('logger failed');},completeImpl:async()=>({content:'safe final',reasoning:jsonToolCall('Read',{}),parentMessageId:null})},async post=>{
     const response=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'probe'}],tools:[{type:'function',function:{name:'Read'}}]},{'x-agent-session':'private-session'})).json();
     assert.equal(response.choices[0].message.content,'safe final');
+    assert.equal(response.choices[0].message.tool_calls,undefined);
   });
 });
 

@@ -7,7 +7,7 @@ const path = require('path');
 const { assertConfig, cors, authorized, safeError, logSafeError, isLoopback } = require('./lib/security');
 const { SessionStore } = require('./lib/session');
 const { SessionResolver } = require('./lib/session_resolver');
-const { parseToolCallFromOutput, toolPrompt } = require('./lib/tool_parser');
+const { inspectToolCallFromOutput, toolPrompt } = require('./lib/tool_parser');
 const { createToolRetryPrompt, hideRetryReasoning, logToolRetry, shouldRetryToolResponse } = require('./lib/tool_retry');
 const {
   createRepeatedToolCorrectionPrompt,
@@ -387,7 +387,8 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         onStage: onUpstreamStage,
         onError: onUpstreamError,
       });
-      let toolCall = parseToolCallFromOutput(output, allowedTools);
+      let toolParseResult = inspectToolCallFromOutput(output, allowedTools);
+      let toolCall = toolParseResult.toolCall;
       let correctiveAttempted = false;
       let safeFailure = false;
       if (shouldRetryToolResponse({ hasTools, output, toolCall, retryCount: 0 })) {
@@ -403,7 +404,8 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
           onStage: onUpstreamStage,
           onError: onUpstreamError,
         });
-        toolCall = parseToolCallFromOutput(output, allowedTools);
+        toolParseResult = inspectToolCallFromOutput(output, allowedTools);
+        toolCall = toolParseResult.toolCall;
         safeFailure = !toolCall && !String(output?.content || '').trim();
         output = hideRetryReasoning(output, toolCall);
       }
@@ -421,7 +423,8 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
             onStage: onUpstreamStage,
             onError: onUpstreamError,
           });
-          toolCall = parseToolCallFromOutput(output, allowedTools);
+          toolParseResult = inspectToolCallFromOutput(output, allowedTools);
+          toolCall = toolParseResult.toolCall;
           if (!toolCall) output = { ...output, reasoning: '' };
         }
         if (isExactCompletedToolCall(toolCall, toolResults)
@@ -450,6 +453,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         contentNonempty: Boolean(String(output?.content || '').trim()),
         reasoningRetryAttempted,
         repeatedToolRetryAttempted,
+        toolParseResult,
         outcome: toolCall ? 'tool_call' : safeFailure || !String(output?.content || '').trim() ? 'safe_failure' : 'final_text',
       });
       if (stream) return stream.finish({ output, toolCall, finalResponse });
