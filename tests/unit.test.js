@@ -1,9 +1,10 @@
 'use strict';
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
-const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,clientSessionKey,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { complete, loadAuth, parseRetryAfter, parseStream }=client; const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
+const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,clientSessionKey,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { checked, complete, loadAuth, parseRetryAfter, parseStream }=client; const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
 const {TOOL_RETRY_FAILURE_MESSAGE,createToolRetryPrompt,hideRetryReasoning,shouldRetryToolResponse}=require('../lib/tool_retry');
 const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
-const {MAX_TOOL_NAMES,MAX_TOOL_NAME_CHARS,createToolDiagnostics}=require('../lib/tool_diagnostics');
+const {MAX_TOOL_NAMES,MAX_TOOL_NAME_CHARS,classifyUpstreamError,createToolDiagnostics}=require('../lib/tool_diagnostics');
+const {solvePOW}=require('../lib/pow');
 const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory,readAuthStatus}=require('../lib/setup');
 const {runDiagnostics,boundedTimeout}=require('../scripts/doctor');
 test('loopback and external bind security',()=>{assert.equal(isLoopback('127.0.0.1'),true);assert.equal(isLoopback('0.0.0.0'),false);assert.throws(()=>assertConfig({HOST:'0.0.0.0'}));assert.equal(assertConfig({HOST:'0.0.0.0',PROXY_API_KEY:'x'.repeat(24)}).host,'0.0.0.0');});
@@ -17,6 +18,23 @@ test('safe error logging never throws for unusual errors or logger failures',()=
   const unusual={get message(){throw new Error('message getter failed');},toString(){throw new Error('toString failed');}};
   assert.doesNotThrow(()=>logSafeError(unusual,()=>{throw new Error('logger failed');}));
   assert.equal(safeError(unusual),'Internal error');
+});
+test('safe error logging redacts network URLs and local absolute paths',()=>{
+  const unsafe=[
+    'failed at https://secret.example/path?token=URL_MARKER',
+    'failed at file:///C:/Users/Sensitive/FILE_MARKER.txt',
+    'failed at C:\\Users\\Sensitive\\WINDOWS_MARKER.txt',
+    'failed at \\\\private-server\\share\\UNC_MARKER.txt',
+    'failed at /home/sensitive/UNIX_MARKER.txt',
+    'failed at /workspace/private/WORKSPACE_MARKER.txt',
+  ];
+  for(const value of unsafe){
+    const message=safeError(new Error(value));
+    assert.doesNotMatch(message,/secret\.example|URL_MARKER|FILE_MARKER|WINDOWS_MARKER|UNC_MARKER|UNIX_MARKER|WORKSPACE_MARKER|https?:\/\/|file:\/\/|[A-Z]:\\|\\\\private-server|\/home\/sensitive|\/workspace\/private/);
+  }
+  assert.equal(safeError(new Error('fetch failed')),'fetch failed');
+  assert.equal(safeError(new Error('Upstream request timed out')),'Upstream request timed out');
+  assert.equal(safeError(new Error('DeepSeek Web HTTP 429')),'DeepSeek Web HTTP 429');
 });
 test('setup auth status accepts only non-empty string credentials',t=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'deepseek-bridge-auth-status-'));
@@ -453,6 +471,212 @@ test('completion without diagnostic callbacks preserves retries and existing res
   assert.deepEqual(waits,[2000]);
 });
 
+function fetchFailure(name,code,message='fetch failed https://secret.example/private?token=TOKEN_SECRET'){
+  const error=new Error(message);
+  error.name=name;
+  if(code)error.cause={code,message:'cause details must not be logged'};
+  return error;
+}
+
+test('checked preserves only safe network metadata without changing retry policy',async()=>{
+  const cases=[
+    ['TypeError','ENOTFOUND',undefined],
+    ['TypeError','EAI_AGAIN',undefined],
+    ['TypeError','ECONNREFUSED',undefined],
+    ['TypeError','ECONNRESET',undefined],
+    ['TypeError','ERR_TLS_CERT_ALTNAME_INVALID',undefined],
+    ['TypeError','ETIMEDOUT',undefined],
+    ['TimeoutError',null,true],
+    ['AbortError',null,true],
+  ];
+  for(const [name,code,retryable] of cases){
+    let caught;
+    try{await checked('https://must-not-be-logged.example/private',{method:'GET'},100,async()=>{throw fetchFailure(name,code);});}
+    catch(error){caught=error;}
+    assert.ok(caught);
+    assert.equal(caught.causeCode,code||undefined);
+    assert.equal(caught.retryable,retryable);
+    assert.equal(caught.status,name==='TimeoutError'||name==='AbortError'?504:undefined);
+    assert.doesNotMatch(caught.message,/https?:|TOKEN_SECRET|private/);
+  }
+});
+
+test('upstream error diagnostics classify only safe provable metadata',async()=>{
+  const cases=[
+    {name:'TypeError',code:'ENOTFOUND',stage:'remote_session_start',category:'dns',status:null,retryable:false,timeout:false},
+    {name:'TypeError',code:'EAI_AGAIN',stage:'challenge_start',category:'dns',status:null,retryable:false,timeout:false},
+    {name:'TypeError',code:'ECONNREFUSED',stage:'completion_start',category:'connect',status:null,retryable:false,timeout:false},
+    {name:'TypeError',code:'ECONNRESET',stage:'completion_start',category:'connect',status:null,retryable:false,timeout:false},
+    {name:'TypeError',code:'ERR_TLS_CERT_ALTNAME_INVALID',stage:'remote_session_start',category:'tls',status:null,retryable:false,timeout:false},
+    {name:'TypeError',code:'ETIMEDOUT',stage:'wasm_download_start',category:'timeout',status:null,retryable:false,timeout:true},
+    {name:'TimeoutError',stage:'completion_start',category:'timeout',status:504,retryable:true,timeout:true},
+    {name:'AbortError',stage:'challenge_start',category:'timeout',status:504,retryable:true,timeout:true},
+  ];
+  for(const item of cases){
+    let error;
+    try{await checked('https://must-not-be-logged.example/private',{method:'GET'},100,async()=>{throw fetchFailure(item.name,item.code);});}
+    catch(caught){error=caught;}
+    const lines=[];
+    const callbacks=requestDiagnostics(lines);
+    callbacks.onError(error,{stage:item.stage,attempt:2,maxAttempts:3});
+    const record=diagnosticRecords(lines).find(value=>value.event==='upstream_error');
+    assert.deepEqual(record,{
+      event:'upstream_error',request_ref:'0011223344556677',stage:item.stage,error_name:item.name,error_category:item.category,status:item.status,
+      cause_code:item.code||null,retryable:item.retryable,timeout:item.timeout,attempt:2,max_attempts:3,
+    });
+  }
+
+  for(const status of [403,429,500]){
+    let error;
+    try{await checked('https://must-not-be-logged.example/private',{method:'POST'},100,async()=>new Response('UPSTREAM_BODY_SECRET',{status,headers:status===429?{'retry-after':'1'}:{}}));}
+    catch(caught){error=caught;}
+    const lines=[];
+    const callbacks=requestDiagnostics(lines);
+    callbacks.onError(error,{stage:'completion_start',attempt:1,maxAttempts:3});
+    const record=diagnosticRecords(lines).find(value=>value.event==='upstream_error');
+    assert.equal(record.error_category,'http');
+    assert.equal(record.status,status);
+    assert.equal(record.retryable,status===429||status>=500);
+    assert.equal(record.timeout,false);
+    assert.equal(record.cause_code,null);
+    assert.equal(record.attempt,1);
+    assert.equal(record.max_attempts,3);
+  }
+  assert.equal(classifyUpstreamError(new Error('compile failed'),'wasm_compile_start').error_category,'pow');
+  const wasmHttp=new Error('PoW WASM HTTP 403');wasmHttp.upstreamStatus=403;
+  assert.deepEqual(classifyUpstreamError(wasmHttp,'wasm_download_start'),{
+    stage:'wasm_download_start',error_name:'Error',error_category:'http',status:403,cause_code:null,retryable:false,timeout:false,
+  });
+  assert.equal(classifyUpstreamError(fetchFailure('TypeError','ENOTFOUND'),'wasm_download_start').error_category,'dns');
+});
+
+test('HTTP errors discard arbitrary upstream response bodies',async()=>{
+  const secret='UPSTREAM_BODY_SECRET https://secret.example/private C:\\private\\file.txt token=TOKEN_SECRET';
+  let caught;
+  try{await checked('https://must-not-be-logged.example/private',{method:'POST'},100,async()=>new Response(secret,{status:500}));}
+  catch(error){caught=error;}
+  assert.ok(caught);
+  assert.equal(caught.status,500);
+  assert.equal(caught.retryable,true);
+  assert.equal(caught.message,'DeepSeek Web HTTP 500');
+  assert.doesNotMatch(caught.message,/UPSTREAM_BODY_SECRET|https?:|private|TOKEN_SECRET/);
+});
+
+test('PoW WASM loader forwards safe network code and HTTP status metadata',async t=>{
+  const originalFetch=global.fetch;
+  t.after(()=>{global.fetch=originalFetch;});
+  global.fetch=async()=>{throw fetchFailure('TypeError','ENOTFOUND');};
+  let networkError;
+  try{await solvePOW({challenge:'c',salt:'s',expire_at:1,difficulty:1},'https://wasm-network-secret.example/private.wasm',100);}
+  catch(error){networkError=error;}
+  assert.equal(networkError.message,'fetch failed');
+  assert.equal(networkError.causeCode,'ENOTFOUND');
+  assert.doesNotMatch(networkError.message,/https?:|private/);
+
+  global.fetch=async()=>new Response('UPSTREAM_WASM_BODY_SECRET',{status:403});
+  let httpError;
+  try{await solvePOW({challenge:'c',salt:'s',expire_at:1,difficulty:1},'https://wasm-http-secret.example/private.wasm',100);}
+  catch(error){httpError=error;}
+  assert.equal(httpError.upstreamStatus,403);
+  assert.equal(httpError.message,'PoW WASM HTTP 403');
+  assert.doesNotMatch(httpError.message,/UPSTREAM_WASM_BODY_SECRET|https?:|private/);
+});
+
+function syntheticPowInstance(answer=42){
+  const memory=new WebAssembly.Memory({initial:1});
+  let allocation=64;
+  return {exports:{
+    memory,
+    __wbindgen_export_0(length){const pointer=allocation;allocation+=length;return pointer;},
+    __wbindgen_add_to_stack_pointer(){return 0;},
+    wasm_solve(){const view=new DataView(memory.buffer);view.setInt32(0,1,true);view.setFloat64(8,answer,true);},
+  }};
+}
+
+test('production PoW cache keeps cold owner, concurrent waiter and warm hit stages request-local',async t=>{
+  const originalFetch=global.fetch;
+  const originalCompile=WebAssembly.compile;
+  const originalInstantiate=WebAssembly.instantiate;
+  t.after(()=>{global.fetch=originalFetch;WebAssembly.compile=originalCompile;WebAssembly.instantiate=originalInstantiate;});
+  let fetches=0,compiles=0,releaseCompile,compileStarted;
+  const compileGate=new Promise(resolve=>{releaseCompile=resolve;});
+  const compileReady=new Promise(resolve=>{compileStarted=resolve;});
+  global.fetch=async()=>{fetches+=1;return new Response(new Uint8Array([0,97,115,109]),{status:200});};
+  WebAssembly.compile=async()=>{compiles+=1;compileStarted();await compileGate;return {synthetic:true};};
+  WebAssembly.instantiate=async()=>syntheticPowInstance();
+  const challenge={challenge:'c',salt:'s',expire_at:1,difficulty:1};
+  const ownerStages=[],waiterStages=[],warmStages=[];
+  const owner=solvePOW(challenge,'https://pow-cache-success.test/module.wasm',1000,stage=>ownerStages.push(stage));
+  await compileReady;
+  const waiter=solvePOW(challenge,'https://pow-cache-success.test/module.wasm',1000,stage=>waiterStages.push(stage));
+  releaseCompile();
+  assert.deepEqual(await Promise.all([owner,waiter]),[42,42]);
+  assert.equal(await solvePOW(challenge,'https://pow-cache-success.test/module.wasm',1000,stage=>warmStages.push(stage)),42);
+  assert.equal(fetches,1);
+  assert.equal(compiles,1);
+  assert.deepEqual(ownerStages,[
+    'wasm_download_start','wasm_downloaded','wasm_compile_start','wasm_compiled','pow_solve_start','pow_solved',
+  ]);
+  assert.deepEqual(waiterStages,['wasm_wait_shared','wasm_compiled','pow_solve_start','pow_solved']);
+  assert.deepEqual(warmStages,['wasm_cache_hit','pow_solve_start','pow_solved']);
+});
+
+test('production PoW shared download failure keeps request callbacks and failure stage separate',async t=>{
+  const originalFetch=global.fetch;
+  t.after(()=>{global.fetch=originalFetch;});
+  let fetches=0,rejectFetch,fetchStarted;
+  const started=new Promise(resolve=>{fetchStarted=resolve;});
+  global.fetch=()=>{fetches+=1;fetchStarted();return new Promise((resolve,reject)=>{rejectFetch=reject;});};
+  const challenge={challenge:'c',salt:'s',expire_at:1,difficulty:1};
+  const ownerStages=[],waiterStages=[];
+  const owner=solvePOW(challenge,'https://pow-cache-download-failure.test/module.wasm',1000,stage=>ownerStages.push(stage));
+  await started;
+  const waiter=solvePOW(challenge,'https://pow-cache-download-failure.test/module.wasm',1000,stage=>waiterStages.push(stage));
+  rejectFetch(fetchFailure('TypeError','ENOTFOUND'));
+  const results=await Promise.allSettled([owner,waiter]);
+  assert.equal(fetches,1);
+  assert.deepEqual(ownerStages,['wasm_download_start']);
+  assert.deepEqual(waiterStages,['wasm_wait_shared']);
+  assert.ok(results.every(result=>result.status==='rejected'));
+  assert.ok(results.every(result=>result.reason.causeCode==='ENOTFOUND'));
+  assert.ok(results.every(result=>result.reason.upstreamStage==='wasm_download_start'));
+});
+
+test('production PoW shared compile failure reports the compile phase to every waiter',async t=>{
+  const originalFetch=global.fetch;
+  const originalCompile=WebAssembly.compile;
+  t.after(()=>{global.fetch=originalFetch;WebAssembly.compile=originalCompile;});
+  let fetches=0,compiles=0,rejectCompile,compileStarted;
+  const started=new Promise(resolve=>{compileStarted=resolve;});
+  global.fetch=async()=>{fetches+=1;return new Response(new Uint8Array([0,97,115,109]),{status:200});};
+  WebAssembly.compile=()=>{compiles+=1;compileStarted();return new Promise((resolve,reject)=>{rejectCompile=reject;});};
+  const challenge={challenge:'c',salt:'s',expire_at:1,difficulty:1};
+  const ownerStages=[],waiterStages=[];
+  const owner=solvePOW(challenge,'https://pow-cache-compile-failure.test/module.wasm',1000,stage=>ownerStages.push(stage));
+  await started;
+  const waiter=solvePOW(challenge,'https://pow-cache-compile-failure.test/module.wasm',1000,stage=>waiterStages.push(stage));
+  rejectCompile(new WebAssembly.CompileError('synthetic compile failure'));
+  const results=await Promise.allSettled([owner,waiter]);
+  assert.equal(fetches,1);
+  assert.equal(compiles,1);
+  assert.deepEqual(ownerStages,['wasm_download_start','wasm_downloaded','wasm_compile_start']);
+  assert.deepEqual(waiterStages,['wasm_wait_shared']);
+  assert.ok(results.every(result=>result.status==='rejected'));
+  assert.ok(results.every(result=>result.reason.upstreamStage==='wasm_compile_start'));
+});
+
+test('production PoW stage callback failures remain observational',async t=>{
+  const originalFetch=global.fetch;
+  const originalCompile=WebAssembly.compile;
+  const originalInstantiate=WebAssembly.instantiate;
+  t.after(()=>{global.fetch=originalFetch;WebAssembly.compile=originalCompile;WebAssembly.instantiate=originalInstantiate;});
+  global.fetch=async()=>new Response(new Uint8Array([0,97,115,109]),{status:200});
+  WebAssembly.compile=async()=>({synthetic:true});
+  WebAssembly.instantiate=async()=>syntheticPowInstance(7);
+  const challenge={challenge:'c',salt:'s',expire_at:1,difficulty:1};
+  assert.equal(await solvePOW(challenge,'https://pow-callback-safety.test/module.wasm',1000,()=>{throw new Error('diagnostic callback failed');}),7);
+});
+
 function doctorAuth(){return JSON.stringify({token:'test-token',cookie:'test-cookie',wasmUrl:'https://example.test/pow.wasm'});}
 function doctorChallenge(){return {data:{biz_data:{challenge:{challenge:'c',salt:'s',expire_at:1,difficulty:1,algorithm:'a',signature:'sig'}}}};}
 function doctorFetch(marker,{reachabilityStatus=200,sessionStatus=200,challengeStatus=200,completionStatus=200,completionText}={}){
@@ -466,6 +690,7 @@ function doctorFetch(marker,{reachabilityStatus=200,sessionStatus=200,challengeS
 }
 function doctorPow({failureStage}={}){
   return async(challenge,url,timeout,onStage)=>{
+    onStage('wasm_download_start');
     if(failureStage==='download')throw new Error('WASM download failed token=secret');
     onStage('wasm_downloaded');
     onStage('wasm_compile_start');
@@ -1493,6 +1718,195 @@ test('tool diagnostics are disabled by default',async()=>{
   }finally{server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
 });
 
+test('one HTTP request shares a private request_ref across all diagnostic events only',async()=>{
+  const lines=[];
+  let completionOptions;
+  let payload;
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{
+    completionOptions=options;
+    options.onStage?.('completion_start',{attempt:1,maxAttempts:1});
+    return {content:'request ref final',reasoning:'',parentMessageId:null};
+  }},async post=>{
+    payload=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'offline request ref'}]})).json();
+  });
+  const records=diagnosticRecords(lines);
+  const request=records.find(record=>record.event==='tool_request');
+  const response=records.find(record=>record.event==='tool_response');
+  const stage=records.find(record=>record.event==='upstream_stage');
+  assert.match(request.request_ref,/^[a-f0-9]{16}$/);
+  assert.equal(response.request_ref,request.request_ref);
+  assert.equal(stage.request_ref,request.request_ref);
+  assert.equal(stage.stage,'completion_start');
+  assert.equal(Object.prototype.hasOwnProperty.call(completionOptions,'requestRef'),false);
+  assert.equal(JSON.stringify(payload).includes(request.request_ref),false);
+});
+
+test('parallel HTTP requests always receive distinct request_ref values',async()=>{
+  const lines=[];
+  let arrivals=0;
+  let release;
+  const gate=new Promise(resolve=>{release=resolve;});
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+    arrivals+=1;
+    if(arrivals===2)release();
+    await gate;
+    return {content:'parallel final',reasoning:'',parentMessageId:null};
+  }},async post=>{
+    await Promise.all([
+      post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'parallel one'}]}),
+      post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'parallel two'}]}),
+    ]);
+  });
+  const records=diagnosticRecords(lines);
+  const requests=records.filter(record=>record.event==='tool_request');
+  assert.equal(requests.length,2);
+  assert.equal(new Set(requests.map(record=>record.request_ref)).size,2);
+  for(const request of requests){
+    assert.equal(records.filter(record=>record.request_ref===request.request_ref&&record.event==='tool_response').length,1);
+  }
+});
+
+test('fetch failed diagnostics and ordinary logger expose no request or network secrets',async()=>{
+  const lines=[];
+  const secretValues=[
+    'PROMPT_SECRET','REASONING_SECRET','ARGUMENT_SECRET','TOOL_RESULT_SECRET','SESSION_ID_SECRET','CALL_ID_SECRET',
+    'TOKEN_SECRET','COOKIE_SECRET','AUTHORIZATION_SECRET','UPSTREAM_BODY_SECRET','synthetic-token','synthetic-cookie','C:\\private\\marker.txt',
+    'https://secret.example/private?token=TOKEN_SECRET',
+  ];
+  const completeImpl=options=>complete({
+    ...options,auth:{token:'synthetic-token',cookie:'synthetic-cookie'},solvePow:async()=>7,
+    fetchImpl:async()=>{throw fetchFailure('TypeError','ENOTFOUND',`${secretValues[13]} ${secretValues[9]}`);},
+    sleep:async()=>{},
+  });
+  const server=createDiagnosticsEnabledServer({logger:line=>lines.push(line),completeImpl});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  let responseText;
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/messages`,{
+      method:'POST',
+      headers:{'content-type':'application/json','x-claude-code-session-id':secretValues[4],authorization:`Bearer ${secretValues[8]}`,cookie:secretValues[7]},
+      body:JSON.stringify({
+        model:'deepseek-chat',messages:[{role:'user',content:`${secretValues[0]} ${secretValues[12]} ${secretValues[3]}`}],
+        tools:[{name:'Read',description:secretValues[1],input_schema:{type:'object',description:secretValues[2]}}],
+      }),
+    });
+    responseText=await response.text();
+    assert.equal(response.status,502);
+    assert.match(responseText,/DeepSeek request failed/);
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+  const records=diagnosticRecords(lines);
+  const request=records.find(record=>record.event==='tool_request');
+  const error=records.find(record=>record.event==='upstream_error');
+  const toolResponse=records.find(record=>record.event==='tool_response');
+  assert.equal(error.request_ref,request.request_ref);
+  assert.equal(toolResponse.request_ref,request.request_ref);
+  assert.deepEqual({...error,request_ref:'ref'}, {
+    event:'upstream_error',request_ref:'ref',stage:'remote_session_start',error_name:'TypeError',error_category:'dns',
+    status:null,cause_code:'ENOTFOUND',retryable:false,timeout:false,attempt:1,max_attempts:3,
+  });
+  assert.equal(responseText.includes(request.request_ref),false);
+  const journal=lines.join('\n');
+  assert.match(journal,/\[deepseek-bridge\] request error: fetch failed/);
+  for(const secret of secretValues)assert.equal(journal.includes(secret),false,secret);
+  assert.doesNotMatch(journal,/https?:\/\/|[A-Z]:\\/);
+});
+
+test('production server sanitizes stream reader errors before diagnostics, logger and API response',async()=>{
+  const lines=[];
+  const urlMarker='STREAM_URL_SECRET_MARKER';
+  const pathMarker='STREAM_PATH_SECRET_MARKER';
+  const rawMessage=`reader failed https://secret.example/path?token=${urlMarker} C:\\Users\\Sensitive\\${pathMarker}.txt`;
+  const streamError=fetchFailure('TypeError','ECONNRESET',rawMessage);
+  const stream=new ReadableStream({start(controller){controller.error(streamError);}});
+  const responses=[upstreamSessionResponse('stream-logger-session'),upstreamChallengeResponse(),new Response(stream,{status:200})];
+  const completeImpl=options=>complete({
+    ...options,auth:{token:'synthetic-token',cookie:'synthetic-cookie'},
+    fetchImpl:async()=>responses.shift(),solvePow:async()=>7,maxRetries:0,
+  });
+  const server=createDiagnosticsEnabledServer({logger:line=>lines.push(line),completeImpl});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  let responseText;
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/messages`,{
+      method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content:'offline stream logger test'}]}),
+    });
+    responseText=await response.text();
+    assert.equal(response.status,502);
+    assert.match(responseText,/DeepSeek request failed/);
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+  const journal=lines.join('\n');
+  for(const secret of [urlMarker,pathMarker,'secret.example','C:\\Users\\Sensitive']){
+    assert.equal(journal.includes(secret),false,secret);
+    assert.equal(responseText.includes(secret),false,secret);
+  }
+  assert.match(journal,/\[deepseek-bridge\] request error: Upstream stream read failed/);
+  const error=diagnosticRecords(lines).find(record=>record.event==='upstream_error');
+  assert.deepEqual({...error,request_ref:'ref'}, {
+    event:'upstream_error',request_ref:'ref',stage:'stream_read',error_name:'TypeError',error_category:'stream',
+    status:null,cause_code:'ECONNRESET',retryable:false,timeout:false,attempt:1,max_attempts:1,
+  });
+});
+
+test('parallel HTTP requests retain distinct request_ref on one shared WASM failure',async t=>{
+  const localFetch=global.fetch;
+  let rejectWasm,sessionSequence=0,wasmFetches=0;
+  const wasmFailure=()=>fetchFailure('TypeError','ENOTFOUND');
+  global.fetch=()=>{wasmFetches+=1;return new Promise((resolve,reject)=>{rejectWasm=reject;});};
+  t.after(()=>{global.fetch=localFetch;});
+  const lines=[];
+  const upstreamFetch=async url=>{
+    if(String(url).includes('chat_session/create'))return upstreamSessionResponse(`parallel-wasm-${++sessionSequence}`);
+    if(String(url).includes('create_pow_challenge')){
+      return upstreamChallengeResponse();
+    }
+    throw new Error('unexpected completion request');
+  };
+  const completeImpl=options=>complete({
+    ...options,auth:{token:'synthetic-token',cookie:'synthetic-cookie',wasmUrl:'https://parallel-wasm-failure.test/module.wasm'},
+    fetchImpl:upstreamFetch,maxRetries:0,
+  });
+  const server=createDiagnosticsEnabledServer({logger:line=>{
+    lines.push(line);
+    try{
+      const record=JSON.parse(line);
+      if(record.event==='upstream_stage'&&record.stage==='wasm_wait_shared')queueMicrotask(()=>rejectWasm(wasmFailure()));
+    }catch{}
+  },completeImpl});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const post=content=>localFetch(`http://127.0.0.1:${server.address().port}/v1/messages`,{
+      method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content}]}),
+    });
+    const responses=await Promise.all([post('parallel wasm one'),post('parallel wasm two')]);
+    assert.deepEqual(responses.map(response=>response.status),[502,502]);
+    await Promise.all(responses.map(response=>response.text()));
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+  assert.equal(wasmFetches,1);
+  const records=diagnosticRecords(lines);
+  const requests=records.filter(record=>record.event==='tool_request');
+  const errors=records.filter(record=>record.event==='upstream_error');
+  assert.equal(requests.length,2);
+  assert.equal(errors.length,2);
+  assert.equal(new Set(requests.map(record=>record.request_ref)).size,2);
+  assert.deepEqual(new Set(errors.map(record=>record.request_ref)),new Set(requests.map(record=>record.request_ref)));
+  assert.ok(errors.every(record=>record.stage==='wasm_download_start'));
+  assert.ok(errors.every(record=>record.error_category==='dns'&&record.cause_code==='ENOTFOUND'));
+  const requestStages=requests.map(request=>records.filter(record=>record.request_ref===request.request_ref&&record.event==='upstream_stage').map(record=>record.stage));
+  assert.equal(requestStages.filter(stages=>stages.includes('wasm_download_start')).length,1);
+  assert.equal(requestStages.filter(stages=>stages.includes('wasm_wait_shared')).length,1);
+});
+
 test('tool diagnostics are bounded and never break requests when logging fails',()=>{
   const lines=[];
   const diagnostics=createToolDiagnostics({enabled:true,logger:line=>lines.push(line)});
@@ -1501,8 +1915,7 @@ test('tool diagnostics are bounded and never break requests when logging fails',
   response.response({outcome:'final_text',contentNonempty:true});
   const records=diagnosticRecords(lines);
   assert.equal(records[0].tool_names.length,MAX_TOOL_NAMES);
-  assert.ok(records[0].tool_names[0].length<=MAX_TOOL_NAME_CHARS);
-  assert.doesNotMatch(records[0].tool_names[0],/[\r\n]/);
+  assert.equal(records[0].tool_names[0],'invalid');
   assert.equal(records[0].tool_names[1],'invalid');
   assert.equal(records[0].client_session_source,'unavailable');
   assert.equal(records[0].client_session_ref,null);
@@ -1513,6 +1926,186 @@ test('tool diagnostics are bounded and never break requests when logging fails',
   assert.equal(diagnosticRecords(wrongLines)[0].raw_tool_count,0);
   const failing=createToolDiagnostics({enabled:true,logger:()=>{throw new Error('logger failed');}});
   assert.doesNotThrow(()=>failing.request({protocol:'anthropic',route:'/v1/messages',body:{model:'deepseek-chat',tools:[]},upstreamSource:'anonymous',upstreamKey:'private',clientSessionSource:'unavailable',clientSessionKey:null}));
+});
+
+test('tool diagnostics accept only safe identifier-shaped tool names',()=>{
+  const marker='PRINTABLE_TOOL_SECRET_MARKER';
+  const lines=[];
+  const diagnostics=createToolDiagnostics({enabled:true,logger:line=>lines.push(line),randomBytes:()=>Buffer.alloc(8,4)});
+  diagnostics.request({
+    protocol:'anthropic',route:'/v1/messages',body:{model:'deepseek-chat',tools:[
+      {name:'Read'},{name:'Glob'},{name:'ListMcpResourcesTool'},
+      {name:'mcp__context7__resolve-library-id'},
+      {name:`https://secret.example/${marker}`},
+      {name:`C:\\Users\\X\\${marker}`},
+      {name:`Bearer ${marker}`},
+      {name:`tool ${marker}`},
+      {name:`tool\n${marker}`},
+    ]},
+    upstreamSource:'anonymous',upstreamKey:'private',clientSessionSource:'unavailable',clientSessionKey:null,
+  });
+  const record=diagnosticRecords(lines)[0];
+  assert.deepEqual(record.tool_names,[
+    'Read','Glob','ListMcpResourcesTool','mcp__context7__resolve-library-id',
+    'invalid','invalid','invalid','invalid','invalid',
+  ]);
+  assert.equal(JSON.stringify(record).includes(marker),false);
+  assert.equal(JSON.stringify(record).includes('secret.example'),false);
+});
+
+function upstreamSessionResponse(id){return new Response(JSON.stringify({data:{biz_data:{id}}}),{status:200});}
+function upstreamChallengeResponse(){return new Response(JSON.stringify(doctorChallenge()),{status:200});}
+function upstreamStreamResponse(content='ok'){
+  return new Response(`data: ${JSON.stringify({p:'response/content',v:content})}\n`,{status:200,headers:{'content-type':'text/event-stream'}});
+}
+function requestDiagnostics(lines,requestRef='0011223344556677'){
+  const diagnostics=createToolDiagnostics({enabled:true,logger:line=>lines.push(line)});
+  const request=diagnostics.request({
+    protocol:'anthropic',route:'/v1/messages',requestRef,
+    body:{model:'deepseek-chat',messages:[{role:'user',content:'PROMPT_MUST_NOT_LEAK'}]},
+    upstreamSource:'anonymous',upstreamKey:'anonymous:SESSION_MUST_NOT_LEAK',
+    clientSessionSource:'claude_header',clientSessionKey:'client:SESSION_MUST_NOT_LEAK',
+    isToolContinuation:false,toolResultCount:0,
+  });
+  return {
+    request,
+    onStage:(stage,metadata)=>request.stage(stage,metadata),
+    onError:(error,metadata)=>request.upstreamError(error,metadata),
+  };
+}
+function powStages(challenge,url,timeout,onStage){
+  onStage('wasm_download_start');
+  onStage('wasm_downloaded');
+  onStage('wasm_compile_start');
+  onStage('wasm_compiled');
+  onStage('pow_solve_start');
+  onStage('pow_solved');
+  return 7;
+}
+
+test('upstream_stage follows the real session, PoW, completion and stream path',async()=>{
+  const lines=[];
+  const callbacks=requestDiagnostics(lines);
+  const responses=[upstreamSessionResponse('stage-session'),upstreamChallengeResponse(),upstreamStreamResponse('stage final')];
+  const result=await complete({
+    prompt:'offline',session:{id:null,parentMessageId:null,history:[]},
+    model:{model_type:'default',reasoning:false,search:false},auth:{token:'synthetic',cookie:'synthetic'},
+    fetchImpl:async()=>responses.shift(),solvePow:powStages,maxRetries:0,
+    onStage:callbacks.onStage,onError:callbacks.onError,
+  });
+  callbacks.request.response({outcome:'final_text',contentNonempty:true});
+  assert.equal(result.content,'stage final');
+  const records=diagnosticRecords(lines);
+  const stages=records.filter(record=>record.event==='upstream_stage');
+  assert.deepEqual(stages.map(record=>record.stage),[
+    'remote_session_start','remote_session_created','challenge_start','challenge_received',
+    'wasm_download_start','wasm_downloaded','wasm_compile_start','wasm_compiled',
+    'pow_solve_start','pow_solved','completion_start','completion_completed',
+    'stream_received','stream_read','stream_parsed',
+  ]);
+  assert.ok(stages.every(record=>record.request_ref==='0011223344556677'));
+  assert.ok(stages.every(record=>Object.keys(record).sort().join(',')==='event,request_ref,stage'));
+});
+
+test('throwing upstream stage callbacks cannot change a successful completion',async()=>{
+  const responses=[upstreamSessionResponse('callback-session'),upstreamChallengeResponse(),upstreamStreamResponse('callback safe')];
+  const result=await complete({
+    prompt:'offline',session:{id:null,parentMessageId:null,history:[]},
+    model:{model_type:'default',reasoning:false,search:false},auth:{token:'synthetic',cookie:'synthetic'},
+    fetchImpl:async()=>responses.shift(),solvePow:powStages,maxRetries:0,
+    onStage:()=>{throw new Error('diagnostic stage callback failed');},
+  });
+  assert.equal(result.content,'callback safe');
+});
+
+test('stream reader failures remain stream errors even with a network cause code',async()=>{
+  const lines=[];
+  const callbacks=requestDiagnostics(lines,'1122334455667788');
+  const stream=new ReadableStream({start(controller){controller.error(fetchFailure('TypeError','ECONNRESET'));}});
+  const responses=[upstreamSessionResponse('stream-session'),upstreamChallengeResponse(),new Response(stream,{status:200})];
+  await assert.rejects(()=>complete({
+    prompt:'offline',session:{id:null,parentMessageId:null,history:[]},
+    model:{model_type:'default',reasoning:false,search:false},auth:{token:'synthetic',cookie:'synthetic'},
+    fetchImpl:async()=>responses.shift(),solvePow:async()=>7,
+    onStage:callbacks.onStage,onError:callbacks.onError,sleep:async()=>{},
+  }));
+  callbacks.request.response({outcome:'upstream_error'});
+  const error=diagnosticRecords(lines).find(record=>record.event==='upstream_error');
+  assert.deepEqual(error,{
+    event:'upstream_error',request_ref:'1122334455667788',stage:'stream_read',error_name:'TypeError',
+    error_category:'stream',status:null,cause_code:'ECONNRESET',retryable:false,timeout:false,attempt:1,max_attempts:3,
+  });
+});
+
+test('stream timeout evidence is independent from the primary stream category',()=>{
+  const cases=[
+    {error:fetchFailure('AbortError'),timeout:true,cause:null},
+    {error:fetchFailure('TimeoutError'),timeout:true,cause:null},
+    {error:fetchFailure('TypeError','ETIMEDOUT'),timeout:true,cause:'ETIMEDOUT'},
+    {error:fetchFailure('TypeError','ECONNRESET'),timeout:false,cause:'ECONNRESET'},
+  ];
+  for(const item of cases){
+    const result=classifyUpstreamError(item.error,'stream_read');
+    assert.equal(result.error_category,'stream');
+    assert.equal(result.timeout,item.timeout);
+    assert.equal(result.cause_code,item.cause);
+  }
+});
+
+test('existing retry can recover under one request_ref without policy changes',async()=>{
+  const lines=[];
+  const callbacks=requestDiagnostics(lines,'2233445566778899');
+  const responses=[
+    upstreamSessionResponse('retry-session-1'),upstreamChallengeResponse(),new Response('RETRY_BODY_SECRET',{status:500}),
+    upstreamSessionResponse('retry-session-2'),upstreamChallengeResponse(),upstreamStreamResponse('retry recovered'),
+  ];
+  const waits=[];
+  const result=await complete({
+    prompt:'offline',session:{id:null,parentMessageId:null,history:[]},
+    model:{model_type:'default',reasoning:false,search:false},auth:{token:'synthetic',cookie:'synthetic'},
+    fetchImpl:async()=>responses.shift(),solvePow:async()=>7,sleep:async ms=>waits.push(ms),
+    onStage:callbacks.onStage,onError:callbacks.onError,
+  });
+  callbacks.request.response({outcome:'final_text',contentNonempty:true});
+  assert.equal(result.content,'retry recovered');
+  assert.deepEqual(waits,[500]);
+  const records=diagnosticRecords(lines);
+  const errors=records.filter(record=>record.event==='upstream_error');
+  assert.equal(errors.length,1);
+  assert.deepEqual(errors[0],{
+    event:'upstream_error',request_ref:'2233445566778899',stage:'completion_start',error_name:'DeepSeekUpstreamError',
+    error_category:'http',status:500,cause_code:null,retryable:true,timeout:false,attempt:1,max_attempts:3,
+  });
+  assert.ok(records.some(record=>record.event==='upstream_stage'&&record.stage==='remote_session_start'));
+  assert.equal(records.at(-1).event,'tool_response');
+  assert.equal(records.at(-1).request_ref,'2233445566778899');
+  assert.doesNotMatch(lines.join('\n'),/RETRY_BODY_SECRET/);
+});
+
+test('retry exhaustion reports every existing attempt and preserves the safe final error',async()=>{
+  const lines=[];
+  const callbacks=requestDiagnostics(lines,'33445566778899aa');
+  const responses=[];
+  for(let attempt=1;attempt<=3;attempt+=1){
+    responses.push(upstreamSessionResponse(`exhausted-${attempt}`),upstreamChallengeResponse(),new Response(`UPSTREAM_BODY_SECRET_${attempt}`,{status:500}));
+  }
+  let finalError;
+  try{
+    await complete({
+      prompt:'offline',session:{id:null,parentMessageId:null,history:[]},
+      model:{model_type:'default',reasoning:false,search:false},auth:{token:'synthetic',cookie:'synthetic'},
+      fetchImpl:async()=>responses.shift(),solvePow:async()=>7,sleep:async()=>{},
+      onStage:callbacks.onStage,onError:callbacks.onError,
+    });
+  }catch(error){finalError=error;}
+  callbacks.request.response({outcome:'upstream_error'});
+  assert.equal(finalError.message,'DeepSeek Web HTTP 500');
+  const errors=diagnosticRecords(lines).filter(record=>record.event==='upstream_error');
+  assert.deepEqual(errors.map(record=>record.attempt),[1,2,3]);
+  assert.deepEqual(errors.map(record=>record.max_attempts),[3,3,3]);
+  assert.ok(errors.every(record=>record.request_ref==='33445566778899aa'));
+  assert.ok(errors.every(record=>record.stage==='completion_start'&&record.status===500&&record.retryable===true));
+  assert.doesNotMatch(lines.join('\n'),/UPSTREAM_BODY_SECRET|synthetic|PROMPT_MUST_NOT_LEAK|SESSION_MUST_NOT_LEAK|https?:|[A-Z]:\\/);
 });
 
 test('Claude client correlation stays stable while ordinary upstream turns remain stateless',async()=>{
@@ -1579,7 +2172,11 @@ test('Claude client correlation stays stable while ordinary upstream turns remai
   assert.doesNotMatch(calls[1].prompt,/first synthetic task/);
   assert.doesNotMatch(calls[3].prompt,/second synthetic task/);
   const requests=diagnosticRecords(lines).filter(record=>record.event==='tool_request');
+  const responses=diagnosticRecords(lines).filter(record=>record.event==='tool_response');
   assert.equal(requests.length,4);
+  assert.equal(responses.length,4);
+  assert.equal(new Set(requests.map(record=>record.request_ref)).size,4);
+  assert.deepEqual(responses.map(record=>record.request_ref),requests.map(record=>record.request_ref));
   assert.ok(requests.every(record=>record.client_session_source==='claude_header'));
   assert.equal(new Set(requests.map(record=>record.client_session_ref)).size,1);
   assert.equal(requests[0].session_ref,requests[1].session_ref);
@@ -2003,4 +2600,47 @@ test('Claude live probe uses confirmed resume and read-only tool flags',async()=
   const first=buildClaudeArgs({sessionId:session,first:true,prompt:'synthetic'}),next=buildClaudeArgs({sessionId:session,first:false,prompt:'synthetic'});
   assert.ok(first.includes('--print'));assert.ok(first.includes('stream-json'));assert.equal(first[first.indexOf('--tools')+1],'Read,Glob,Grep');assert.equal(first[first.indexOf('--allowedTools')+1],'Read,Glob,Grep');assert.match(first[first.indexOf('--disallowedTools')+1],/Write.*Edit.*Bash/);
   assert.deepEqual(first.slice(first.indexOf('--session-id'),first.indexOf('--session-id')+2),['--session-id',session]);assert.deepEqual(next.slice(next.indexOf('--resume'),next.indexOf('--resume')+2),['--resume',session]);
+});
+
+let claudeToolExposureProbeModule;
+async function claudeToolExposureProbe(){return claudeToolExposureProbeModule??=await import('../scripts/claude_2_1_226_tool_exposure_probe.mjs');}
+
+test('Claude 2.1.226 exposure probe distinguishes verified and previous tool syntax',async()=>{
+  const {argsForProbe}=await claudeToolExposureProbe();
+  const correct=argsForProbe('glob-read','Safe probe prompt.');
+  const previous=argsForProbe('previous','Safe probe prompt.');
+  assert.equal(correct[correct.indexOf('--tools')+1],'Glob,Read');
+  assert.equal(correct[correct.indexOf('--allowedTools')+1],'Glob,Read');
+  assert.deepEqual(previous.slice(previous.indexOf('--tools')+1,previous.indexOf('--tools')+3),['Glob','Read']);
+  assert.deepEqual(previous.slice(previous.indexOf('--allowedTools')+1,previous.indexOf('--allowedTools')+3),['Glob','Read']);
+  assert.ok(previous.includes('--safe-mode'));
+  assert.ok(previous.includes('--bare'));
+});
+
+test('Claude 2.1.226 exposure probes disable inherited customizations and MCP configs',async()=>{
+  const {argsForProbe}=await claudeToolExposureProbe();
+  for(const probe of ['default','glob','read','glob-read','previous']){
+    const args=argsForProbe(probe,'Safe probe prompt.');
+    assert.equal(args.filter(value=>value==='--safe-mode').length,1);
+    assert.equal(args.filter(value=>value==='--strict-mcp-config').length,1);
+    assert.equal(args.includes('--mcp-config'),false);
+  }
+});
+
+test('Claude 2.1.226 exposure records omit request bodies and identifier values',async()=>{
+  const {sanitizeRequest}=await claudeToolExposureProbe();
+  const secret='MUST_NOT_APPEAR_IN_EXPOSURE_RECORD';
+  const record=sanitizeRequest({
+    model:'probe-model',stream:true,prompt:secret,
+    messages:[{role:'user',content:[{type:'tool_result',tool_use_id:secret,content:secret}]}],
+    tools:[{name:'Glob',description:secret,input_schema:{type:'object',properties:{pattern:{type:'string'}}}}],
+  },{'x-claude-code-session-id':secret,authorization:secret,cookie:secret},1);
+  assert.deepEqual(record.tool_names,['Glob']);
+  assert.equal(record.tool_result_count,1);
+  assert.equal(record.claude_session_header_present,true);
+  assert.equal(JSON.stringify(record).includes(secret),false);
+  assert.deepEqual(Object.keys(record),[
+    'request_number','request_kind','tools_field_present','tools_field_type','tool_count',
+    'tool_names','model','stream','tool_result_count','claude_session_header_present',
+  ]);
 });
