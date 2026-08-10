@@ -2344,3 +2344,36 @@ test('Claude live probe uses confirmed resume and read-only tool flags',async()=
   assert.ok(first.includes('--print'));assert.ok(first.includes('stream-json'));assert.equal(first[first.indexOf('--tools')+1],'Read,Glob,Grep');assert.equal(first[first.indexOf('--allowedTools')+1],'Read,Glob,Grep');assert.match(first[first.indexOf('--disallowedTools')+1],/Write.*Edit.*Bash/);
   assert.deepEqual(first.slice(first.indexOf('--session-id'),first.indexOf('--session-id')+2),['--session-id',session]);assert.deepEqual(next.slice(next.indexOf('--resume'),next.indexOf('--resume')+2),['--resume',session]);
 });
+
+let claudeToolExposureProbeModule;
+async function claudeToolExposureProbe(){return claudeToolExposureProbeModule??=await import('../scripts/claude_2_1_226_tool_exposure_probe.mjs');}
+
+test('Claude 2.1.226 exposure probe distinguishes verified and previous tool syntax',async()=>{
+  const {argsForProbe}=await claudeToolExposureProbe();
+  const correct=argsForProbe('glob-read','Safe probe prompt.');
+  const previous=argsForProbe('previous','Safe probe prompt.');
+  assert.equal(correct[correct.indexOf('--tools')+1],'Glob,Read');
+  assert.equal(correct[correct.indexOf('--allowedTools')+1],'Glob,Read');
+  assert.deepEqual(previous.slice(previous.indexOf('--tools')+1,previous.indexOf('--tools')+3),['Glob','Read']);
+  assert.deepEqual(previous.slice(previous.indexOf('--allowedTools')+1,previous.indexOf('--allowedTools')+3),['Glob','Read']);
+  assert.ok(previous.includes('--safe-mode'));
+  assert.ok(previous.includes('--bare'));
+});
+
+test('Claude 2.1.226 exposure records omit request bodies and identifier values',async()=>{
+  const {sanitizeRequest}=await claudeToolExposureProbe();
+  const secret='MUST_NOT_APPEAR_IN_EXPOSURE_RECORD';
+  const record=sanitizeRequest({
+    model:'probe-model',stream:true,prompt:secret,
+    messages:[{role:'user',content:[{type:'tool_result',tool_use_id:secret,content:secret}]}],
+    tools:[{name:'Glob',description:secret,input_schema:{type:'object',properties:{pattern:{type:'string'}}}}],
+  },{'x-claude-code-session-id':secret,authorization:secret,cookie:secret},1);
+  assert.deepEqual(record.tool_names,['Glob']);
+  assert.equal(record.tool_result_count,1);
+  assert.equal(record.claude_session_header_present,true);
+  assert.equal(JSON.stringify(record).includes(secret),false);
+  assert.deepEqual(Object.keys(record),[
+    'request_number','request_kind','tools_field_present','tools_field_type','tool_count',
+    'tool_names','model','stream','tool_result_count','claude_session_header_present',
+  ]);
+});
