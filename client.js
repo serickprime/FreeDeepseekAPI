@@ -53,19 +53,25 @@ function upstreamError(status, retryAfter) {
   return error;
 }
 
+function sanitizedUpstreamError(error, message, upstreamStage) {
+  const causeCode = error?.cause?.code ?? error?.code;
+  const safe = new Error(message);
+  safe.name = typeof error?.name === 'string' ? error.name : 'Error';
+  if (typeof causeCode === 'string' && /^[A-Z0-9_]{1,64}$/.test(causeCode)) safe.causeCode = causeCode;
+  if (Number.isInteger(error?.status)) safe.status = error.status;
+  if (error?.retryable === true) safe.retryable = true;
+  if (Number.isFinite(error?.retryAfterMs)) safe.retryAfterMs = error.retryAfterMs;
+  if (upstreamStage) safe.upstreamStage = upstreamStage;
+  return safe;
+}
+
 async function checked(url, options, timeoutMs, fetchImpl = fetch) {
   let response;
   try {
     response = await fetchImpl(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
   } catch (error) {
-    const causeCode = error?.cause?.code ?? error?.code;
     const timeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
-    const safe = new Error(timeout ? 'Upstream request timed out' : 'fetch failed');
-    safe.name = typeof error?.name === 'string' ? error.name : 'Error';
-    if (typeof causeCode === 'string' && /^[A-Z0-9_]{1,64}$/.test(causeCode)) safe.causeCode = causeCode;
-    if (Number.isInteger(error?.status)) safe.status = error.status;
-    if (error?.retryable === true) safe.retryable = true;
-    if (Number.isFinite(error?.retryAfterMs)) safe.retryAfterMs = error.retryAfterMs;
+    const safe = sanitizedUpstreamError(error, timeout ? 'Upstream request timed out' : 'fetch failed');
     if (timeout) {
       safe.status = 504;
       safe.retryable = true;
@@ -159,7 +165,10 @@ async function parseStream(stream, onDelta) {
   };
 
   for (;;) {
-    const { done, value } = await reader.read();
+    let chunk;
+    try { chunk = await reader.read(); }
+    catch (error) { throw sanitizedUpstreamError(error, 'Upstream stream read failed', 'stream_read'); }
+    const { done, value } = chunk;
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split(/\r?\n/);
@@ -200,7 +209,6 @@ async function completeOnce({ prompt, session, model, onDelta, onStage, timeoutM
   const challenge = (await challengeResponse.json())?.data?.biz_data?.challenge;
   if (!challenge) throw new Error('DeepSeek did not return a PoW challenge. Run npm run doctor.');
   onStage?.('challenge_received');
-  onStage?.('wasm_download_start');
   const answer = await solvePow(challenge, auth.wasmUrl || DEFAULT_WASM_URL, Math.min(timeoutMs, 15_000), onStage);
   const pow = Buffer.from(JSON.stringify({
     algorithm: challenge.algorithm,
@@ -258,13 +266,15 @@ async function complete({
     let currentStage = 'unknown';
     const attemptStage = stage => {
       currentStage = stage;
-      onStage?.(stage, { attempt: attemptNumber, maxAttempts });
+      try { onStage?.(stage, { attempt: attemptNumber, maxAttempts }); } catch {}
     };
     try {
       return await completeOnce({ prompt, session, model, onDelta, onStage: attemptStage, timeoutMs, auth, fetchImpl, solvePow });
     } catch (error) {
       lastError = error;
-      try { onError?.(error, { stage: currentStage, attempt: attemptNumber, maxAttempts }); } catch {}
+      let errorStage = currentStage;
+      try { if (typeof error?.upstreamStage === 'string') errorStage = error.upstreamStage; } catch {}
+      try { onError?.(error, { stage: errorStage, attempt: attemptNumber, maxAttempts }); } catch {}
       if (error.status === 401 || error.status === 403) resetRemoteSession(session);
       if (!error.retryable || attempt === maxRetries) throw error;
       resetRemoteSession(session);

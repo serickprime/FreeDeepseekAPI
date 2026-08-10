@@ -122,6 +122,21 @@ request.
 No probe produced a parallel internal `/v1/messages` request. Probe D produced
 two sequential requests because of its single bounded tool-result cycle.
 
+### Review-fix isolation recheck
+
+The five results above remain historical evidence from the original
+investigation. The tracked helper now adds the documented Claude Code 2.1.226
+flags `--safe-mode` and `--strict-mcp-config` to every probe. Safe mode disables
+user/project customizations and MCP configuration, while strict MCP mode allows
+only explicitly supplied `--mcp-config` entries; the helper supplies none.
+Admin-managed policy remains outside CLI control.
+
+One authorized bounded `glob-read` localhost recheck completed with exit code
+0 and two `/v1/messages` requests. Both requests contained exactly `Glob` and
+`Read`; the second contained the expected tool result. No `context7` or other
+inherited MCP tool was exposed. No DeepSeek or Bridge-to-DeepSeek request was
+made.
+
 ## Verified invocation
 
 The locally verified tool-selection fragment for Claude Code 2.1.226 is:

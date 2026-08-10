@@ -6,7 +6,9 @@
 - Branch: `fix/upstream-network-diagnostics`
 - Base: `origin/main` at `d4c92bb7c644b20c52848117f3523dd30c79036a`
 - Audited feature head: `a090219fec032bd297f42b9998da29a99f5b6e12`
-- Blockers: none
+- Original audit status: superseded by an independent `CHANGES_REQUESTED`
+  review; its five findings are addressed in
+  `UPSTREAM_NETWORK_REVIEW_FIXES.md` and require another independent review.
 
 This review covers the per-request upstream diagnostics implementation, its
 offline tests, the bounded live evidence, and the separate Claude Code 2.1.226
@@ -26,7 +28,9 @@ The production diff is limited to:
 - `lib/tool_diagnostics.js`: implements opt-in structured events, process-local
   correlation, allowlisted fields, and provable error classification;
 - `lib/pow.js`: forwards real WASM download/compile/solve stages and safe
-  network/HTTP metadata.
+  network/HTTP metadata;
+- `lib/security.js`: applies defence-in-depth URL and absolute-path redaction
+  to the existing ordinary error logger.
 
 No production file outside that list changed.
 
@@ -51,7 +55,8 @@ The real stage sequence is:
 
 - `remote_session_start`, `remote_session_created`;
 - `challenge_start`, `challenge_received`;
-- `wasm_download_start`, `wasm_downloaded`;
+- one of `wasm_download_start`, `wasm_wait_shared`, or `wasm_cache_hit`, then
+  the applicable `wasm_downloaded`/compile events;
 - `wasm_compile_start`, `wasm_compiled`;
 - `pow_solve_start`, `pow_solved`;
 - `completion_start`, `completion_completed`;
@@ -59,7 +64,8 @@ The real stage sequence is:
 
 `stream_read` is emitted immediately before `parseStream()` starts calling
 `reader.read()`. A reader failure is therefore reported at `stream_read`, not
-at mere HTTP-response receipt.
+at mere HTTP-response receipt. Its original message is replaced by a safe
+summary before it can reach the ordinary logger.
 
 ## Error classification and logging safety
 
@@ -67,7 +73,9 @@ The structured classifier permits only `dns`, `connect`, `tls`, `timeout`,
 `http`, `stream`, `pow`, and `unknown`. It maps `ENOTFOUND` and `EAI_AGAIN` to
 DNS; `ECONNREFUSED` and `ECONNRESET` to connect; `ETIMEDOUT`, `TimeoutError`,
 and `AbortError` to timeout; an allowlist of TLS codes to TLS; valid upstream
-HTTP status to HTTP; and active reader failures to stream. WASM/PoW stages are
+HTTP status to HTTP; and active reader failures to stream. The independent
+`timeout` flag remains true for a proven stream `AbortError`, `TimeoutError`, or
+`ETIMEDOUT` even though its primary category is `stream`. WASM/PoW stages are
 classified as `pow` only when no more specific code or status proves another
 category. Everything else remains `unknown`.
 
@@ -78,10 +86,12 @@ session IDs, call IDs, or local paths. Error names, cause codes, status values,
 attempt counters, and stages are validated and bounded before logging.
 
 The ordinary `[deepseek-bridge] request error: ...` logger remains. Fetch
-exceptions are converted to `fetch failed` or `Upstream request timed out`,
-with only a syntactically safe cause code retained. Non-success upstream HTTP
-bodies are discarded and are no longer appended to `error.message`. The API
-continues to return its existing generalized upstream failure contract.
+exceptions are converted to `fetch failed` or `Upstream request timed out`, and
+stream-reader errors to `Upstream stream read failed`, with only a
+syntactically safe cause code retained. Non-success upstream HTTP bodies are
+discarded and are no longer appended to `error.message`. The ordinary logger
+also redacts known URL and absolute-path forms. The API continues to return its
+existing generalized upstream failure contract.
 
 ## Retry invariants
 
@@ -114,9 +124,11 @@ defect and does not inherit an earlier allowlist.
 
 The DeepSeek WASM URL, cache key and eviction behavior, challenge fields,
 WebAssembly imports, memory operations, solve call, numeric validation, and
-returned answer calculation are unchanged. The only additions are stage
-callbacks and safe network/HTTP metadata propagation. No alternative URL,
-algorithm change, or new cache was added.
+returned answer calculation are unchanged. A shared module promise now
+broadcasts factual phases to transient request-local observers instead of
+capturing the first callback. Cold owners, concurrent waiters and warm hits are
+distinguished without another fetch/compile. No alternative URL, algorithm
+change, or new cache was added.
 
 ## Tests and probe review
 
@@ -133,7 +145,9 @@ The unit suite covers:
 All network-error tests use injected mock fetch/streams and make no external
 request. The tool-exposure helper listens only on an ephemeral `127.0.0.1`
 port, caps message requests at eight, has a 60-second process timeout, records
-only safe structural fields, and neither reads nor modifies user settings. It
+only safe structural fields, and invokes Claude Code with `--safe-mode` and
+`--strict-mcp-config` so user/project customizations and inherited MCP servers
+are disabled. Admin-managed policy remains outside CLI control. It
 is not wired into normal Bridge startup or the npm test command as an executing
 CLI probe; unit tests import only its pure helpers.
 
@@ -175,12 +189,13 @@ basis for a new network retry or fallback.
 
 - Syntax checks: passed for all changed JavaScript files and the unit suite.
 - `git diff --check origin/main...HEAD`: passed.
-- `npm.cmd test`: 144/144 passed.
+- `npm.cmd test`: 155/155 passed after the review fixes.
 - `git merge-tree` against current `origin/main`: no conflicts.
 - Secret/personal-path scan of the branch diff: no sensitive value found.
 - Unexpected tracked files: none.
 
 Known limitations are that the historical network failure was not reproduced,
-Claude Code behavior is version- and invocation-specific, and diagnostics must
-be enabled before an incident to provide correlation. No blocker remains for a
-review-only pull request. Merge and auto-merge are outside this review.
+Claude Code behavior is version- and invocation-specific, admin-managed Claude
+policy cannot be disabled by CLI flags, and diagnostics must be enabled before
+an incident to provide correlation. The updated branch requires another
+independent review. Merge and auto-merge remain outside this work.

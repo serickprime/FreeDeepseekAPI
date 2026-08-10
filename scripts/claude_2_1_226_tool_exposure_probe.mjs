@@ -217,7 +217,8 @@ function childEnvironment(origin) {
 
 function commonArgs() {
   return [
-    '--print', '--output-format', 'text', '--no-session-persistence',
+    '--print', '--safe-mode', '--strict-mcp-config',
+    '--output-format', 'text', '--no-session-persistence',
     '--no-chrome', '--disable-slash-commands', '--model', 'sonnet',
   ];
 }
@@ -228,7 +229,7 @@ export function argsForProbe(probe, prompt) {
   if (probe === 'read') args.push('--tools', 'Read', '--allowedTools', 'Read', '--permission-mode', 'dontAsk');
   if (probe === 'glob-read') args.push('--tools', 'Glob,Read', '--allowedTools', 'Glob,Read', '--permission-mode', 'dontAsk');
   if (probe === 'previous') {
-    args.splice(1, 0, '--safe-mode', '--bare');
+    args.splice(1, 0, '--bare');
     args.push(
       '--tools', 'Glob', 'Read', '--allowedTools', 'Glob', 'Read',
       '--disallowedTools', 'Edit,Write,Bash,NotebookEdit,WebFetch,WebSearch',

@@ -36,7 +36,9 @@ Tool parser, tool continuation, client/upstream session routing и retry policy 
 2. `remote_session_created`;
 3. `challenge_start`;
 4. `challenge_received`;
-5. `wasm_download_start`;
+5. `wasm_download_start` для владельца холодной загрузки, либо
+   `wasm_wait_shared` для конкурентного ожидающего запроса, либо
+   `wasm_cache_hit` для готового cache hit;
 6. `wasm_downloaded`;
 7. `wasm_compile_start`;
 8. `wasm_compiled`;
@@ -97,17 +99,17 @@ Node.js fetch часто возвращает верхнеуровневый `Ty
 
 ## Streaming response
 
-После успешного HTTP completion Bridge фиксирует `completion_completed`, `stream_received`, затем `stream_read`. Если `ReadableStreamDefaultReader.read()` отклоняется, ошибка записывается со stage `stream_read` и category `stream`. Безопасный `cause_code` может сохраниться для анализа, но не меняет категорию и retry policy.
+После успешного HTTP completion Bridge фиксирует `completion_completed`, `stream_received`, затем `stream_read`. Если `ReadableStreamDefaultReader.read()` отклоняется, исходное сообщение заменяется безопасным `Upstream stream read failed`, а ошибка записывается со stage `stream_read` и category `stream`. Безопасный `cause_code` может сохраниться для анализа, но не меняет категорию и retry policy. Независимый признак `timeout` остаётся `true` для `AbortError`, `TimeoutError` и `ETIMEDOUT`, даже когда основной category остаётся `stream`.
 
 ## WASM и PoW
 
-`lib/pow.js` по-прежнему использует глобальный `fetch`, прежний URL, прежний cache и тот же PoW-алгоритм. Архитектура загрузчика не переписана.
+`lib/pow.js` по-прежнему использует глобальный `fetch`, прежний URL, прежний cache и тот же PoW-алгоритм. Shared cache entry хранит один module promise и общую фактическую фазу, а request-specific callbacks подписываются только на время ожидания. Холодный owner, concurrent waiter и warm cache hit поэтому получают разные честные стадии; shared failure передаёт обоим запросам одну фактическую WASM-фазу без общего `request_ref`.
 
 Минимально добавлена передача безопасного `cause_code` для network failure и отдельного `upstreamStatus` для HTTP-ответа WASM. Это поле используется только диагностическим classifier и не меняет HTTP contract Bridge или retryable-правила. Неизвестная ошибка compile/solve классифицируется как `pow`; доказанный DNS/connect/TLS/timeout/HTTP сохраняет более точную категорию.
 
 ## Обычный logger
 
-Строка `[deepseek-bridge] request error: ...` сохранена. `checked()` больше не читает и не включает произвольное upstream response body в `error.message`. Fetch exceptions преобразуются в безопасное `fetch failed` или `Upstream request timed out`, при этом отдельно сохраняются только безопасные status/retry metadata и `cause_code`.
+Строка `[deepseek-bridge] request error: ...` сохранена. `checked()` больше не читает и не включает произвольное upstream response body в `error.message`. Fetch exceptions преобразуются в безопасное `fetch failed` или `Upstream request timed out`, а stream-reader exceptions — в `Upstream stream read failed`; отдельно сохраняются только безопасные status/retry metadata и `cause_code`. Defence-in-depth logger удаляет HTTP/file URL, Windows/UNC и Unix-like абсолютные пути.
 
 Клиентский API error contract не менялся: streaming и обычные ответы по-прежнему получают существующие обобщённые сообщения без внутренней диагностики.
 

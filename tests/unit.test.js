@@ -19,6 +19,23 @@ test('safe error logging never throws for unusual errors or logger failures',()=
   assert.doesNotThrow(()=>logSafeError(unusual,()=>{throw new Error('logger failed');}));
   assert.equal(safeError(unusual),'Internal error');
 });
+test('safe error logging redacts network URLs and local absolute paths',()=>{
+  const unsafe=[
+    'failed at https://secret.example/path?token=URL_MARKER',
+    'failed at file:///C:/Users/Sensitive/FILE_MARKER.txt',
+    'failed at C:\\Users\\Sensitive\\WINDOWS_MARKER.txt',
+    'failed at \\\\private-server\\share\\UNC_MARKER.txt',
+    'failed at /home/sensitive/UNIX_MARKER.txt',
+    'failed at /workspace/private/WORKSPACE_MARKER.txt',
+  ];
+  for(const value of unsafe){
+    const message=safeError(new Error(value));
+    assert.doesNotMatch(message,/secret\.example|URL_MARKER|FILE_MARKER|WINDOWS_MARKER|UNC_MARKER|UNIX_MARKER|WORKSPACE_MARKER|https?:\/\/|file:\/\/|[A-Z]:\\|\\\\private-server|\/home\/sensitive|\/workspace\/private/);
+  }
+  assert.equal(safeError(new Error('fetch failed')),'fetch failed');
+  assert.equal(safeError(new Error('Upstream request timed out')),'Upstream request timed out');
+  assert.equal(safeError(new Error('DeepSeek Web HTTP 429')),'DeepSeek Web HTTP 429');
+});
 test('setup auth status accepts only non-empty string credentials',t=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'deepseek-bridge-auth-status-'));
   const authPath=path.join(root,'deepseek-auth.json');
@@ -565,6 +582,101 @@ test('PoW WASM loader forwards safe network code and HTTP status metadata',async
   assert.doesNotMatch(httpError.message,/UPSTREAM_WASM_BODY_SECRET|https?:|private/);
 });
 
+function syntheticPowInstance(answer=42){
+  const memory=new WebAssembly.Memory({initial:1});
+  let allocation=64;
+  return {exports:{
+    memory,
+    __wbindgen_export_0(length){const pointer=allocation;allocation+=length;return pointer;},
+    __wbindgen_add_to_stack_pointer(){return 0;},
+    wasm_solve(){const view=new DataView(memory.buffer);view.setInt32(0,1,true);view.setFloat64(8,answer,true);},
+  }};
+}
+
+test('production PoW cache keeps cold owner, concurrent waiter and warm hit stages request-local',async t=>{
+  const originalFetch=global.fetch;
+  const originalCompile=WebAssembly.compile;
+  const originalInstantiate=WebAssembly.instantiate;
+  t.after(()=>{global.fetch=originalFetch;WebAssembly.compile=originalCompile;WebAssembly.instantiate=originalInstantiate;});
+  let fetches=0,compiles=0,releaseCompile,compileStarted;
+  const compileGate=new Promise(resolve=>{releaseCompile=resolve;});
+  const compileReady=new Promise(resolve=>{compileStarted=resolve;});
+  global.fetch=async()=>{fetches+=1;return new Response(new Uint8Array([0,97,115,109]),{status:200});};
+  WebAssembly.compile=async()=>{compiles+=1;compileStarted();await compileGate;return {synthetic:true};};
+  WebAssembly.instantiate=async()=>syntheticPowInstance();
+  const challenge={challenge:'c',salt:'s',expire_at:1,difficulty:1};
+  const ownerStages=[],waiterStages=[],warmStages=[];
+  const owner=solvePOW(challenge,'https://pow-cache-success.test/module.wasm',1000,stage=>ownerStages.push(stage));
+  await compileReady;
+  const waiter=solvePOW(challenge,'https://pow-cache-success.test/module.wasm',1000,stage=>waiterStages.push(stage));
+  releaseCompile();
+  assert.deepEqual(await Promise.all([owner,waiter]),[42,42]);
+  assert.equal(await solvePOW(challenge,'https://pow-cache-success.test/module.wasm',1000,stage=>warmStages.push(stage)),42);
+  assert.equal(fetches,1);
+  assert.equal(compiles,1);
+  assert.deepEqual(ownerStages,[
+    'wasm_download_start','wasm_downloaded','wasm_compile_start','wasm_compiled','pow_solve_start','pow_solved',
+  ]);
+  assert.deepEqual(waiterStages,['wasm_wait_shared','wasm_compiled','pow_solve_start','pow_solved']);
+  assert.deepEqual(warmStages,['wasm_cache_hit','pow_solve_start','pow_solved']);
+});
+
+test('production PoW shared download failure keeps request callbacks and failure stage separate',async t=>{
+  const originalFetch=global.fetch;
+  t.after(()=>{global.fetch=originalFetch;});
+  let fetches=0,rejectFetch,fetchStarted;
+  const started=new Promise(resolve=>{fetchStarted=resolve;});
+  global.fetch=()=>{fetches+=1;fetchStarted();return new Promise((resolve,reject)=>{rejectFetch=reject;});};
+  const challenge={challenge:'c',salt:'s',expire_at:1,difficulty:1};
+  const ownerStages=[],waiterStages=[];
+  const owner=solvePOW(challenge,'https://pow-cache-download-failure.test/module.wasm',1000,stage=>ownerStages.push(stage));
+  await started;
+  const waiter=solvePOW(challenge,'https://pow-cache-download-failure.test/module.wasm',1000,stage=>waiterStages.push(stage));
+  rejectFetch(fetchFailure('TypeError','ENOTFOUND'));
+  const results=await Promise.allSettled([owner,waiter]);
+  assert.equal(fetches,1);
+  assert.deepEqual(ownerStages,['wasm_download_start']);
+  assert.deepEqual(waiterStages,['wasm_wait_shared']);
+  assert.ok(results.every(result=>result.status==='rejected'));
+  assert.ok(results.every(result=>result.reason.causeCode==='ENOTFOUND'));
+  assert.ok(results.every(result=>result.reason.upstreamStage==='wasm_download_start'));
+});
+
+test('production PoW shared compile failure reports the compile phase to every waiter',async t=>{
+  const originalFetch=global.fetch;
+  const originalCompile=WebAssembly.compile;
+  t.after(()=>{global.fetch=originalFetch;WebAssembly.compile=originalCompile;});
+  let fetches=0,compiles=0,rejectCompile,compileStarted;
+  const started=new Promise(resolve=>{compileStarted=resolve;});
+  global.fetch=async()=>{fetches+=1;return new Response(new Uint8Array([0,97,115,109]),{status:200});};
+  WebAssembly.compile=()=>{compiles+=1;compileStarted();return new Promise((resolve,reject)=>{rejectCompile=reject;});};
+  const challenge={challenge:'c',salt:'s',expire_at:1,difficulty:1};
+  const ownerStages=[],waiterStages=[];
+  const owner=solvePOW(challenge,'https://pow-cache-compile-failure.test/module.wasm',1000,stage=>ownerStages.push(stage));
+  await started;
+  const waiter=solvePOW(challenge,'https://pow-cache-compile-failure.test/module.wasm',1000,stage=>waiterStages.push(stage));
+  rejectCompile(new WebAssembly.CompileError('synthetic compile failure'));
+  const results=await Promise.allSettled([owner,waiter]);
+  assert.equal(fetches,1);
+  assert.equal(compiles,1);
+  assert.deepEqual(ownerStages,['wasm_download_start','wasm_downloaded','wasm_compile_start']);
+  assert.deepEqual(waiterStages,['wasm_wait_shared']);
+  assert.ok(results.every(result=>result.status==='rejected'));
+  assert.ok(results.every(result=>result.reason.upstreamStage==='wasm_compile_start'));
+});
+
+test('production PoW stage callback failures remain observational',async t=>{
+  const originalFetch=global.fetch;
+  const originalCompile=WebAssembly.compile;
+  const originalInstantiate=WebAssembly.instantiate;
+  t.after(()=>{global.fetch=originalFetch;WebAssembly.compile=originalCompile;WebAssembly.instantiate=originalInstantiate;});
+  global.fetch=async()=>new Response(new Uint8Array([0,97,115,109]),{status:200});
+  WebAssembly.compile=async()=>({synthetic:true});
+  WebAssembly.instantiate=async()=>syntheticPowInstance(7);
+  const challenge={challenge:'c',salt:'s',expire_at:1,difficulty:1};
+  assert.equal(await solvePOW(challenge,'https://pow-callback-safety.test/module.wasm',1000,()=>{throw new Error('diagnostic callback failed');}),7);
+});
+
 function doctorAuth(){return JSON.stringify({token:'test-token',cookie:'test-cookie',wasmUrl:'https://example.test/pow.wasm'});}
 function doctorChallenge(){return {data:{biz_data:{challenge:{challenge:'c',salt:'s',expire_at:1,difficulty:1,algorithm:'a',signature:'sig'}}}};}
 function doctorFetch(marker,{reachabilityStatus=200,sessionStatus=200,challengeStatus=200,completionStatus=200,completionText}={}){
@@ -578,6 +690,7 @@ function doctorFetch(marker,{reachabilityStatus=200,sessionStatus=200,challengeS
 }
 function doctorPow({failureStage}={}){
   return async(challenge,url,timeout,onStage)=>{
+    onStage('wasm_download_start');
     if(failureStage==='download')throw new Error('WASM download failed token=secret');
     onStage('wasm_downloaded');
     onStage('wasm_compile_start');
@@ -1701,6 +1814,99 @@ test('fetch failed diagnostics and ordinary logger expose no request or network 
   assert.doesNotMatch(journal,/https?:\/\/|[A-Z]:\\/);
 });
 
+test('production server sanitizes stream reader errors before diagnostics, logger and API response',async()=>{
+  const lines=[];
+  const urlMarker='STREAM_URL_SECRET_MARKER';
+  const pathMarker='STREAM_PATH_SECRET_MARKER';
+  const rawMessage=`reader failed https://secret.example/path?token=${urlMarker} C:\\Users\\Sensitive\\${pathMarker}.txt`;
+  const streamError=fetchFailure('TypeError','ECONNRESET',rawMessage);
+  const stream=new ReadableStream({start(controller){controller.error(streamError);}});
+  const responses=[upstreamSessionResponse('stream-logger-session'),upstreamChallengeResponse(),new Response(stream,{status:200})];
+  const completeImpl=options=>complete({
+    ...options,auth:{token:'synthetic-token',cookie:'synthetic-cookie'},
+    fetchImpl:async()=>responses.shift(),solvePow:async()=>7,maxRetries:0,
+  });
+  const server=createDiagnosticsEnabledServer({logger:line=>lines.push(line),completeImpl});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  let responseText;
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/messages`,{
+      method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content:'offline stream logger test'}]}),
+    });
+    responseText=await response.text();
+    assert.equal(response.status,502);
+    assert.match(responseText,/DeepSeek request failed/);
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+  const journal=lines.join('\n');
+  for(const secret of [urlMarker,pathMarker,'secret.example','C:\\Users\\Sensitive']){
+    assert.equal(journal.includes(secret),false,secret);
+    assert.equal(responseText.includes(secret),false,secret);
+  }
+  assert.match(journal,/\[deepseek-bridge\] request error: Upstream stream read failed/);
+  const error=diagnosticRecords(lines).find(record=>record.event==='upstream_error');
+  assert.deepEqual({...error,request_ref:'ref'}, {
+    event:'upstream_error',request_ref:'ref',stage:'stream_read',error_name:'TypeError',error_category:'stream',
+    status:null,cause_code:'ECONNRESET',retryable:false,timeout:false,attempt:1,max_attempts:1,
+  });
+});
+
+test('parallel HTTP requests retain distinct request_ref on one shared WASM failure',async t=>{
+  const localFetch=global.fetch;
+  let rejectWasm,sessionSequence=0,wasmFetches=0;
+  const wasmFailure=()=>fetchFailure('TypeError','ENOTFOUND');
+  global.fetch=()=>{wasmFetches+=1;return new Promise((resolve,reject)=>{rejectWasm=reject;});};
+  t.after(()=>{global.fetch=localFetch;});
+  const lines=[];
+  const upstreamFetch=async url=>{
+    if(String(url).includes('chat_session/create'))return upstreamSessionResponse(`parallel-wasm-${++sessionSequence}`);
+    if(String(url).includes('create_pow_challenge')){
+      return upstreamChallengeResponse();
+    }
+    throw new Error('unexpected completion request');
+  };
+  const completeImpl=options=>complete({
+    ...options,auth:{token:'synthetic-token',cookie:'synthetic-cookie',wasmUrl:'https://parallel-wasm-failure.test/module.wasm'},
+    fetchImpl:upstreamFetch,maxRetries:0,
+  });
+  const server=createDiagnosticsEnabledServer({logger:line=>{
+    lines.push(line);
+    try{
+      const record=JSON.parse(line);
+      if(record.event==='upstream_stage'&&record.stage==='wasm_wait_shared')queueMicrotask(()=>rejectWasm(wasmFailure()));
+    }catch{}
+  },completeImpl});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const post=content=>localFetch(`http://127.0.0.1:${server.address().port}/v1/messages`,{
+      method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({model:'deepseek-chat',messages:[{role:'user',content}]}),
+    });
+    const responses=await Promise.all([post('parallel wasm one'),post('parallel wasm two')]);
+    assert.deepEqual(responses.map(response=>response.status),[502,502]);
+    await Promise.all(responses.map(response=>response.text()));
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+  assert.equal(wasmFetches,1);
+  const records=diagnosticRecords(lines);
+  const requests=records.filter(record=>record.event==='tool_request');
+  const errors=records.filter(record=>record.event==='upstream_error');
+  assert.equal(requests.length,2);
+  assert.equal(errors.length,2);
+  assert.equal(new Set(requests.map(record=>record.request_ref)).size,2);
+  assert.deepEqual(new Set(errors.map(record=>record.request_ref)),new Set(requests.map(record=>record.request_ref)));
+  assert.ok(errors.every(record=>record.stage==='wasm_download_start'));
+  assert.ok(errors.every(record=>record.error_category==='dns'&&record.cause_code==='ENOTFOUND'));
+  const requestStages=requests.map(request=>records.filter(record=>record.request_ref===request.request_ref&&record.event==='upstream_stage').map(record=>record.stage));
+  assert.equal(requestStages.filter(stages=>stages.includes('wasm_download_start')).length,1);
+  assert.equal(requestStages.filter(stages=>stages.includes('wasm_wait_shared')).length,1);
+});
+
 test('tool diagnostics are bounded and never break requests when logging fails',()=>{
   const lines=[];
   const diagnostics=createToolDiagnostics({enabled:true,logger:line=>lines.push(line)});
@@ -1709,8 +1915,7 @@ test('tool diagnostics are bounded and never break requests when logging fails',
   response.response({outcome:'final_text',contentNonempty:true});
   const records=diagnosticRecords(lines);
   assert.equal(records[0].tool_names.length,MAX_TOOL_NAMES);
-  assert.ok(records[0].tool_names[0].length<=MAX_TOOL_NAME_CHARS);
-  assert.doesNotMatch(records[0].tool_names[0],/[\r\n]/);
+  assert.equal(records[0].tool_names[0],'invalid');
   assert.equal(records[0].tool_names[1],'invalid');
   assert.equal(records[0].client_session_source,'unavailable');
   assert.equal(records[0].client_session_ref,null);
@@ -1721,6 +1926,31 @@ test('tool diagnostics are bounded and never break requests when logging fails',
   assert.equal(diagnosticRecords(wrongLines)[0].raw_tool_count,0);
   const failing=createToolDiagnostics({enabled:true,logger:()=>{throw new Error('logger failed');}});
   assert.doesNotThrow(()=>failing.request({protocol:'anthropic',route:'/v1/messages',body:{model:'deepseek-chat',tools:[]},upstreamSource:'anonymous',upstreamKey:'private',clientSessionSource:'unavailable',clientSessionKey:null}));
+});
+
+test('tool diagnostics accept only safe identifier-shaped tool names',()=>{
+  const marker='PRINTABLE_TOOL_SECRET_MARKER';
+  const lines=[];
+  const diagnostics=createToolDiagnostics({enabled:true,logger:line=>lines.push(line),randomBytes:()=>Buffer.alloc(8,4)});
+  diagnostics.request({
+    protocol:'anthropic',route:'/v1/messages',body:{model:'deepseek-chat',tools:[
+      {name:'Read'},{name:'Glob'},{name:'ListMcpResourcesTool'},
+      {name:'mcp__context7__resolve-library-id'},
+      {name:`https://secret.example/${marker}`},
+      {name:`C:\\Users\\X\\${marker}`},
+      {name:`Bearer ${marker}`},
+      {name:`tool ${marker}`},
+      {name:`tool\n${marker}`},
+    ]},
+    upstreamSource:'anonymous',upstreamKey:'private',clientSessionSource:'unavailable',clientSessionKey:null,
+  });
+  const record=diagnosticRecords(lines)[0];
+  assert.deepEqual(record.tool_names,[
+    'Read','Glob','ListMcpResourcesTool','mcp__context7__resolve-library-id',
+    'invalid','invalid','invalid','invalid','invalid',
+  ]);
+  assert.equal(JSON.stringify(record).includes(marker),false);
+  assert.equal(JSON.stringify(record).includes('secret.example'),false);
 });
 
 function upstreamSessionResponse(id){return new Response(JSON.stringify({data:{biz_data:{id}}}),{status:200});}
@@ -1744,6 +1974,7 @@ function requestDiagnostics(lines,requestRef='0011223344556677'){
   };
 }
 function powStages(challenge,url,timeout,onStage){
+  onStage('wasm_download_start');
   onStage('wasm_downloaded');
   onStage('wasm_compile_start');
   onStage('wasm_compiled');
@@ -1776,6 +2007,17 @@ test('upstream_stage follows the real session, PoW, completion and stream path',
   assert.ok(stages.every(record=>Object.keys(record).sort().join(',')==='event,request_ref,stage'));
 });
 
+test('throwing upstream stage callbacks cannot change a successful completion',async()=>{
+  const responses=[upstreamSessionResponse('callback-session'),upstreamChallengeResponse(),upstreamStreamResponse('callback safe')];
+  const result=await complete({
+    prompt:'offline',session:{id:null,parentMessageId:null,history:[]},
+    model:{model_type:'default',reasoning:false,search:false},auth:{token:'synthetic',cookie:'synthetic'},
+    fetchImpl:async()=>responses.shift(),solvePow:powStages,maxRetries:0,
+    onStage:()=>{throw new Error('diagnostic stage callback failed');},
+  });
+  assert.equal(result.content,'callback safe');
+});
+
 test('stream reader failures remain stream errors even with a network cause code',async()=>{
   const lines=[];
   const callbacks=requestDiagnostics(lines,'1122334455667788');
@@ -1793,6 +2035,21 @@ test('stream reader failures remain stream errors even with a network cause code
     event:'upstream_error',request_ref:'1122334455667788',stage:'stream_read',error_name:'TypeError',
     error_category:'stream',status:null,cause_code:'ECONNRESET',retryable:false,timeout:false,attempt:1,max_attempts:3,
   });
+});
+
+test('stream timeout evidence is independent from the primary stream category',()=>{
+  const cases=[
+    {error:fetchFailure('AbortError'),timeout:true,cause:null},
+    {error:fetchFailure('TimeoutError'),timeout:true,cause:null},
+    {error:fetchFailure('TypeError','ETIMEDOUT'),timeout:true,cause:'ETIMEDOUT'},
+    {error:fetchFailure('TypeError','ECONNRESET'),timeout:false,cause:'ECONNRESET'},
+  ];
+  for(const item of cases){
+    const result=classifyUpstreamError(item.error,'stream_read');
+    assert.equal(result.error_category,'stream');
+    assert.equal(result.timeout,item.timeout);
+    assert.equal(result.cause_code,item.cause);
+  }
 });
 
 test('existing retry can recover under one request_ref without policy changes',async()=>{
@@ -2358,6 +2615,16 @@ test('Claude 2.1.226 exposure probe distinguishes verified and previous tool syn
   assert.deepEqual(previous.slice(previous.indexOf('--allowedTools')+1,previous.indexOf('--allowedTools')+3),['Glob','Read']);
   assert.ok(previous.includes('--safe-mode'));
   assert.ok(previous.includes('--bare'));
+});
+
+test('Claude 2.1.226 exposure probes disable inherited customizations and MCP configs',async()=>{
+  const {argsForProbe}=await claudeToolExposureProbe();
+  for(const probe of ['default','glob','read','glob-read','previous']){
+    const args=argsForProbe(probe,'Safe probe prompt.');
+    assert.equal(args.filter(value=>value==='--safe-mode').length,1);
+    assert.equal(args.filter(value=>value==='--strict-mcp-config').length,1);
+    assert.equal(args.includes('--mcp-config'),false);
+  }
 });
 
 test('Claude 2.1.226 exposure records omit request bodies and identifier values',async()=>{
