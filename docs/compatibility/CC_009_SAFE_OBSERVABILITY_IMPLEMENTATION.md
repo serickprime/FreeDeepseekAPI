@@ -31,8 +31,11 @@ The field never contains tool arguments.
 `tool_result_error_count` is emitted on `tool_request`, beside
 `tool_result_count` and `is_tool_continuation`:
 
-- for Anthropic Messages, it counts only `tool_result` blocks whose
-  `is_error` property is exactly the boolean `true`;
+- for Anthropic Messages, it counts only current call-ID-linked continuation
+  results whose `is_error` property is exactly the boolean `true`;
+- historical `tool_result` blocks retained in a full Claude transcript are
+  excluded by the same known-call filtering that defines
+  `tool_result_count`;
 - strings, numbers, result text, stderr-like text, and error-like words do not
   affect the count;
 - OpenAI Chat Completions and Responses emit `0`, because the current
@@ -65,7 +68,8 @@ response, tool execution, or continuation.
 
 Focused tests cover accepted, absent, and unsafe selected names; zero, one,
 and multiple Anthropic error results; strict boolean-only counting; result
-text isolation; OpenAI and Responses zero behavior; diagnostics disabled;
+text isolation; exclusion of a historical errored result from a later
+continuation; OpenAI and Responses zero behavior; diagnostics disabled;
 throwing logger behavior; and an end-to-end Anthropic errored continuation.
 
 The separately authorized bounded live validation remains to be recorded in

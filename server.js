@@ -344,6 +344,9 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         clientSessionKey: resolution.clientKey,
         isToolContinuation,
         toolResultCount: toolResults.length,
+        toolResultErrorCount: kind === 'anthropic'
+          ? toolResults.filter(result => result.isError === true).length
+          : 0,
         requestRef,
       });
       const onUpstreamStage = (stage, metadata = {}) => {
