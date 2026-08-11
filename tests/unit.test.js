@@ -1,7 +1,7 @@
 'use strict';
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,clientSessionKey,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,inspectToolCall,inspectToolCallFromOutput,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { checked, complete, loadAuth, parseRetryAfter, parseStream }=client; const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
-const {TOOL_RETRY_FAILURE_MESSAGE,createFencedToolRetryPrompt,createToolRetryPrompt,hideRetryReasoning,shouldRetryFencedToolResponse,shouldRetryPrefixedToolResponse,shouldRetryToolResponse}=require('../lib/tool_retry');
+const {TOOL_RETRY_FAILURE_MESSAGE,createFencedToolRetryPrompt,createToolRetryPrompt,hideRetryReasoning,shouldRetryBraceDelimitedToolLikeResponse,shouldRetryFencedToolResponse,shouldRetryPrefixedToolResponse,shouldRetryToolResponse}=require('../lib/tool_retry');
 const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
 const {MAX_TOOL_NAMES,MAX_TOOL_NAME_CHARS,classifyUpstreamError,createToolDiagnostics}=require('../lib/tool_diagnostics');
 const {solvePOW}=require('../lib/pow');
@@ -330,6 +330,7 @@ test('count_tokens body validation requires the confirmed Anthropic contract',()
 const jsonToolCall=(name='read_file',args={path:'package.json'})=>JSON.stringify({tool_call:{name,arguments:args}});
 const fencedToolCall=(name='read_file',args={path:'package.json'})=>`\`\`\`json\n${jsonToolCall(name,args)}\n\`\`\``;
 const prefixedToolCall=(prefix='Tool request:',name='read_file',args={path:'package.json'})=>`${prefix}\n${jsonToolCall(name,args)}`;
+const braceMalformedToolCall=(name='read_file')=>`{"tool_call":{"name":"${name}" "arguments":{}}}`;
 const xmlToolCall=(name='read_file',args={path:'package.json'})=>`<tool_call>${JSON.stringify({name,arguments:args})}</tool_call>`;
 
 test('strict JSON and XML tool calls are accepted only as the whole content',()=>{
@@ -577,6 +578,53 @@ test('prefixed tool retry predicate accepts only the proven non-fenced structura
     {...base,inspection:{...inspection,metadata:{...inspection.metadata,content_contains_tool_call_marker:false}}},
   ];
   for(const item of negatives)assert.equal(shouldRetryPrefixedToolResponse(item),false);
+});
+test('brace-delimited retry predicate accepts only the proven malformed content shape',()=>{
+  const allowed=['Glob'];
+  const malformed=braceMalformedToolCall('Glob');
+  const inspection=inspectToolCallFromOutput({content:malformed,reasoning:'ordinary reasoning'},allowed);
+  const base={hasTools:true,toolCall:null,retryCount:0,inspection};
+  assert.equal(inspection.source,'content');
+  assert.equal(inspection.reason,'invalid_json');
+  assert.equal(inspection.toolCall,null);
+  assert.equal(inspection.metadata.content_starts_with_code_fence,false);
+  assert.equal(inspection.metadata.content_starts_with_brace,true);
+  assert.equal(inspection.metadata.content_ends_with_brace,true);
+  assert.equal(inspection.metadata.content_contains_tool_call_marker,true);
+  assert.equal(shouldRetryBraceDelimitedToolLikeResponse(base),true);
+
+  const negatives=[
+    ['budget used',{...base,retryCount:1}],
+    ['no tools',{...base,hasTools:false}],
+    ['accepted call',{...base,toolCall:{function:{name:'Glob',arguments:'{}'}}}],
+    ['reasoning source',{...base,inspection:{...inspection,source:'reasoning'}}],
+    ['no source',{...base,inspection:{...inspection,source:'none'}}],
+    ['invalid envelope',{...base,inspection:{...inspection,reason:'invalid_envelope'}}],
+    ['invalid tool shape',{...base,inspection:{...inspection,reason:'invalid_tool_shape'}}],
+    ['code fence',{...base,inspection:{...inspection,metadata:{...inspection.metadata,content_starts_with_code_fence:true}}}],
+    ['not brace-starting',{...base,inspection:{...inspection,metadata:{...inspection.metadata,content_starts_with_brace:false}}}],
+    ['not brace-ending',{...base,inspection:{...inspection,metadata:{...inspection.metadata,content_ends_with_brace:false}}}],
+    ['no marker',{...base,inspection:{...inspection,metadata:{...inspection.metadata,content_contains_tool_call_marker:false}}}],
+  ];
+  for(const [label,item] of negatives)assert.equal(shouldRetryBraceDelimitedToolLikeResponse(item),false,label);
+
+  const nonmatching=[
+    'ordinary final text',
+    'The model could return {"tool_call": ...} in some cases.',
+    '{"status":"ok"}',
+    '{"tool_call": broken',
+    fencedToolCall('Glob',{}),
+    prefixedToolCall('Tool request:','Glob',{}),
+  ];
+  for(const content of nonmatching){
+    const candidate=inspectToolCallFromOutput({content,reasoning:''},allowed);
+    assert.equal(shouldRetryBraceDelimitedToolLikeResponse({...base,inspection:candidate}),false,content);
+  }
+  const accepted=inspectToolCallFromOutput({content:jsonToolCall('Glob',{}),reasoning:''},allowed);
+  assert.equal(accepted.reason,'accepted');
+  assert.equal(shouldRetryBraceDelimitedToolLikeResponse({...base,toolCall:accepted.toolCall,inspection:accepted}),false);
+  assert.equal(shouldRetryFencedToolResponse(base),false);
+  assert.equal(shouldRetryPrefixedToolResponse(base),false);
 });
 test('corrective tool prompt is bounded to allowed names and retry reasoning is hidden',()=>{
   const prompt=createToolRetryPrompt(['read_file','glob','bad name','read_file']);
@@ -3138,6 +3186,361 @@ test('throwing logger cannot break a successful prefixed correction',async()=>{
     assert.equal(response.choices[0].message.tool_calls[0].function.name,'Glob');
   });
   assert.equal(calls,2);
+});
+
+test('brace-delimited Edit is corrected once into an Anthropic tool_use',async()=>{
+  const lines=[];
+  const calls=[];
+  const strict=jsonToolCall('Edit',{file_path:'EDIT_PATH_MARKER',old_string:'OLD_VALUE_MARKER',new_string:'NEW_VALUE_MARKER'});
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{
+    calls.push(options);
+    return calls.length===1
+      ? {content:braceMalformedToolCall('Edit'),reasoning:'initial private reasoning',parentMessageId:'brace-edit'}
+      : {content:strict,reasoning:'',parentMessageId:'corrected-edit'};
+  }},async post=>{
+    const response=(await post('/v1/messages',{
+      model:'deepseek-reasoner',max_tokens:128,messages:[{role:'user',content:'synthetic edit'}],
+      tools:[{name:'Edit',input_schema:{type:'object'}}],
+    })).json();
+    assert.equal(response.stop_reason,'tool_use');
+    assert.equal(response.content[0].type,'tool_use');
+    assert.equal(response.content[0].name,'Edit');
+    assert.deepEqual(response.content[0].input,{file_path:'EDIT_PATH_MARKER',old_string:'OLD_VALUE_MARKER',new_string:'NEW_VALUE_MARKER'});
+  });
+  assert.equal(calls.length,2);
+  assert.equal(calls[1].session,calls[0].session);
+  assert.equal(calls[1].model.reasoning,false);
+  assert.equal(calls[1].model.search,false);
+  assert.match(calls[1].prompt,/Return the intended tool call/);
+  assert.doesNotMatch(calls[1].prompt,/brace-edit|initial private reasoning|EDIT_PATH_MARKER|OLD_VALUE_MARKER|NEW_VALUE_MARKER/);
+  const response=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+  assert.equal(response.brace_tool_retry_attempted,true);
+  assert.equal(response.fenced_tool_retry_attempted,false);
+  assert.equal(response.prefixed_tool_retry_attempted,false);
+  assert.equal(response.reasoning_retry_attempted,false);
+  assert.equal(response.repeated_tool_retry_attempted,false);
+  assert.equal(response.tool_retry_reason,'brace_tool');
+  assert.equal(response.tool_parse_reason,'accepted');
+  assert.equal(response.strict_tool_call_detected,true);
+  assert.equal(response.selected_tool_name,'Edit');
+  assert.equal(response.outcome,'tool_call');
+  assert.match(lines.join('\n'),/Retrying one brace-delimited tool-like response/);
+});
+
+test('failed brace correction is bounded and exposes only the generic safe failure',async()=>{
+  const lines=[];
+  const calls=[];
+  const rejectedSecret='REJECTED_SECRET_001';
+  const secondSecret='SECOND_SECRET_002';
+  let responseText='';
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{
+    calls.push(options);
+    return calls.length===1
+      ? {content:`{"tool_call":{"name":"Glob" "arguments":{"marker":"${rejectedSecret}"}}}`,reasoning:'FIRST_PRIVATE_REASONING',parentMessageId:'one'}
+      : {content:`{"tool_call":{"name":"Glob" "arguments":{"marker":"${secondSecret}"}}}`,reasoning:'SECOND_PRIVATE_REASONING',parentMessageId:'two'};
+  }},async post=>{
+    responseText=(await post('/v1/chat/completions',{
+      model:'deepseek-reasoner',messages:[{role:'user',content:'PROMPT_SECRET_003'}],
+      tools:[{type:'function',function:{name:'Glob'}}],
+    })).text;
+  });
+  assert.equal(calls.length,2);
+  assert.doesNotMatch(calls[1].prompt,/REJECTED_SECRET_001|SECOND_SECRET_002|PROMPT_SECRET_003|FIRST_PRIVATE_REASONING/);
+  const response=JSON.parse(responseText);
+  assert.equal(response.choices[0].message.content,TOOL_RETRY_FAILURE_MESSAGE);
+  assert.equal(response.choices[0].message.reasoning_content,undefined);
+  const observed=`${responseText}\n${lines.join('\n')}`;
+  assert.doesNotMatch(observed,/REJECTED_SECRET_001|SECOND_SECRET_002|PROMPT_SECRET_003|FIRST_PRIVATE_REASONING|SECOND_PRIVATE_REASONING/);
+  const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+  assert.equal(diagnostic.brace_tool_retry_attempted,true);
+  assert.equal(diagnostic.tool_retry_reason,'brace_tool');
+  assert.equal(diagnostic.tool_parse_reason,'invalid_json');
+  assert.equal(diagnostic.strict_tool_call_detected,false);
+  assert.equal(diagnostic.selected_tool_name,'none');
+  assert.equal(diagnostic.outcome,'safe_failure');
+});
+
+test('brace correction consumes the one shared budget for every later malformed class',async()=>{
+  const secondOutputs=[
+    ['reasoning only',{content:'',reasoning:'SECOND_REASONING_SECRET'}],
+    ['code fence',{content:fencedToolCall('Glob',{}),reasoning:''}],
+    ['prefixed',{content:prefixedToolCall('Tool request:','Glob',{}),reasoning:''}],
+    ['brace again',{content:braceMalformedToolCall('Glob'),reasoning:''}],
+  ];
+  for(const [label,second] of secondOutputs){
+    const lines=[];
+    let calls=0;
+    let responseText='';
+    await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+      calls+=1;
+      return calls===1
+        ? {content:braceMalformedToolCall('Glob'),reasoning:'',parentMessageId:'one'}
+        : {...second,parentMessageId:'two'};
+    }},async post=>{
+      responseText=(await post('/v1/chat/completions',{
+        model:'deepseek-reasoner',messages:[{role:'user',content:'synthetic'}],
+        tools:[{type:'function',function:{name:'Glob'}}],
+      })).text;
+    });
+    assert.equal(calls,2,label);
+    assert.equal(JSON.parse(responseText).choices[0].message.content,TOOL_RETRY_FAILURE_MESSAGE,label);
+    assert.doesNotMatch(responseText,/SECOND_REASONING_SECRET|tool_call|Tool request/,label);
+    const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+    assert.equal(diagnostic.brace_tool_retry_attempted,true,label);
+    assert.equal(diagnostic.fenced_tool_retry_attempted,false,label);
+    assert.equal(diagnostic.prefixed_tool_retry_attempted,false,label);
+    assert.equal(diagnostic.reasoning_retry_attempted,false,label);
+    assert.equal(diagnostic.repeated_tool_retry_attempted,false,label);
+    assert.equal(diagnostic.tool_retry_reason,'brace_tool',label);
+  }
+});
+
+test('an earlier correction class prevents a later brace retry in the same request',async()=>{
+  const cases=[
+    ['reasoning',{content:'',reasoning:'needs a tool'},'reasoning_only'],
+    ['fenced',{content:fencedToolCall('Glob',{}),reasoning:''},'code_fence'],
+    ['prefixed',{content:prefixedToolCall('Tool request:','Glob',{}),reasoning:''},'prefixed_tool'],
+  ];
+  for(const [label,first,expectedReason] of cases){
+    const lines=[];
+    let calls=0;
+    await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+      calls+=1;
+      return calls===1
+        ? {...first,parentMessageId:'one'}
+        : {content:braceMalformedToolCall('Glob'),reasoning:'',parentMessageId:'two'};
+    }},async post=>{
+      await post('/v1/chat/completions',{
+        model:'deepseek-reasoner',messages:[{role:'user',content:'synthetic'}],
+        tools:[{type:'function',function:{name:'Glob'}}],
+      });
+    });
+    assert.equal(calls,2,label);
+    const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+    assert.equal(diagnostic.brace_tool_retry_attempted,false,label);
+    assert.equal(diagnostic.tool_retry_reason,expectedReason,label);
+  }
+});
+
+test('brace recovery preserves fenced, prefixed, strict and ordinary response priority',async()=>{
+  const cases=[
+    {content:fencedToolCall('Glob',{}),reason:'code_fence',flag:'fenced_tool_retry_attempted',calls:2},
+    {content:prefixedToolCall('Tool request:','Glob',{}),reason:'prefixed_tool',flag:'prefixed_tool_retry_attempted',calls:2},
+    {content:jsonToolCall('Glob',{}),reason:'none',flag:null,calls:1},
+    {content:'ordinary final text',reason:'none',flag:null,calls:1},
+    {content:'The model could return {"tool_call": ...} in some cases.',reason:'none',flag:null,calls:1},
+  ];
+  for(const item of cases){
+    const lines=[];
+    let calls=0;
+    await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+      calls+=1;
+      return {content:calls===1?item.content:jsonToolCall('Glob',{}),reasoning:'',parentMessageId:String(calls)};
+    }},async post=>{
+      await post('/v1/chat/completions',{
+        model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}],
+        tools:[{type:'function',function:{name:'Glob'}}],
+      });
+    });
+    assert.equal(calls,item.calls,item.reason);
+    const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+    assert.equal(diagnostic.brace_tool_retry_attempted,false,item.reason);
+    assert.equal(diagnostic.tool_retry_reason,item.reason,item.reason);
+    if(item.flag)assert.equal(diagnostic[item.flag],true,item.reason);
+  }
+});
+
+test('Anthropic continuation recovers a brace-delimited Read and completes its result lifecycle',async()=>{
+  const lines=[];
+  const calls=[];
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{
+    calls.push(options);
+    if(calls.length===1)return {content:jsonToolCall('Glob',{pattern:'**/*.ts'}),reasoning:'',parentMessageId:'glob'};
+    if(calls.length===2)return {content:braceMalformedToolCall('Read'),reasoning:'',parentMessageId:'brace-read'};
+    if(calls.length===3)return {content:jsonToolCall('Read',{file_path:'src/example.ts'}),reasoning:'',parentMessageId:'strict-read'};
+    return {content:'completed recovered read',reasoning:'',parentMessageId:'final'};
+  }},async post=>{
+    const tools=[{name:'Glob',input_schema:{type:'object'}},{name:'Read',input_schema:{type:'object'}}];
+    const headers={'x-agent-session':'brace-continuation'};
+    const first=(await post('/v1/messages',{model:'deepseek-reasoner',max_tokens:128,messages:[{role:'user',content:'find then read'}],tools},headers)).json();
+    const glob=first.content[0];
+    const second=(await post('/v1/messages',{model:'deepseek-reasoner',max_tokens:128,messages:[{role:'user',content:[{type:'tool_result',tool_use_id:glob.id,content:'src/example.ts'}]}],tools},headers)).json();
+    const read=second.content[0];
+    assert.equal(read.type,'tool_use');
+    assert.equal(read.name,'Read');
+    const third=(await post('/v1/messages',{model:'deepseek-reasoner',max_tokens:128,messages:[{role:'user',content:[{type:'tool_result',tool_use_id:read.id,content:'safe synthetic result'}]}],tools},headers)).json();
+    assert.equal(third.content[0].text,'completed recovered read');
+  });
+  assert.equal(calls.length,4);
+  assert.equal(calls[0].session,calls[1].session);
+  assert.equal(calls[1].session,calls[2].session);
+  assert.equal(calls[2].session,calls[3].session);
+  assert.match(calls[1].prompt,/TOOL RESULT CONTINUATION/);
+  assert.match(calls[2].prompt,/Return the intended tool call/);
+  const requests=diagnosticRecords(lines).filter(record=>record.event==='tool_request');
+  const responses=diagnosticRecords(lines).filter(record=>record.event==='tool_response');
+  assert.deepEqual(requests.map(record=>record.tool_result_count),[0,1,1]);
+  assert.equal(responses[1].brace_tool_retry_attempted,true);
+  assert.equal(responses[1].selected_tool_name,'Read');
+  assert.equal(responses[2].brace_tool_retry_attempted,false);
+  assert.equal(responses[2].outcome,'final_text');
+});
+
+test('brace correction consumes repeated-tool protection budget on a continuation',async()=>{
+  const lines=[];
+  const calls=[];
+  let secondResponse;
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+    calls.push(calls.length+1);
+    if(calls.length===1)return {content:jsonToolCall('echo',{text:'same'}),reasoning:'',parentMessageId:'tool'};
+    if(calls.length===2)return {content:braceMalformedToolCall('echo'),reasoning:'',parentMessageId:'brace-repeat'};
+    return {content:jsonToolCall('echo',{text:'same'}),reasoning:'',parentMessageId:'strict-repeat'};
+  }},async post=>{
+    const tools=[{type:'function',function:{name:'echo',parameters:{type:'object'}}}];
+    const headers={'x-agent-session':'brace-repeat-budget'};
+    const first=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'echo once'}],tools},headers)).json();
+    const call=first.choices[0].message.tool_calls[0];
+    secondResponse=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'tool',name:'echo',tool_call_id:call.id,content:'same'}],tools},headers)).json();
+  });
+  assert.equal(calls.length,3);
+  assert.equal(secondResponse.choices[0].message.content,REPEATED_TOOL_FAILURE_MESSAGE);
+  assert.equal(secondResponse.choices[0].message.tool_calls,undefined);
+  const response=diagnosticRecords(lines).filter(record=>record.event==='tool_response')[1];
+  assert.equal(response.brace_tool_retry_attempted,true);
+  assert.equal(response.repeated_tool_retry_attempted,false);
+  assert.equal(response.tool_retry_reason,'brace_tool');
+  assert.equal(response.outcome,'safe_failure');
+});
+
+test('brace recovery uses the existing OpenAI and Responses adapters',async()=>{
+  const cases=[
+    {
+      path:'/v1/chat/completions',
+      body:{model:'deepseek-chat',messages:[{role:'user',content:'edit'}],tools:[{type:'function',function:{name:'Edit'}}]},
+      assertResponse:response=>assert.equal(response.choices[0].message.tool_calls[0].function.name,'Edit'),
+    },
+    {
+      path:'/v1/responses',
+      body:{model:'deepseek-chat',input:'edit',tools:[{type:'function',name:'Edit',parameters:{type:'object'}}]},
+      assertResponse:response=>assert.equal(response.output[0].name,'Edit'),
+    },
+  ];
+  for(const item of cases){
+    let calls=0;
+    const result=await toolRetryProxyCase({path:item.path,body:item.body,logger:()=>{},completeImpl:async()=>{
+      calls+=1;
+      return calls===1
+        ? {content:braceMalformedToolCall('Edit'),reasoning:'',parentMessageId:'one'}
+        : {content:jsonToolCall('Edit',{file_path:'safe.ts',old_string:'a',new_string:'b'}),reasoning:'',parentMessageId:'two'};
+    }});
+    assert.equal(calls,2,item.path);
+    item.assertResponse(JSON.parse(result.text));
+  }
+});
+
+test('brace recovery streaming hides rejected output and emits only corrected protocol events',async()=>{
+  const rejectedSecret='REJECTED_STREAM_SECRET';
+  let calls=0;
+  const result=await toolRetryProxyCase({
+    path:'/v1/messages',
+    body:{model:'deepseek-chat',stream:true,max_tokens:64,messages:[{role:'user',content:'read'}],tools:[{name:'Read',input_schema:{type:'object'}}]},
+    logger:()=>{},
+    completeImpl:async({onDelta})=>{
+      calls+=1;
+      const content=calls===1
+        ? `{"tool_call":{"name":"Read" "arguments":{"marker":"${rejectedSecret}"}}}`
+        : jsonToolCall('Read',{file_path:'safe.txt'});
+      onDelta?.({content});
+      return {content,reasoning:'',parentMessageId:String(calls)};
+    },
+  });
+  assert.equal(calls,2);
+  assert.match(result.contentType,/^text\/event-stream/);
+  assert.match(result.text,/"type":"tool_use"/);
+  assert.doesNotMatch(result.text,/REJECTED_STREAM_SECRET|"tool_call"/);
+  assert.equal((result.text.match(/event: message_stop/g)||[]).length,1);
+});
+
+test('failed brace recovery streaming emits one generic final event without malformed text',async()=>{
+  let calls=0;
+  const result=await toolRetryProxyCase({
+    path:'/v1/chat/completions',
+    body:{model:'deepseek-chat',stream:true,messages:[{role:'user',content:'read'}],tools:[{type:'function',function:{name:'Read'}}]},
+    logger:()=>{},
+    completeImpl:async({onDelta})=>{
+      calls+=1;
+      const content=calls===1
+        ? '{"tool_call":{"name":"Read" "arguments":{"marker":"FIRST_STREAM_SECRET"}}}'
+        : '{"tool_call":{"name":"Read" "arguments":{"marker":"SECOND_STREAM_SECRET"}}}';
+      onDelta?.({content});
+      return {content,reasoning:`STREAM_REASONING_SECRET_${calls}`,parentMessageId:String(calls)};
+    },
+  });
+  assert.equal(calls,2);
+  assert.match(result.text,new RegExp(TOOL_RETRY_FAILURE_MESSAGE.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')));
+  assert.doesNotMatch(result.text,/FIRST_STREAM_SECRET|SECOND_STREAM_SECRET|STREAM_REASONING_SECRET|"tool_call"|"tool_calls"/);
+  assert.equal((result.text.match(/data: \[DONE\]/g)||[]).length,1);
+});
+
+test('brace correction prompt and diagnostics isolate prompt, result and malformed payload secrets',async()=>{
+  const lines=[];
+  const calls=[];
+  let responseText='';
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{
+    calls.push(options);
+    if(calls.length===1)return {content:jsonToolCall('Glob',{pattern:'**/*'}),reasoning:'',parentMessageId:'glob'};
+    if(calls.length===2)return {content:'{"tool_call":{"name":"Read" "arguments":{"marker":"REJECTED_SECRET_001"}}}',reasoning:'REJECTED_REASONING_SECRET',parentMessageId:'malformed'};
+    return {content:'{"tool_call":{"name":"Read" "arguments":{"marker":"SECOND_SECRET_002"}}}',reasoning:'SECOND_REASONING_SECRET',parentMessageId:'correction'};
+  }},async post=>{
+    const tools=[{name:'Glob',input_schema:{type:'object'}},{name:'Read',input_schema:{type:'object'}}];
+    const headers={'x-agent-session':'brace-secret-isolation'};
+    const first=(await post('/v1/messages',{model:'deepseek-reasoner',max_tokens:128,messages:[{role:'user',content:'PROMPT_SECRET_003'}],tools},headers)).json();
+    const glob=first.content[0];
+    responseText=(await post('/v1/messages',{model:'deepseek-reasoner',max_tokens:128,messages:[{role:'user',content:[{type:'tool_result',tool_use_id:glob.id,content:'RESULT_SECRET_004'}]}],tools},headers)).text;
+  });
+  assert.equal(calls.length,3);
+  assert.doesNotMatch(calls[2].prompt,/REJECTED_SECRET_001|SECOND_SECRET_002|PROMPT_SECRET_003|RESULT_SECRET_004|REJECTED_REASONING_SECRET/);
+  const observed=`${responseText}\n${lines.join('\n')}`;
+  assert.doesNotMatch(observed,/REJECTED_SECRET_001|SECOND_SECRET_002|PROMPT_SECRET_003|RESULT_SECRET_004|REJECTED_REASONING_SECRET|SECOND_REASONING_SECRET/);
+  const response=JSON.parse(responseText);
+  assert.equal(response.content[0].text,TOOL_RETRY_FAILURE_MESSAGE);
+  const diagnostic=diagnosticRecords(lines).filter(record=>record.event==='tool_response')[1];
+  assert.equal(diagnostic.brace_tool_retry_attempted,true);
+  assert.equal(diagnostic.outcome,'safe_failure');
+});
+
+test('brace recovery remains functional with diagnostics disabled and a throwing logger',async()=>{
+  const previous=process.env.BRIDGE_TOOL_DIAGNOSTICS;
+  delete process.env.BRIDGE_TOOL_DIAGNOSTICS;
+  let disabledCalls=0;
+  try{
+    const result=await toolRetryProxyCase({
+      logger:()=>{},
+      body:{model:'deepseek-chat',messages:[{role:'user',content:'find'}],tools:[{type:'function',function:{name:'Glob'}}]},
+      completeImpl:async()=>{disabledCalls+=1;return disabledCalls===1
+        ? {content:braceMalformedToolCall('Glob'),reasoning:'',parentMessageId:'one'}
+        : {content:jsonToolCall('Glob',{}),reasoning:'',parentMessageId:'two'};},
+    });
+    assert.equal(JSON.parse(result.text).choices[0].finish_reason,'tool_calls');
+  }finally{
+    if(previous===undefined)delete process.env.BRIDGE_TOOL_DIAGNOSTICS;
+    else process.env.BRIDGE_TOOL_DIAGNOSTICS=previous;
+  }
+  assert.equal(disabledCalls,2);
+
+  let loggerCalls=0;
+  await withDiagnosticsServer({logger:()=>{throw new Error('logger failed');},completeImpl:async()=>{
+    loggerCalls+=1;
+    return loggerCalls===1
+      ? {content:braceMalformedToolCall('Glob'),reasoning:'',parentMessageId:'one'}
+      : {content:jsonToolCall('Glob',{}),reasoning:'',parentMessageId:'two'};
+  }},async post=>{
+    const response=(await post('/v1/chat/completions',{
+      model:'deepseek-chat',messages:[{role:'user',content:'find'}],tools:[{type:'function',function:{name:'Glob'}}],
+    })).json();
+    assert.equal(response.choices[0].finish_reason,'tool_calls');
+  });
+  assert.equal(loggerCalls,2);
 });
 
 test('rejected parser diagnostics expose no content, paths, URLs or tool arguments',async()=>{
