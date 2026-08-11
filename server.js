@@ -9,14 +9,17 @@ const { SessionStore } = require('./lib/session');
 const { SessionResolver } = require('./lib/session_resolver');
 const { inspectToolCallFromOutput, toolPrompt } = require('./lib/tool_parser');
 const {
+  braceToolFailure,
   createFencedToolRetryPrompt,
   createToolRetryPrompt,
   fencedToolFailure,
   hideRetryReasoning,
+  logBraceToolRetry,
   logFencedToolRetry,
   logPrefixedToolRetry,
   logToolRetry,
   prefixedToolFailure,
+  shouldRetryBraceDelimitedToolLikeResponse,
   shouldRetryFencedToolResponse,
   shouldRetryPrefixedToolResponse,
   shouldRetryToolResponse,
@@ -267,6 +270,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
     let reasoningRetryAttempted = false;
     let fencedToolRetryAttempted = false;
     let prefixedToolRetryAttempted = false;
+    let braceToolRetryAttempted = false;
     let repeatedToolRetryAttempted = false;
     let toolRetryReason = 'none';
     try {
@@ -456,6 +460,32 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
           output = prefixedToolFailure(output);
         }
       }
+      if (shouldRetryBraceDelimitedToolLikeResponse({
+        hasTools,
+        toolCall,
+        retryCount: correctiveAttempted ? 1 : 0,
+        inspection: toolParseResult,
+      })) {
+        correctiveAttempted = true;
+        braceToolRetryAttempted = true;
+        toolRetryReason = 'brace_tool';
+        logBraceToolRetry(logger);
+        output = await completeImpl({
+          prompt: createFencedToolRetryPrompt(allowedTools),
+          session,
+          model: MODELS['deepseek-chat'],
+          timeoutMs: config.timeoutMs,
+          onDelta: input.stream ? delta => stream.delta(delta) : undefined,
+          onStage: onUpstreamStage,
+          onError: onUpstreamError,
+        });
+        toolParseResult = inspectToolCallFromOutput(output, allowedTools);
+        toolCall = toolParseResult.toolCall;
+        if (!toolCall) {
+          safeFailure = true;
+          output = braceToolFailure(output);
+        }
+      }
       if (!correctiveAttempted && shouldRetryToolResponse({ hasTools, output, toolCall, retryCount: 0 })) {
         correctiveAttempted = true;
         reasoningRetryAttempted = true;
@@ -522,6 +552,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         reasoningRetryAttempted,
         fencedToolRetryAttempted,
         prefixedToolRetryAttempted,
+        braceToolRetryAttempted,
         repeatedToolRetryAttempted,
         toolRetryReason,
         toolParseResult,
@@ -531,7 +562,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       return send(res, 200, finalResponse);
     } catch (error) {
       diagnosticResponse?.upstreamError(error, latestUpstream);
-      diagnosticResponse?.response({ reasoningRetryAttempted, fencedToolRetryAttempted, prefixedToolRetryAttempted, repeatedToolRetryAttempted, toolRetryReason, outcome: 'upstream_error' });
+      diagnosticResponse?.response({ reasoningRetryAttempted, fencedToolRetryAttempted, prefixedToolRetryAttempted, braceToolRetryAttempted, repeatedToolRetryAttempted, toolRetryReason, outcome: 'upstream_error' });
       logSafeError(error, logger);
       if (stream) return stream.fail('DeepSeek streaming request failed. Run npm run doctor or re-authenticate.');
       const status = error.status || (error.name === 'TimeoutError' ? 504 : 502);
