@@ -92,6 +92,47 @@ a successful Write continuation. OpenAI and Responses remain fixed at zero.
 The one-run limit was respected. The corrected counter was revalidated
 offline only; no second Claude invocation was made.
 
+## Final counter-scope live validation
+
+A separate, explicitly authorized minimal validation tested the current-result
+scoping correction without repeating the broader Claude Code audit.
+
+- branch HEAD at start: `96173259d10a2d7b357ee944376c0e01c6e6f02e`
+- initial observability implementation: `e4dfce25690f530f443a5104d5ce819c37c161f8`
+- current-result counter correction: `05b5b179dd59937f5459bc94e09d83b797b8b2cf`
+- Claude Code: `2.1.226`
+- Node.js: `v24.12.0`
+- foreground Claude invocations: 1
+- user prompts: 2
+- `/v1/messages` requests: 4
+- independent Claude roots: 0
+
+The safe diagnostic sequence was:
+
+| Sequence | Turn | Continuation | tool_result_count | tool_result_error_count | selected_tool_name | Strict call | Outcome |
+| ---: | --- | --- | ---: | ---: | --- | --- | --- |
+| 1 | Missing Read | No | 0 | 0 | Read | Yes | tool_call |
+| 2 | Missing Read result | Yes | 1 | 1 | none | No | final_text |
+| 3 | New Write | No | 0 | 0 | Write | Yes | tool_call |
+| 4 | Write result | Yes | 1 | 0 | none | No | final_text |
+
+This confirms that the historical errored Read result was excluded both from
+the new independent Write turn and from its successful continuation. The
+Write target was physically created and its synthetic content matched the
+expected value before the disposable fixture was removed.
+
+All four requests reached `completion_completed`, `stream_received`,
+`stream_read`, and `stream_parsed`, with one upstream completion per request.
+There were no network errors, retries, raw tool-like JSON events, or payload
+leaks. The single Claude process was a descendant of the one foreground
+invocation. Cleanup left port 9655 free and zero test Claude processes.
+
+The earlier audit classified Write as FAIL. Subsequent controlled CC-009
+validation demonstrated a successful strict Write → tool_result lifecycle with
+physical file creation. Therefore the original CC-002 runtime-failure finding
+requires re-evaluation before any production fix is attempted. CC-002 status:
+`REQUIRES_REEVALUATION`; it is not closed by this observability validation.
+
 ## Recovery and safety
 
 - reasoning retry attempted: 0
@@ -116,10 +157,8 @@ credentials, full session IDs, and call IDs.
 
 ## Classification
 
-`CC_009_BLOCKED`
+`CC_009_COMPLETE`
 
-The selected tool name and explicit boolean semantics were demonstrated live
-for successful and errored Read calls, and Write was newly demonstrated as a
-successful real tool lifecycle. Full completion is withheld because the
-final historical-result scoping correction was not re-run live and the
-platform-native shell tool was not advertised in this bounded invocation.
+The selected tool name, explicit boolean semantics, and current-result counter
+scope are now demonstrated live. The platform-native shell inventory is a
+separate capability investigation and does not block CC-009 diagnostics.
