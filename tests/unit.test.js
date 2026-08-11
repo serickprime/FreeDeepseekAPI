@@ -1,7 +1,7 @@
 'use strict';
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,clientSessionKey,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,inspectToolCall,inspectToolCallFromOutput,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { checked, complete, loadAuth, parseRetryAfter, parseStream }=client; const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
-const {TOOL_RETRY_FAILURE_MESSAGE,createFencedToolRetryPrompt,createToolRetryPrompt,hideRetryReasoning,shouldRetryFencedToolResponse,shouldRetryToolResponse}=require('../lib/tool_retry');
+const {TOOL_RETRY_FAILURE_MESSAGE,createFencedToolRetryPrompt,createToolRetryPrompt,hideRetryReasoning,shouldRetryFencedToolResponse,shouldRetryPrefixedToolResponse,shouldRetryToolResponse}=require('../lib/tool_retry');
 const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
 const {MAX_TOOL_NAMES,MAX_TOOL_NAME_CHARS,classifyUpstreamError,createToolDiagnostics}=require('../lib/tool_diagnostics');
 const {solvePOW}=require('../lib/pow');
@@ -329,6 +329,7 @@ test('count_tokens body validation requires the confirmed Anthropic contract',()
 });
 const jsonToolCall=(name='read_file',args={path:'package.json'})=>JSON.stringify({tool_call:{name,arguments:args}});
 const fencedToolCall=(name='read_file',args={path:'package.json'})=>`\`\`\`json\n${jsonToolCall(name,args)}\n\`\`\``;
+const prefixedToolCall=(prefix='Tool request:',name='read_file',args={path:'package.json'})=>`${prefix}\n${jsonToolCall(name,args)}`;
 const xmlToolCall=(name='read_file',args={path:'package.json'})=>`<tool_call>${JSON.stringify({name,arguments:args})}</tool_call>`;
 
 test('strict JSON and XML tool calls are accepted only as the whole content',()=>{
@@ -539,6 +540,43 @@ test('fenced tool retry predicate accepts only the proven selected-content shape
     {...base,inspection:inspectToolCallFromOutput({content:'[]',reasoning:''},allowed)},
   ];
   for(const item of negatives)assert.equal(shouldRetryFencedToolResponse(item),false);
+});
+test('prefixed tool retry predicate accepts only the proven non-fenced structural shape',()=>{
+  const allowed=['Glob'];
+  const inspection=inspectToolCallFromOutput({
+    content:prefixedToolCall('Tool request:','Glob',{pattern:'**/InteractiveStars.tsx'}),
+    reasoning:'ordinary reasoning',
+  },allowed);
+  const base={hasTools:true,toolCall:null,retryCount:0,inspection};
+  assert.equal(inspection.source,'content');
+  assert.equal(inspection.reason,'invalid_json');
+  assert.equal(inspection.metadata.content_starts_with_code_fence,false);
+  assert.equal(inspection.metadata.content_starts_with_brace,false);
+  assert.equal(inspection.metadata.content_ends_with_brace,true);
+  assert.equal(inspection.metadata.content_contains_tool_call_marker,true);
+  assert.equal(shouldRetryPrefixedToolResponse(base),true);
+
+  const bracketInspection=inspectToolCallFromOutput({
+    content:`[\u8c03\u7528 Glob] ${jsonToolCall('Glob',{pattern:'**/InteractiveStars.tsx'})}`,
+    reasoning:'',
+  },allowed);
+  assert.equal(bracketInspection.reason,'invalid_json');
+  assert.equal(shouldRetryPrefixedToolResponse({...base,inspection:bracketInspection}),true);
+
+  const negatives=[
+    {...base,hasTools:false},
+    {...base,toolCall:{}},
+    {...base,retryCount:1},
+    {...base,inspection:{...inspection,source:'reasoning'}},
+    {...base,inspection:{...inspection,source:'none'}},
+    {...base,inspection:{...inspection,reason:'tool_not_allowed'}},
+    {...base,inspection:{...inspection,reason:'invalid_envelope'}},
+    {...base,inspection:{...inspection,metadata:{...inspection.metadata,content_starts_with_code_fence:true}}},
+    {...base,inspection:{...inspection,metadata:{...inspection.metadata,content_starts_with_brace:true}}},
+    {...base,inspection:{...inspection,metadata:{...inspection.metadata,content_ends_with_brace:false}}},
+    {...base,inspection:{...inspection,metadata:{...inspection.metadata,content_contains_tool_call_marker:false}}},
+  ];
+  for(const item of negatives)assert.equal(shouldRetryPrefixedToolResponse(item),false);
 });
 test('corrective tool prompt is bounded to allowed names and retry reasoning is hidden',()=>{
   const prompt=createToolRetryPrompt(['read_file','glob','bad name','read_file']);
@@ -1034,7 +1072,7 @@ test('streaming hides a strict reasoning envelope and emits only protocol tool e
 test('ordinary responses without tools and rejected tool-like text stay normal responses',async()=>{
   const outputs=[
     {content:'ordinary answer',reasoning:'I may use Read later',parentMessageId:null},
-    {content:`Example only: ${jsonToolCall('read_file',{})}`,reasoning:'',parentMessageId:null},
+    {content:`Example only: ${jsonToolCall('read_file',{})}\nThis is not a request.`,reasoning:'',parentMessageId:null},
   ];
   const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
   const server=createProxyServer({config,completeImpl:async()=>outputs.shift()});
@@ -2498,6 +2536,7 @@ test('fenced Glob content gets one correction and becomes an Anthropic tool_use'
   assert.doesNotMatch(calls[1].prompt,/InteractiveStars|nonempty initial reasoning|```/);
   const response=diagnosticRecords(lines).find(record=>record.event==='tool_response');
   assert.equal(response.fenced_tool_retry_attempted,true);
+  assert.equal(response.prefixed_tool_retry_attempted,false);
   assert.equal(response.reasoning_retry_attempted,false);
   assert.equal(response.repeated_tool_retry_attempted,false);
   assert.equal(response.tool_retry_reason,'code_fence');
@@ -2505,6 +2544,164 @@ test('fenced Glob content gets one correction and becomes an Anthropic tool_use'
   assert.equal(response.tool_parse_reason,'accepted');
   assert.equal(response.strict_tool_call_detected,true);
   assert.equal(response.outcome,'tool_call');
+});
+
+test('prefixed Glob content gets one correction and becomes an Anthropic tool_use',async()=>{
+  const lines=[];
+  const calls=[];
+  const strict=jsonToolCall('Glob',{pattern:'**/InteractiveStars.tsx'});
+  const malformed=prefixedToolCall('Tool request:','Glob',{pattern:'**/InteractiveStars.tsx'});
+  assert.equal(inspectToolCallFromOutput({content:malformed,reasoning:'synthetic reasoning'},['Glob','Read','Grep']).reason,'invalid_json');
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{
+    calls.push(options);
+    return calls.length===1
+      ? {content:malformed,reasoning:'nonempty synthetic reasoning',parentMessageId:'prefixed'}
+      : {content:strict,reasoning:'',parentMessageId:'corrected'};
+  }},async post=>{
+    const response=(await post('/v1/messages',{
+      model:'deepseek-reasoner',max_tokens:128,messages:[{role:'user',content:'synthetic read-only task'}],
+      tools:[
+        {name:'Glob',input_schema:{type:'object'}},
+        {name:'Read',input_schema:{type:'object'}},
+        {name:'Grep',input_schema:{type:'object'}},
+      ],
+    })).json();
+    assert.equal(response.stop_reason,'tool_use');
+    assert.equal(response.content[0].type,'tool_use');
+    assert.equal(response.content[0].name,'Glob');
+    assert.deepEqual(response.content[0].input,{pattern:'**/InteractiveStars.tsx'});
+  });
+  assert.equal(calls.length,2);
+  assert.equal(calls[1].session,calls[0].session);
+  assert.equal(calls[1].model.reasoning,false);
+  assert.equal(calls[1].model.search,false);
+  assert.match(calls[1].prompt,/Return the intended tool call/);
+  assert.match(calls[1].prompt,/exactly one strict JSON object/);
+  assert.match(calls[1].prompt,/\["Glob","Read","Grep"\]/);
+  assert.doesNotMatch(calls[1].prompt,/InteractiveStars|Tool request|synthetic reasoning/);
+  const response=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+  assert.equal(response.prefixed_tool_retry_attempted,true);
+  assert.equal(response.fenced_tool_retry_attempted,false);
+  assert.equal(response.reasoning_retry_attempted,false);
+  assert.equal(response.repeated_tool_retry_attempted,false);
+  assert.equal(response.tool_retry_reason,'prefixed_tool');
+  assert.equal(response.tool_parse_source,'content');
+  assert.equal(response.tool_parse_reason,'accepted');
+  assert.equal(response.strict_tool_call_detected,true);
+  assert.equal(response.outcome,'tool_call');
+  assert.match(lines.join('\n'),/Retrying one prefixed tool response/);
+});
+
+test('bracket-prefixed synthetic Glob is corrected once without weakening parser acceptance',async()=>{
+  const lines=[];
+  const calls=[];
+  const strict=jsonToolCall('Glob',{pattern:'**/InteractiveStars.tsx'});
+  const malformed=`[\u8c03\u7528 Glob] ${strict}`;
+  assert.equal(inspectToolCall(malformed,['Glob']).reason,'invalid_json');
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{
+    calls.push(options);
+    return calls.length===1
+      ? {content:malformed,reasoning:'',parentMessageId:'prefixed'}
+      : {content:strict,reasoning:'',parentMessageId:'corrected'};
+  }},async post=>{
+    const response=(await post('/v1/chat/completions',{
+      model:'deepseek-chat',messages:[{role:'user',content:'synthetic bracket fixture'}],
+      tools:[{type:'function',function:{name:'Glob',parameters:{type:'object'}}}],
+    })).json();
+    assert.equal(response.choices[0].finish_reason,'tool_calls');
+    assert.equal(response.choices[0].message.tool_calls[0].function.name,'Glob');
+  });
+  assert.equal(calls.length,2);
+  const response=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+  assert.equal(response.prefixed_tool_retry_attempted,true);
+  assert.equal(response.fenced_tool_retry_attempted,false);
+  assert.equal(response.tool_retry_reason,'prefixed_tool');
+  assert.equal(response.tool_parse_reason,'accepted');
+  assert.equal(response.outcome,'tool_call');
+});
+
+test('failed prefixed correction emits one generic safe failure and no third completion',async()=>{
+  const lines=[];
+  let calls=0;
+  const malformed=prefixedToolCall('Tool request:','Glob',{pattern:'**/InteractiveStars.tsx'});
+  let responseText='';
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+    calls+=1;
+    return {content:malformed,reasoning:`FAILED_PREFIXED_REASONING_${calls}`,parentMessageId:String(calls)};
+  }},async post=>{
+    responseText=(await post('/v1/chat/completions',{
+      model:'deepseek-reasoner',messages:[{role:'user',content:'find component'}],
+      tools:[{type:'function',function:{name:'Glob'}}],
+    })).text;
+  });
+  assert.equal(calls,2);
+  const response=JSON.parse(responseText);
+  assert.equal(response.choices[0].message.content,TOOL_RETRY_FAILURE_MESSAGE);
+  assert.equal(response.choices[0].message.reasoning_content,undefined);
+  assert.doesNotMatch(responseText,/tool_call|InteractiveStars|FAILED_PREFIXED_REASONING|Tool request/);
+  const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+  assert.equal(diagnostic.prefixed_tool_retry_attempted,true);
+  assert.equal(diagnostic.fenced_tool_retry_attempted,false);
+  assert.equal(diagnostic.tool_retry_reason,'prefixed_tool');
+  assert.equal(diagnostic.tool_parse_reason,'invalid_json');
+  assert.equal(diagnostic.strict_tool_call_detected,false);
+  assert.equal(diagnostic.outcome,'safe_failure');
+});
+
+test('prefixed correction consumes the shared budget before a reasoning-only response',async()=>{
+  const lines=[];
+  let calls=0;
+  let responseText='';
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+    calls+=1;
+    return calls===1
+      ? {content:prefixedToolCall('Tool request:','Glob',{}),reasoning:'initial reasoning',parentMessageId:'one'}
+      : {content:'',reasoning:'PRIVATE_SECOND_REASONING',parentMessageId:'two'};
+  }},async post=>{
+    responseText=(await post('/v1/chat/completions',{
+      model:'deepseek-reasoner',messages:[{role:'user',content:'find component'}],
+      tools:[{type:'function',function:{name:'Glob'}}],
+    })).text;
+  });
+  assert.equal(calls,2);
+  const response=JSON.parse(responseText);
+  assert.equal(response.choices[0].message.content,TOOL_RETRY_FAILURE_MESSAGE);
+  assert.doesNotMatch(responseText,/PRIVATE_SECOND_REASONING|tool_call/);
+  const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+  assert.equal(diagnostic.prefixed_tool_retry_attempted,true);
+  assert.equal(diagnostic.reasoning_retry_attempted,false);
+  assert.equal(diagnostic.tool_retry_reason,'prefixed_tool');
+  assert.equal(diagnostic.outcome,'safe_failure');
+});
+
+test('strict and nonmatching content shapes never enter prefixed recovery',async()=>{
+  const cases=[
+    {content:jsonToolCall('Glob',{}),expected:'tool_calls'},
+    {content:'Компонент находится в проекте.',expected:'final_text'},
+    {content:'The tool_call mechanism is unavailable right now.',expected:'final_text'},
+    {content:'{"tool_call": broken',expected:'final_text'},
+    {content:'Result: {"status":"ok"}',expected:'final_text'},
+  ];
+  for(const item of cases){
+    const lines=[];
+    let calls=0;
+    let response;
+    await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+      calls+=1;
+      return {content:item.content,reasoning:'',parentMessageId:'one'};
+    }},async post=>{
+      response=(await post('/v1/chat/completions',{
+        model:'deepseek-chat',messages:[{role:'user',content:'synthetic shape'}],
+        tools:[{type:'function',function:{name:'Glob'}}],
+      })).json();
+    });
+    assert.equal(calls,1,item.content);
+    assert.equal(response.choices[0].finish_reason,item.expected==='tool_calls'?'tool_calls':'stop');
+    const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+    assert.equal(diagnostic.prefixed_tool_retry_attempted,false,item.content);
+    assert.equal(diagnostic.fenced_tool_retry_attempted,false,item.content);
+    assert.equal(diagnostic.tool_retry_reason,'none',item.content);
+  }
 });
 
 test('failed fenced correction emits one safe failure with code_fence diagnostics',async()=>{
@@ -2527,6 +2724,7 @@ test('failed fenced correction emits one safe failure with code_fence diagnostic
   assert.doesNotMatch(responseText,/tool_call|InteractiveStars|FAILED_CORRECTION_REASONING/);
   const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
   assert.equal(diagnostic.fenced_tool_retry_attempted,true);
+  assert.equal(diagnostic.prefixed_tool_retry_attempted,false);
   assert.equal(diagnostic.tool_retry_reason,'code_fence');
   assert.equal(diagnostic.tool_parse_reason,'invalid_json');
   assert.equal(diagnostic.strict_tool_call_detected,false);
@@ -2674,6 +2872,151 @@ test('throwing logger cannot break a successful fenced correction',async()=>{
   assert.equal(calls,2);
 });
 
+test('prefixed retry prompt and diagnostics never copy rejected payload secrets',async()=>{
+  const lines=[];
+  const calls=[];
+  const malformed='PREFIX TOP_SECRET\n'+jsonToolCall('Glob',{pattern:'D:\\private-project\\secret'});
+  let responseText='';
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{
+    calls.push(options);
+    return calls.length===1
+      ? {content:malformed,reasoning:'PRIVATE_PREFIXED_REASONING',parentMessageId:'one'}
+      : {content:jsonToolCall('Glob',{pattern:'**/*'}),reasoning:'',parentMessageId:'two'};
+  }},async post=>{
+    responseText=(await post('/v1/chat/completions',{
+      model:'deepseek-chat',messages:[{role:'user',content:'synthetic safe request'}],
+      tools:[{type:'function',function:{name:'Glob'}}],
+    })).text;
+  });
+  assert.equal(calls.length,2);
+  assert.match(calls[1].prompt,/\["Glob"\]/);
+  const observed=`${calls[1].prompt}\n${lines.join('\n')}\n${responseText}`;
+  for(const secret of ['TOP_SECRET','private-project','secret','PRIVATE_PREFIXED_REASONING']){
+    assert.equal(observed.includes(secret),false,secret);
+  }
+  const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+  assert.equal(diagnostic.prefixed_tool_retry_attempted,true);
+  assert.equal(diagnostic.tool_retry_reason,'prefixed_tool');
+  assert.equal(diagnostic.outcome,'tool_call');
+});
+
+test('tool-result continuation can correct one prefixed Read and keep the linked session',async()=>{
+  const lines=[];
+  const calls=[];
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{
+    calls.push(options);
+    if(calls.length===1)return {content:jsonToolCall('Glob',{pattern:'**/*.tsx'}),reasoning:'',parentMessageId:'glob'};
+    if(calls.length===2)return {content:prefixedToolCall('Tool request:','Read',{file_path:'component.tsx'}),reasoning:'choose Read',parentMessageId:'prefixed-read'};
+    return {content:jsonToolCall('Read',{file_path:'component.tsx'}),reasoning:'',parentMessageId:'strict-read'};
+  }},async post=>{
+    const tools=[
+      {name:'Glob',input_schema:{type:'object'}},
+      {name:'Read',input_schema:{type:'object'}},
+      {name:'Grep',input_schema:{type:'object'}},
+    ];
+    const headers={'x-agent-session':'prefixed-continuation'};
+    const first=(await post('/v1/messages',{
+      model:'deepseek-reasoner',max_tokens:128,messages:[{role:'user',content:'find then read'}],tools,
+    },headers)).json();
+    const glob=first.content[0];
+    const second=(await post('/v1/messages',{
+      model:'deepseek-reasoner',max_tokens:128,
+      messages:[{role:'user',content:[{type:'tool_result',tool_use_id:glob.id,content:'component.tsx'}]}],tools,
+    },headers)).json();
+    assert.equal(second.stop_reason,'tool_use');
+    assert.equal(second.content[0].type,'tool_use');
+    assert.equal(second.content[0].name,'Read');
+    assert.deepEqual(second.content[0].input,{file_path:'component.tsx'});
+  });
+  assert.equal(calls.length,3);
+  assert.equal(calls[0].session,calls[1].session);
+  assert.equal(calls[1].session,calls[2].session);
+  assert.match(calls[1].prompt,/TOOL RESULT CONTINUATION/);
+  assert.match(calls[2].prompt,/Return the intended tool call/);
+  assert.doesNotMatch(calls[2].prompt,/component\.tsx|Completed Tool Result|Tool request/);
+  const requests=diagnosticRecords(lines).filter(record=>record.event==='tool_request');
+  const responses=diagnosticRecords(lines).filter(record=>record.event==='tool_response');
+  assert.equal(requests[1].is_tool_continuation,true);
+  assert.equal(requests[1].tool_result_count,1);
+  assert.equal(responses[1].prefixed_tool_retry_attempted,true);
+  assert.equal(responses[1].fenced_tool_retry_attempted,false);
+  assert.equal(responses[1].tool_retry_reason,'prefixed_tool');
+  assert.equal(responses[1].strict_tool_call_detected,true);
+  assert.equal(responses[1].outcome,'tool_call');
+});
+
+test('prefixed correction consumes repeated-tool budget on a continuation',async()=>{
+  const lines=[];
+  const calls=[];
+  let secondResponse;
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{
+    calls.push(options);
+    if(calls.length===1)return {content:jsonToolCall('echo',{text:'same'}),reasoning:'',parentMessageId:'tool'};
+    if(calls.length===2)return {content:prefixedToolCall('Tool request:','echo',{text:'same'}),reasoning:'',parentMessageId:'prefixed-repeat'};
+    return {content:jsonToolCall('echo',{text:'same'}),reasoning:'',parentMessageId:'strict-repeat'};
+  }},async post=>{
+    const tools=[{type:'function',function:{name:'echo',parameters:{type:'object'}}}];
+    const headers={'x-agent-session':'prefixed-repeat-budget'};
+    const first=(await post('/v1/chat/completions',{
+      model:'deepseek-chat',messages:[{role:'user',content:'echo once'}],tools,
+    },headers)).json();
+    const call=first.choices[0].message.tool_calls[0];
+    secondResponse=(await post('/v1/chat/completions',{
+      model:'deepseek-chat',messages:[{role:'tool',name:'echo',tool_call_id:call.id,content:'same'}],tools,
+    },headers)).json();
+  });
+  assert.equal(calls.length,3);
+  assert.equal(secondResponse.choices[0].message.content,REPEATED_TOOL_FAILURE_MESSAGE);
+  assert.equal(secondResponse.choices[0].message.tool_calls,undefined);
+  const responses=diagnosticRecords(lines).filter(record=>record.event==='tool_response');
+  assert.equal(responses[1].prefixed_tool_retry_attempted,true);
+  assert.equal(responses[1].fenced_tool_retry_attempted,false);
+  assert.equal(responses[1].repeated_tool_retry_attempted,false);
+  assert.equal(responses[1].tool_retry_reason,'prefixed_tool');
+  assert.equal(responses[1].outcome,'safe_failure');
+});
+
+test('prefixed correction works with structured diagnostics disabled',async()=>{
+  const previous=process.env.BRIDGE_TOOL_DIAGNOSTICS;
+  delete process.env.BRIDGE_TOOL_DIAGNOSTICS;
+  const lines=[];
+  let calls=0;
+  try{
+    const result=await toolRetryProxyCase({
+      logger:line=>lines.push(line),
+      body:{model:'deepseek-chat',messages:[{role:'user',content:'find'}],tools:[{type:'function',function:{name:'Glob'}}]},
+      completeImpl:async()=>{calls+=1;return calls===1
+        ? {content:prefixedToolCall('Tool request:','Glob',{}),reasoning:'',parentMessageId:'one'}
+        : {content:jsonToolCall('Glob',{}),reasoning:'',parentMessageId:'two'};},
+    });
+    const response=JSON.parse(result.text);
+    assert.equal(response.choices[0].finish_reason,'tool_calls');
+    assert.equal(response.choices[0].message.tool_calls[0].function.name,'Glob');
+  }finally{
+    if(previous===undefined)delete process.env.BRIDGE_TOOL_DIAGNOSTICS;
+    else process.env.BRIDGE_TOOL_DIAGNOSTICS=previous;
+  }
+  assert.equal(calls,2);
+  assert.equal(diagnosticRecords(lines).length,0);
+});
+
+test('throwing logger cannot break a successful prefixed correction',async()=>{
+  let calls=0;
+  await withDiagnosticsServer({logger:()=>{throw new Error('logger failed');},completeImpl:async()=>{
+    calls+=1;
+    return calls===1
+      ? {content:prefixedToolCall('Tool request:','Glob',{}),reasoning:'',parentMessageId:'one'}
+      : {content:jsonToolCall('Glob',{}),reasoning:'',parentMessageId:'two'};
+  }},async post=>{
+    const response=(await post('/v1/chat/completions',{
+      model:'deepseek-chat',messages:[{role:'user',content:'find'}],tools:[{type:'function',function:{name:'Glob'}}],
+    })).json();
+    assert.equal(response.choices[0].finish_reason,'tool_calls');
+    assert.equal(response.choices[0].message.tool_calls[0].function.name,'Glob');
+  });
+  assert.equal(calls,2);
+});
+
 test('rejected parser diagnostics expose no content, paths, URLs or tool arguments',async()=>{
   const lines=[];
   const rejected=[
@@ -2681,6 +3024,7 @@ test('rejected parser diagnostics expose no content, paths, URLs or tool argumen
     'C:\\Users\\Sensitive\\private.txt',
     'Bearer VERYSECRET',
     '{"tool_call":{"name":"Glob","arguments":{"path":"D:\\\\secret-project"}}}',
+    'trailing ordinary text',
   ].join('\n');
   await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>({content:rejected,reasoning:'',parentMessageId:null})},async post=>{
     const response=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}],tools:[{type:'function',function:{name:'Glob',parameters:{type:'object'}}}]})).json();
