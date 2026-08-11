@@ -2135,7 +2135,13 @@ test('tool diagnostics are bounded and never break requests when logging fails',
   assert.equal(diagnosticRecords(wrongLines)[0].tools_field_shape,'object');
   assert.equal(diagnosticRecords(wrongLines)[0].raw_tool_count,0);
   const failing=createToolDiagnostics({enabled:true,logger:()=>{throw new Error('logger failed');}});
-  assert.doesNotThrow(()=>failing.request({protocol:'anthropic',route:'/v1/messages',body:{model:'deepseek-chat',tools:[]},upstreamSource:'anonymous',upstreamKey:'private',clientSessionSource:'unavailable',clientSessionKey:null}));
+  let failingRequest;
+  assert.doesNotThrow(()=>{failingRequest=failing.request({
+    protocol:'anthropic',route:'/v1/messages',
+    body:{model:'deepseek-chat',tools:[],messages:[{role:'user',content:[{type:'tool_result',is_error:true,content:'LOGGER_RESULT_SECRET'}]}]},
+    upstreamSource:'anonymous',upstreamKey:'private',clientSessionSource:'unavailable',clientSessionKey:null,toolResultCount:1,
+  });});
+  assert.doesNotThrow(()=>failingRequest.response({strictToolCallDetected:true,selectedToolName:'Write',outcome:'tool_call'}));
 });
 
 test('tool diagnostics accept only safe identifier-shaped tool names',()=>{
@@ -2161,6 +2167,50 @@ test('tool diagnostics accept only safe identifier-shaped tool names',()=>{
   ]);
   assert.equal(JSON.stringify(record).includes(marker),false);
   assert.equal(JSON.stringify(record).includes('secret.example'),false);
+});
+
+test('selected tool diagnostics use safe accepted, none and invalid values only',()=>{
+  const marker='UNSAFE_SELECTED_TOOL_SECRET';
+  const lines=[];
+  const diagnostics=createToolDiagnostics({enabled:true,logger:line=>lines.push(line)});
+  const accepted=diagnostics.request({protocol:'anthropic',route:'/v1/messages',body:{model:'deepseek-chat'},upstreamSource:'anonymous',upstreamKey:'private',clientSessionSource:'unavailable'});
+  accepted.response({strictToolCallDetected:true,selectedToolName:'Write',outcome:'tool_call'});
+  const noTool=diagnostics.request({protocol:'anthropic',route:'/v1/messages',body:{model:'deepseek-chat'},upstreamSource:'anonymous',upstreamKey:'private',clientSessionSource:'unavailable'});
+  noTool.response({strictToolCallDetected:false,selectedToolName:`Read\n${marker}`,outcome:'final_text'});
+  const invalid=diagnostics.request({protocol:'anthropic',route:'/v1/messages',body:{model:'deepseek-chat'},upstreamSource:'anonymous',upstreamKey:'private',clientSessionSource:'unavailable'});
+  invalid.response({strictToolCallDetected:true,selectedToolName:`https://secret.example/${marker}`,outcome:'tool_call'});
+  const responses=diagnosticRecords(lines).filter(record=>record.event==='tool_response');
+  assert.deepEqual(responses.map(record=>record.selected_tool_name),['Write','none','invalid']);
+  assert.equal(lines.join('\n').includes(marker),false);
+  assert.equal(lines.join('\n').includes('secret.example'),false);
+});
+
+test('tool result error diagnostics count Anthropic explicit true booleans only',()=>{
+  const marker='TOOL_RESULT_TEXT_SECRET';
+  const lines=[];
+  const diagnostics=createToolDiagnostics({enabled:true,logger:line=>lines.push(line)});
+  const recordFor=(protocol,body,toolResultCount)=>{
+    diagnostics.request({protocol,route:protocol==='anthropic'?'/v1/messages':protocol==='responses'?'/v1/responses':'/v1/chat/completions',body,upstreamSource:'anonymous',upstreamKey:'private',clientSessionSource:'unavailable',toolResultCount});
+    return diagnosticRecords(lines).filter(record=>record.event==='tool_request').at(-1);
+  };
+  const zero=recordFor('anthropic',{model:'deepseek-chat',messages:[{role:'user',content:[{type:'tool_result',is_error:false,content:`ERROR permission denied ${marker}`}]}]},1);
+  const one=recordFor('anthropic',{model:'deepseek-chat',messages:[{role:'user',content:[{type:'tool_result',is_error:true,content:marker}]}]},1);
+  const multiple=recordFor('anthropic',{model:'deepseek-chat',messages:[{role:'user',content:[
+    {type:'tool_result',is_error:false,content:marker},
+    {type:'tool_result',is_error:true,content:marker},
+    {type:'tool_result',is_error:true,content:marker},
+    {type:'tool_result',is_error:'true',content:marker},
+    {type:'tool_result',is_error:1,content:marker},
+  ]}]},5);
+  const openai=recordFor('openai',{model:'deepseek-chat',messages:[{role:'tool',is_error:true,content:marker}]},1);
+  const responses=recordFor('responses',{model:'deepseek-chat',input:[{type:'function_call_output',is_error:true,output:marker}]},1);
+  assert.deepEqual([zero.tool_result_count,zero.tool_result_error_count],[1,0]);
+  assert.deepEqual([one.tool_result_count,one.tool_result_error_count],[1,1]);
+  assert.deepEqual([multiple.tool_result_count,multiple.tool_result_error_count],[5,2]);
+  assert.equal(openai.tool_result_error_count,0);
+  assert.equal(responses.tool_result_error_count,0);
+  assert.equal(lines.join('\n').includes(marker),false);
+  assert.equal(lines.join('\n').includes('permission denied'),false);
 });
 
 function upstreamSessionResponse(id){return new Response(JSON.stringify({data:{biz_data:{id}}}),{status:200});}
@@ -2485,6 +2535,7 @@ test('server tool_response correlates accepted and content-shadowed parser inspe
   assert.equal(responses.length,2);
   assert.equal(responses[0].request_ref,requests[0].request_ref);
   assert.equal(responses[0].strict_tool_call_detected,true);
+  assert.equal(responses[0].selected_tool_name,'Glob');
   assert.equal(responses[0].tool_parse_source,'content');
   assert.equal(responses[0].tool_parse_reason,'accepted');
   assert.equal(responses[0].fenced_tool_retry_attempted,false);
@@ -2492,6 +2543,7 @@ test('server tool_response correlates accepted and content-shadowed parser inspe
   assert.equal(Object.prototype.hasOwnProperty.call(responses[0],'content_bytes'),false);
   assert.equal(responses[1].request_ref,requests[1].request_ref);
   assert.equal(responses[1].strict_tool_call_detected,false);
+  assert.equal(responses[1].selected_tool_name,'none');
   assert.equal(responses[1].tool_parse_source,'content');
   assert.equal(responses[1].tool_parse_reason,'invalid_json');
   assert.equal(responses[1].content_starts_with_brace,false);
@@ -2502,6 +2554,61 @@ test('server tool_response correlates accepted and content-shadowed parser inspe
   assert.equal(responses[1].outcome,'final_text');
   assert.equal(responses[1].fenced_tool_retry_attempted,false);
   assert.equal(responses[1].tool_retry_reason,'none');
+});
+
+test('accepted tool diagnostics expose the tool name without arguments or payload',async()=>{
+  const lines=[];
+  const fileMarker='SECRET_FILE_PATH_MARKER';
+  const contentMarker='TOP_SECRET_CONTENT_MARKER';
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>({
+    content:jsonToolCall('Write',{file_path:`C:\\private-project\\${fileMarker}.txt`,content:contentMarker}),
+    reasoning:'',parentMessageId:null,
+  })},async post=>{
+    const response=(await post('/v1/messages',{
+      model:'deepseek-chat',messages:[{role:'user',content:'offline safe selected tool'}],
+      tools:[{name:'Write',input_schema:{type:'object'}}],
+    })).json();
+    assert.equal(response.content[0].type,'tool_use');
+    assert.equal(response.content[0].name,'Write');
+  });
+  const response=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+  assert.equal(response.strict_tool_call_detected,true);
+  assert.equal(response.selected_tool_name,'Write');
+  const journal=lines.join('\n');
+  assert.equal(journal.includes(fileMarker),false);
+  assert.equal(journal.includes(contentMarker),false);
+  assert.doesNotMatch(journal,/"arguments":|"file_path":|"content":/);
+});
+
+test('Anthropic continuation diagnostics retain explicit tool result error count',async()=>{
+  const lines=[];
+  const resultMarker='ANTHROPIC_ERROR_RESULT_SECRET';
+  let calls=0;
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+    calls+=1;
+    return calls===1
+      ? {content:jsonToolCall('Read',{file_path:'synthetic.txt'}),reasoning:'',parentMessageId:'tool-parent'}
+      : {content:'handled tool error',reasoning:'',parentMessageId:'result-parent'};
+  }},async post=>{
+    const tools=[{name:'Read',input_schema:{type:'object'}}];
+    const first=(await post('/v1/messages',{model:'deepseek-chat',messages:[{role:'user',content:'offline error continuation'}],tools})).json();
+    const call=first.content[0];
+    assert.equal(call.type,'tool_use');
+    const second=(await post('/v1/messages',{model:'deepseek-chat',messages:[{role:'user',content:[{
+      type:'tool_result',tool_use_id:call.id,is_error:true,content:resultMarker,
+    }]}],tools})).json();
+    assert.equal(second.content[0].text,'handled tool error');
+  });
+  const records=diagnosticRecords(lines);
+  const requests=records.filter(record=>record.event==='tool_request');
+  const responses=records.filter(record=>record.event==='tool_response');
+  assert.equal(requests[0].tool_result_error_count,0);
+  assert.equal(requests[1].is_tool_continuation,true);
+  assert.equal(requests[1].tool_result_count,1);
+  assert.equal(requests[1].tool_result_error_count,1);
+  assert.equal(responses[0].selected_tool_name,'Read');
+  assert.equal(responses[1].selected_tool_name,'none');
+  assert.equal(lines.join('\n').includes(resultMarker),false);
 });
 
 test('fenced Glob content gets one correction and becomes an Anthropic tool_use',async()=>{

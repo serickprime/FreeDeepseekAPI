@@ -513,6 +513,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         : kind === 'responses' ? toResponses(openaiResponse, streamIdentity || {}) : openaiResponse;
       diagnosticResponse?.response({
         strictToolCallDetected: Boolean(toolCall),
+        selectedToolName: toolCall?.function?.name,
         reasoningNonempty: Boolean(String(output?.reasoning || '').trim()),
         contentNonempty: Boolean(String(output?.content || '').trim()),
         reasoningRetryAttempted,
