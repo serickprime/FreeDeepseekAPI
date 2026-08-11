@@ -344,6 +344,9 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         clientSessionKey: resolution.clientKey,
         isToolContinuation,
         toolResultCount: toolResults.length,
+        toolResultErrorCount: kind === 'anthropic'
+          ? toolResults.filter(result => result.isError === true).length
+          : 0,
         requestRef,
       });
       const onUpstreamStage = (stage, metadata = {}) => {
@@ -513,6 +516,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         : kind === 'responses' ? toResponses(openaiResponse, streamIdentity || {}) : openaiResponse;
       diagnosticResponse?.response({
         strictToolCallDetected: Boolean(toolCall),
+        selectedToolName: toolCall?.function?.name,
         reasoningNonempty: Boolean(String(output?.reasoning || '').trim()),
         contentNonempty: Boolean(String(output?.content || '').trim()),
         reasoningRetryAttempted,
