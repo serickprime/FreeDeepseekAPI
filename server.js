@@ -64,6 +64,7 @@ const STATIC_FILES = {
   '/setup/app.js': ['app.js', 'application/javascript; charset=utf-8'],
   '/setup/styles.css': ['styles.css', 'text/css; charset=utf-8'],
   '/setup/model-picker.css': ['model-picker.css', 'text/css; charset=utf-8'],
+  '/setup/assets/bridge-network-map.png': ['assets/bridge-network-map.png', 'image/png'],
 };
 
 function serveSetupAsset(res, pathname) {
@@ -323,7 +324,8 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         if (!setup.authorized(req.headers['x-setup-token'])) return sendError(res, 403, 'Setup action token is invalid.', 'authentication_error');
         const setupBody = await readBody(req, Math.min(config.maxBytes, 16 * 1024));
         const result = await setup.action(setupBody.action, { model: setupBody.model, workingDirectory: setupBody.workingDirectory });
-        return send(res, result.ok ? 200 : 400, result);
+        const validationAction = setupBody.action === 'validate-folder' || setupBody.action === 'browse-folders';
+        return send(res, result.ok || validationAction ? 200 : 400, result);
       }
 
       if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { status: 'ok', bind: config.host });
