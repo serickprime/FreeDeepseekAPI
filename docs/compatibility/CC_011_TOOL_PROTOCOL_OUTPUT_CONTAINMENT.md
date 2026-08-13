@@ -62,17 +62,19 @@ Finding: `CC-011 TOOL_PROTOCOL_OUTPUT_CONTAINMENT`
 
 `CC010_REGRESSION_EVIDENCE = NO`
 
-`BRIDGE_CONTAINMENT_DEFECT_EVIDENCE = YES`
+`BRIDGE_CONTAINMENT_DEFECT_EVIDENCE = NO; FIX VERIFIED`
 
-`PRODUCTION_FIX_REQUIRED = YES`
+`PRODUCTION_FIX_REQUIRED = NO`
 
 `CC011A_CLASSIFICATION = BRIDGE_CONTAINMENT_GAP`
 
 `CC011B_CLASSIFICATION = PROMPT_ECHO_NOT_CONTAINED`
 
-`CC011_CLASSIFICATION = CC_011_BRIDGE_DEFECT_CONFIRMED`
+`CC011_CLASSIFICATION = CC_011_FIXED`
 
-`NEXT_ACTION = separate CC-011 production fix; contain recognized internal protocol output independently of tool execution eligibility`
+`BRIDGE_CONTAINMENT_DEFECT_FIXED = YES`
+
+`NEXT_ACTION = merge the reviewed CC-011 production PR; no additional compatibility work in this scope`
 
 ## Executive summary
 
@@ -337,10 +339,142 @@ allowlist. CC-011 is a newly isolated non-executable containment boundary.
 - `PRODUCTION_FIX_REQUIRED = YES`.
 - `CC011_CLASSIFICATION = CC_011_BRIDGE_DEFECT_CONFIRMED`.
 
-## Next action
+## Pre-fix next action (historical)
 
-Open a separate CC-011 production-fix stage. Preserve the strict parser,
+The audit required a separate CC-011 production-fix stage. Its recorded
+constraints were to preserve the strict parser,
 current-request allowlist, one shared correction budget, and client-owned tool
 execution. Add narrowly tested protocol/prompt containment that remains active
-when execution eligibility is absent. Do not merge this audit branch and do
-not implement the fix in this investigation.
+when execution eligibility is absent. That stage is now implemented and
+verified below; these lines are retained as the historical audit decision.
+
+## Implemented production fix
+
+Implementation commit: `a322d76` (`fix: contain tool protocol output without
+execution rights`).
+
+Execution and containment now use separate gates:
+
+```text
+execution eligibility = strict name membership in current request tools only
+output containment = narrow private/tool-protocol output classifier
+```
+
+`lib/tool_containment.js` recognizes only the exact private prompt markers,
+the exact textual `[Tool Call]` transcript, whole/truncated canonical
+`tool_call` envelopes, and standalone envelopes with surrounding prose. It
+returns `correctable` only for a safe bounded name in the current allowlist;
+otherwise it returns `contain_only`. A private prompt marker is always
+`contain_only`, including output above the strict parser byte limit.
+
+`contain_only` produces the existing generic safe failure. It never creates a
+tool call, never starts a correction, and never retains or restores a previous
+allowlist. Raw output, arguments, paths, reasoning, prompt text, and inventory
+remain absent from the response and diagnostics.
+
+The session contains one boolean, `protocolContextSeen`. It records only that
+the same upstream Bridge session previously received a tool-protocol prompt.
+It stores no tool names, arguments, paths, or execution rights and expires or
+resets with that session.
+
+## Streaming strategy after fix
+
+Responses with current executable tools keep the existing full tool buffer.
+A later no-tool request on a protocol-sensitive upstream session is also
+buffered until final containment classification. This cannot enable execution
+because strict parsing still receives an empty current allowlist.
+
+A fresh ordinary no-tool stream remains incremental. The stream adapter holds
+only a bounded suffix capable of becoming one of four exact protocol markers.
+If a marker completes, output from the marker onward is quarantined pending
+final classification. Ordinary text before it remains streamed, and ordinary
+JSON/documentation stays visible. This avoids globally buffering no-tool chat
+while ensuring recognizable protocol material is never sent before the
+containment decision.
+
+## Regression coverage after fix
+
+The suite increased from 220 to 228 top-level tests and passes 228/228. New
+coverage includes:
+
+- no-tools valid, malformed Windows-path, prefixed, truncated, textual, and
+  historical-name tool protocol output;
+- private prompt echo in content or reasoning, including output above the
+  parser limit;
+- generic safe failure with one completion and no unauthorized `tool_use`;
+- current-tools CC-010 correction capped at two completions;
+- unknown names never executed;
+- ordinary JSON, explicit documentation, fenced examples, README/quoted
+  examples remain visible;
+- OpenAI, Anthropic, and Responses non-streaming containment;
+- the same three streaming adapters with normal incremental output and raw
+  protocol suppression;
+- a protocol-sensitive session followed by an explicit empty current
+  allowlist, with no historical tool restoration.
+
+All existing CC-010 fenced, prefixed, brace, malformed, repeated-tool,
+reasoning-only, continuation, adapter, diagnostics, and shared-budget tests
+remain passing. `lib/tool_parser.js` was not changed.
+
+## Controlled verification after fix
+
+### Run A — normal Claude Code lifecycle
+
+Claude Code version immediately before the invocation: `2.1.231`.
+
+One fresh foreground `deepseek-chat` invocation used a disposable read-only
+project and the fixed Bridge. It completed:
+
+```text
+Glob -> Read -> Read -> Read -> final
+```
+
+Claude reported four real tool results, all non-error, and exited successfully.
+No raw `[Tool Call]`, raw `tool_call`, internal prompt, or result error was
+visible. Harness retries were zero. The observer reducer had an instrumentation
+limitation: it matched only a query-free `/v1/messages` URL and therefore did
+not retain request/diagnostic counters for this run. The Claude structured
+event lifecycle remains direct evidence for normal flow; no replacement
+invocation was run.
+
+### Run B — empty-allowlist containment boundary
+
+Run B was a controlled Bridge harness, not a second Claude runtime proof. The
+same Bridge session first received a request with `Read`, then a streaming
+request with `tools=[]`. The second synthetic upstream response contained a
+recognizable raw `Read` envelope.
+
+```text
+CURRENT_ALLOWLIST_EMPTY = YES
+PROTOCOL_CONTEXT_SEEN = YES
+RAW_PROTOCOL_OUTPUT = NO
+TOOL_EXECUTION = NO
+SAFE_CONTAINMENT = YES
+COMPLETION_MAX = 1
+```
+
+The second request produced `safe_failure`, never an Anthropic `tool_use`.
+No historical allowlist was restored. Both harness runs used zero retries;
+owned ports, process, fixture, and temporary configuration were cleaned up.
+
+## Final classification after fix
+
+`RAW_TOOL_OUTPUT_EXPOSURE = NO`
+
+`INTERNAL_TOOL_PROMPT_EXPOSURE = NO`
+
+`OLD_ALLOWLIST_RESTORED = NO`
+
+`UNAUTHORIZED_TOOL_EXECUTION = NO`
+
+`NORMAL_TOOL_FLOW = PASS`
+
+`NORMAL_STREAMING_REGRESSION = NO`
+
+`MAX_COMPLETIONS = 2`
+
+`BRIDGE_CONTAINMENT_DEFECT_FIXED = YES`
+
+`PRODUCTION_FIX_REQUIRED = NO`
+
+`CC011_CLASSIFICATION = CC_011_FIXED`
