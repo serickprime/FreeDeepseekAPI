@@ -4604,3 +4604,58 @@ test('CC-011 protocol-sensitive session buffers later no-tool output without res
     assert.doesNotMatch(second,/tool_call|old\.txt|PRIVATE|"type":"tool_use"/);
   }finally{server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
 });
+
+test('CC-012 an allowed protocol intent cannot leak after the shared correction budget is spent',async()=>{
+  const rawGlob=[
+    'Сейчас посмотрю структуру.',
+    jsonToolCall('Glob',{pattern:'*'}),
+  ].join('\n');
+  const outputs=[
+    {content:'',reasoning:'Нужно запросить Glob.',parentMessageId:'first'},
+    {content:rawGlob,reasoning:'',parentMessageId:'second'},
+  ];
+  let calls=0;
+  const result=await toolRetryProxyCase({
+    path:'/v1/messages',
+    body:{
+      model:'deepseek-chat',stream:true,max_tokens:64,
+      messages:[{role:'user',content:'что это за проект'}],
+      tools:[{name:'Glob',input_schema:{type:'object'}}],
+    },
+    logger:()=>{},
+    completeImpl:async({onDelta})=>{
+      const output=outputs[calls++];
+      onDelta?.(output.content ? {content:output.content} : {reasoning:output.reasoning});
+      return output;
+    },
+  });
+  assert.equal(calls,MAX_COMPLETIONS);
+  assert.doesNotMatch(result.text,/"tool_call"|Сейчас посмотрю структуру/);
+  assert.doesNotMatch(result.text,/"type":"tool_use"/);
+  assert.match(result.text,new RegExp(TOOL_RETRY_FAILURE_MESSAGE.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')));
+});
+
+test('CC-012 final correctable protocol intent receives one strict correction instead of ordinary text',async()=>{
+  const rawGlob=`Сейчас посмотрю структуру.\n${jsonToolCall('Glob',{pattern:'*'})}\u200b`;
+  let calls=0;
+  const result=await toolRetryProxyCase({
+    path:'/v1/chat/completions',
+    body:{
+      model:'deepseek-chat',stream:false,
+      messages:[{role:'user',content:'посмотри структуру проекта'}],
+      tools:[{type:'function',function:{name:'Glob',parameters:{type:'object'}}}],
+    },
+    logger:()=>{},
+    completeImpl:async()=>{
+      calls+=1;
+      return calls===1
+        ? {content:rawGlob,reasoning:'',parentMessageId:'first'}
+        : {content:jsonToolCall('Glob',{pattern:'*'}),reasoning:'',parentMessageId:'second'};
+    },
+  });
+  const response=JSON.parse(result.text);
+  assert.equal(calls,MAX_COMPLETIONS);
+  assert.equal(response.choices[0].finish_reason,'tool_calls');
+  assert.equal(response.choices[0].message.tool_calls[0].function.name,'Glob');
+  assert.doesNotMatch(result.text,/Сейчас посмотрю структуру|\\u200b/);
+});
