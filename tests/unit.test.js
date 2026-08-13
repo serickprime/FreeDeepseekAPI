@@ -1,7 +1,7 @@
 'use strict';
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
-const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,clientSessionKey,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,inspectToolCall,inspectToolCallFromOutput,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { checked, complete, loadAuth, parseRetryAfter, parseStream }=client; const {createProxyServer,toAnthropic,toOpenAI,toResponses}=require('../server');
-const {TOOL_RETRY_FAILURE_MESSAGE,createFencedToolRetryPrompt,createToolRetryPrompt,hideRetryReasoning,shouldRetryBraceDelimitedToolLikeResponse,shouldRetryFencedToolResponse,shouldRetryPrefixedToolResponse,shouldRetryToolResponse}=require('../lib/tool_retry');
+const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,clientSessionKey,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,inspectToolCall,inspectToolCallFromOutput,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { checked, complete, loadAuth, parseRetryAfter, parseStream }=client; const {MAX_COMPLETIONS,createProxyServer,normalize,toAnthropic,toOpenAI,toResponses}=require('../server');
+const {TOOL_RETRY_FAILURE_MESSAGE,classifyMalformedToolIntent,createFencedToolRetryPrompt,createToolRetryPrompt,hideRetryReasoning,isSafeCorrectionFinalText,shouldRetryBraceDelimitedToolLikeResponse,shouldRetryFencedToolResponse,shouldRetryPrefixedToolResponse,shouldRetryToolResponse}=require('../lib/tool_retry');
 const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
 const {MAX_TOOL_NAMES,MAX_TOOL_NAME_CHARS,classifyUpstreamError,createToolDiagnostics}=require('../lib/tool_diagnostics');
 const {solvePOW}=require('../lib/pow');
@@ -544,11 +544,14 @@ test('fenced tool retry predicate accepts only the proven selected-content shape
 });
 test('prefixed tool retry predicate accepts only the proven non-fenced structural shape',()=>{
   const allowed=['Glob'];
-  const inspection=inspectToolCallFromOutput({
+  const output={
     content:prefixedToolCall('Tool request:','Glob',{pattern:'**/InteractiveStars.tsx'}),
     reasoning:'ordinary reasoning',
+  };
+  const inspection=inspectToolCallFromOutput({
+    ...output,
   },allowed);
-  const base={hasTools:true,toolCall:null,retryCount:0,inspection};
+  const base={hasTools:true,toolCall:null,retryCount:0,inspection,output,allowedNames:allowed};
   assert.equal(inspection.source,'content');
   assert.equal(inspection.reason,'invalid_json');
   assert.equal(inspection.metadata.content_starts_with_code_fence,false);
@@ -562,7 +565,7 @@ test('prefixed tool retry predicate accepts only the proven non-fenced structura
     reasoning:'',
   },allowed);
   assert.equal(bracketInspection.reason,'invalid_json');
-  assert.equal(shouldRetryPrefixedToolResponse({...base,inspection:bracketInspection}),true);
+  assert.equal(shouldRetryPrefixedToolResponse({...base,inspection:bracketInspection,output:{content:`[\u8c03\u7528 Glob] ${jsonToolCall('Glob',{pattern:'**/InteractiveStars.tsx'})}`,reasoning:''}}),true);
 
   const negatives=[
     {...base,hasTools:false},
@@ -576,6 +579,11 @@ test('prefixed tool retry predicate accepts only the proven non-fenced structura
     {...base,inspection:{...inspection,metadata:{...inspection.metadata,content_starts_with_brace:true}}},
     {...base,inspection:{...inspection,metadata:{...inspection.metadata,content_ends_with_brace:false}}},
     {...base,inspection:{...inspection,metadata:{...inspection.metadata,content_contains_tool_call_marker:false}}},
+    {...base,output:{content:`Here is an example:\n${jsonToolCall('Glob',{})}`,reasoning:''}},
+    {...base,output:{content:`Вот пример:\n${jsonToolCall('Glob',{})}`,reasoning:''}},
+    {...base,output:{content:`> ${jsonToolCall('Glob',{})}`,reasoning:''}},
+    {...base,output:{content:`\`inline ${jsonToolCall('Glob',{})}\``,reasoning:''}},
+    {...base,output:{content:prefixedToolCall('Tool request:','Unknown',{}),reasoning:''},allowedNames:allowed},
   ];
   for(const item of negatives)assert.equal(shouldRetryPrefixedToolResponse(item),false);
 });
@@ -3543,8 +3551,9 @@ test('brace recovery remains functional with diagnostics disabled and a throwing
   assert.equal(loggerCalls,2);
 });
 
-test('rejected parser diagnostics expose no content, paths, URLs or tool arguments',async()=>{
+test('recognized suffixed tool intent exposes no content, paths, URLs or tool arguments',async()=>{
   const lines=[];
+  let calls=0;
   const rejected=[
     '[https://secret.example/private?token=TOPSECRET](https://secret.example/private?token=TOPSECRET)',
     'C:\\Users\\Sensitive\\private.txt',
@@ -3552,16 +3561,20 @@ test('rejected parser diagnostics expose no content, paths, URLs or tool argumen
     '{"tool_call":{"name":"Glob","arguments":{"path":"D:\\\\secret-project"}}}',
     'trailing ordinary text',
   ].join('\n');
-  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>({content:rejected,reasoning:'',parentMessageId:null})},async post=>{
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{calls+=1;return {content:rejected,reasoning:'',parentMessageId:null};}},async post=>{
     const response=(await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}],tools:[{type:'function',function:{name:'Glob',parameters:{type:'object'}}}]})).json();
-    assert.equal(response.choices[0].message.content,rejected);
+    assert.equal(response.choices[0].message.content,TOOL_RETRY_FAILURE_MESSAGE);
   });
+  assert.equal(calls,2);
   const records=diagnosticRecords(lines);
   const response=records.find(record=>record.event==='tool_response');
   assert.equal(response.tool_parse_source,'content');
   assert.equal(response.tool_parse_reason,'invalid_json');
   assert.equal(response.content_contains_tool_call_marker,true);
   assert.ok(response.content_bytes>0);
+  assert.equal(response.tool_retry_reason,'malformed_tool_envelope');
+  assert.equal(response.tool_correction_attempted,true);
+  assert.equal(response.completion_count,2);
   const journal=lines.join('\n');
   for(const forbidden of ['TOPSECRET','Sensitive','VERYSECRET','secret-project','secret.example','Bearer']){
     assert.equal(journal.includes(forbidden),false,forbidden);
@@ -3965,4 +3978,360 @@ test('Claude 2.1.226 exposure records omit request bodies and identifier values'
     'request_number','request_kind','tools_field_present','tools_field_type','tool_count',
     'tool_names','model','stream','tool_result_count','claude_session_header_present',
   ]);
+});
+
+function cc010Intent(content,allowedNames=['Read','Glob']){
+  const output={content,reasoning:''};
+  const inspection=inspectToolCallFromOutput(output,allowedNames);
+  return {
+    inspection,
+    intent:classifyMalformedToolIntent({
+      hasTools:true,
+      toolCall:inspection.toolCall,
+      retryCount:0,
+      inspection,
+      output,
+      allowedNames,
+    }),
+  };
+}
+
+const textualToolTranscript=(name='Read',args={file_path:'X'},callId='')=>[
+  '[Tool Call]',
+  `name: ${name}`,
+  callId?`call_id: ${callId}`:'',
+  `arguments: ${JSON.stringify(args)}`,
+].filter(Boolean).join('\n');
+
+const multipleToolLikeText=()=>[
+  'Я прочитаю файлы.',
+  '',
+  jsonToolCall('Read',{file_path:'X'}),
+  jsonToolCall('Glob',{pattern:'**/*.ts'}),
+  '',
+  '**',
+].join('\n');
+
+test('CC-010 historical tool invocations use one neutral non-output transcript across adapters',()=>{
+  const session={toolCalls:new Map([['call_history',{name:'Read',arguments:'{"file_path":"X"}'}]])};
+  const cases=[
+    normalize({
+      model:'deepseek-chat',
+      messages:[
+        {role:'assistant',tool_calls:[{id:'call_history',type:'function',function:{name:'Read',arguments:'{"file_path":"X"}'}}]},
+        {role:'tool',tool_call_id:'call_history',name:'Read',content:'historical result'},
+      ],
+    },'openai',session).prompt,
+    normalize({
+      model:'deepseek-chat',
+      messages:[
+        {role:'assistant',content:[{type:'tool_use',id:'call_history',name:'Read',input:{file_path:'X'}}]},
+        {role:'user',content:[{type:'tool_result',tool_use_id:'call_history',content:'historical result'}]},
+      ],
+    },'anthropic',session).prompt,
+    normalize({
+      model:'deepseek-chat',
+      input:[
+        {type:'function_call',call_id:'call_history',name:'Read',arguments:'{"file_path":"X"}'},
+        {type:'function_call_output',call_id:'call_history',output:'historical result'},
+      ],
+    },'responses',session).prompt,
+  ];
+  for(const prompt of cases){
+    assert.match(prompt,/\[Historical Action Record: already requested by the assistant\]/);
+    assert.match(prompt,/tool_name_data: "Read"/);
+    assert.match(prompt,/correlation_id_data: "call_history"/);
+    assert.match(prompt,/arguments_data: {"file_path":"X"}/);
+    assert.match(prompt,/\[Tool Result\]/);
+    assert.match(prompt,/historical result/);
+    assert.doesNotMatch(prompt,/\[Tool Call\]/);
+    assert.doesNotMatch(prompt,/"tool_call"/);
+  }
+});
+
+test('CC-010 textual Tool Call transcript is rejected strictly and classified without executable arguments',()=>{
+  const content=textualToolTranscript('Read',{file_path:'X'},'call_textual');
+  const {inspection,intent}=cc010Intent(content,['Read']);
+  assert.equal(inspection.toolCall,null);
+  assert.equal(inspection.reason,'invalid_json');
+  assert.deepEqual(intent,{structuralClass:'textual_tool_transcript',action:'correct',mentionedToolName:'Read'});
+  assert.equal(Object.hasOwn(intent,'arguments'),false);
+  assert.deepEqual(classifyMalformedToolIntent({
+    hasTools:true,toolCall:null,retryCount:1,inspection,output:{content,reasoning:''},allowedNames:['Read'],
+  }),{structuralClass:'none',action:'none',mentionedToolName:''});
+  assert.equal(cc010Intent('[Tool Call]\nname: Read\narguments: {malformed',['Read']).intent.action,'correct');
+  assert.equal(cc010Intent(textualToolTranscript('Read',{file_path:'README.md'}),['Read']).intent.action,'correct');
+});
+
+test('CC-010 multiple envelopes and suffix text are correction signals but never parsed as calls',()=>{
+  const multiple=cc010Intent(multipleToolLikeText());
+  assert.equal(multiple.inspection.toolCall,null);
+  assert.equal(multiple.inspection.reason,'invalid_json');
+  assert.deepEqual(multiple.intent,{structuralClass:'multi_tool_like',action:'correct',mentionedToolName:''});
+
+  const suffixed=cc010Intent(`${jsonToolCall('Read',{file_path:'X'})}\nadditional suffix`);
+  assert.equal(suffixed.inspection.toolCall,null);
+  assert.deepEqual(suffixed.intent,{structuralClass:'malformed_tool_envelope',action:'correct',mentionedToolName:'Read'});
+});
+
+test('CC-010 malformed valid-JSON envelopes receive only narrow correction classification',()=>{
+  const cases=[
+    ['arguments string','{"tool_call":{"name":"Read","arguments":"{\\"file_path\\":\\"X\\"}"}}','arguments_not_object'],
+    ['arguments null','{"tool_call":{"name":"Read","arguments":null}}','arguments_not_object'],
+    ['unexpected envelope field','{"tool_call":{"name":"Read","arguments":{}},"extra":true}','unexpected_envelope_keys'],
+    ['wrong args field','{"tool_call":{"name":"Read","args":{"file_path":"X"}}}','invalid_tool_shape'],
+    ['spilled parameter','{"tool_call":{"name":"Read","arguments":{},"file_path":"X"}}','invalid_tool_shape'],
+    ['merged field name','{"tool_call":{"name":"Read","argumentsfile_path":"X"}}','invalid_tool_shape'],
+    ['truncated argument JSON','{"tool_call":{"name":"Read","arguments":{"file_path":"X"','invalid_json'],
+  ];
+  for(const [label,content,reason] of cases){
+    const {inspection,intent}=cc010Intent(content,['Read']);
+    assert.equal(inspection.toolCall,null,label);
+    assert.equal(inspection.reason,reason,label);
+    assert.deepEqual(intent,{structuralClass:'malformed_tool_envelope',action:'correct',mentionedToolName:'Read'},label);
+  }
+  const unknown=cc010Intent(jsonToolCall('UnavailableTool',{}),['Read']);
+  assert.equal(unknown.inspection.reason,'tool_not_allowed');
+  assert.deepEqual(unknown.intent,{structuralClass:'malformed_tool_envelope',action:'reject',mentionedToolName:''});
+});
+
+test('CC-010 negative controls never enter corrective malformed classification',()=>{
+  const negative=[
+    `\`\`\`json\n${jsonToolCall('Read',{})}\n\`\`\``,
+    `Inline example: \`${jsonToolCall('Read',{})}\``,
+    `README documentation:\n${textualToolTranscript('Read',{})}`,
+    `Discussion of the words [Tool Call] without a request.`,
+    `> ${textualToolTranscript('Read',{}).replaceAll('\n','\n> ')}`,
+    'ordinary prose without structural tool intent',
+    '{"ordinary":"json"}',
+    `JSON tutorial:\n${jsonToolCall('Read',{})}`,
+    `Вот пример:\n${jsonToolCall('Read',{})}`,
+    '{"toolCall":{"name":"Read","arguments":{}}}',
+  ];
+  for(const content of negative){
+    assert.equal(cc010Intent(content,['Read']).intent.action,'none',content);
+  }
+  const strict=cc010Intent(jsonToolCall('Read',{}),['Read']);
+  assert.equal(strict.inspection.reason,'accepted');
+  assert.equal(strict.intent.action,'none');
+  const unavailable=cc010Intent(textualToolTranscript('UnavailableTool',{}),['Read']);
+  assert.equal(unavailable.intent.action,'reject');
+  assert.equal(unavailable.intent.mentionedToolName,'');
+});
+
+test('CC-010 textual transcript gets one correction and safe bounded diagnostics',async()=>{
+  const lines=[];
+  const calls=[];
+  const rejectedPath='PRIVATE_CC010_TEXTUAL_PATH';
+  let responseText='';
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async options=>{
+    calls.push(options);
+    return calls.length===1
+      ? {content:textualToolTranscript('Read',{file_path:rejectedPath},'call_private'),reasoning:'PRIVATE_CC010_REASONING',parentMessageId:'one'}
+      : {content:jsonToolCall('Read',{file_path:'safe.txt'}),reasoning:'',parentMessageId:'two'};
+  }},async post=>{
+    responseText=(await post('/v1/messages',{
+      model:'deepseek-reasoner',max_tokens:128,messages:[{role:'user',content:'read synthetic fixture'}],
+      tools:[{name:'Read',input_schema:{type:'object'}}],
+    })).text;
+  });
+  assert.equal(MAX_COMPLETIONS,2);
+  assert.equal(calls.length,MAX_COMPLETIONS);
+  assert.equal(calls[1].session,calls[0].session);
+  assert.match(calls[1].prompt,/exactly one strict JSON tool call/);
+  assert.doesNotMatch(calls[1].prompt,/PRIVATE_CC010_TEXTUAL_PATH|PRIVATE_CC010_REASONING|call_private/);
+  const response=JSON.parse(responseText);
+  assert.equal(response.stop_reason,'tool_use');
+  assert.equal(response.content[0].name,'Read');
+  assert.deepEqual(response.content[0].input,{file_path:'safe.txt'});
+  const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+  assert.equal(diagnostic.tool_retry_reason,'textual_tool_transcript');
+  assert.equal(diagnostic.tool_correction_attempted,true);
+  assert.equal(diagnostic.tool_structural_class,'textual_tool_transcript');
+  assert.equal(diagnostic.mentioned_tool_name,'Read');
+  assert.equal(diagnostic.completion_count,2);
+  assert.equal(diagnostic.strict_tool_call_detected,true);
+  assert.equal(diagnostic.outcome,'tool_call');
+  assert.doesNotMatch(`${responseText}\n${lines.join('\n')}`,/PRIVATE_CC010_TEXTUAL_PATH|PRIVATE_CC010_REASONING|call_private/);
+});
+
+test('CC-010 failed textual correction suppresses both malformed payloads and stops at two completions',async()=>{
+  const lines=[];
+  let calls=0;
+  const firstSecret='CC010_FIRST_RAW_SECRET';
+  const secondSecret='CC010_SECOND_RAW_SECRET';
+  let responseText='';
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+    calls+=1;
+    return calls===1
+      ? {content:textualToolTranscript('Read',{file_path:firstSecret}),reasoning:'',parentMessageId:'one'}
+      : {content:`prose\n${jsonToolCall('Read',{file_path:secondSecret})}\nsuffix`,reasoning:'SECOND_PRIVATE_REASONING',parentMessageId:'two'};
+  }},async post=>{
+    responseText=(await post('/v1/chat/completions',{
+      model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}],
+      tools:[{type:'function',function:{name:'Read',parameters:{type:'object'}}}],
+    })).text;
+  });
+  assert.equal(calls,MAX_COMPLETIONS);
+  assert.equal(JSON.parse(responseText).choices[0].message.content,TOOL_RETRY_FAILURE_MESSAGE);
+  assert.doesNotMatch(`${responseText}\n${lines.join('\n')}`,/CC010_FIRST_RAW_SECRET|CC010_SECOND_RAW_SECRET|SECOND_PRIVATE_REASONING|\[Tool Call\]/);
+  const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+  assert.equal(diagnostic.tool_retry_reason,'textual_tool_transcript');
+  assert.equal(diagnostic.tool_correction_attempted,true);
+  assert.equal(diagnostic.completion_count,2);
+  assert.equal(diagnostic.outcome,'safe_failure');
+});
+
+test('CC-010 correction may return marker-free final text but never tool-like text',async()=>{
+  assert.equal(isSafeCorrectionFinalText(
+    {content:'safe final answer',reasoning:'hidden'},
+    inspectToolCallFromOutput({content:'safe final answer',reasoning:'hidden'},['Read']),
+  ),true);
+  assert.equal(isSafeCorrectionFinalText(
+    {content:'[Tool Call]\nname: Read\narguments: {}',reasoning:''},
+    inspectToolCallFromOutput({content:'[Tool Call]\nname: Read\narguments: {}',reasoning:''},['Read']),
+  ),false);
+  let calls=0;
+  const result=await toolRetryProxyCase({
+    body:{model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}],tools:[{type:'function',function:{name:'Read'}}]},
+    logger:()=>{},
+    completeImpl:async()=>{
+      calls+=1;
+      return calls===1
+        ? {content:textualToolTranscript('Read',{file_path:'X'}),reasoning:'',parentMessageId:'one'}
+        : {content:'safe final answer',reasoning:'PRIVATE_FINAL_REASONING',parentMessageId:'two'};
+    },
+  });
+  assert.equal(calls,2);
+  const response=JSON.parse(result.text);
+  assert.equal(response.choices[0].finish_reason,'stop');
+  assert.equal(response.choices[0].message.content,'safe final answer');
+  assert.equal(response.choices[0].message.reasoning_content,undefined);
+});
+
+test('CC-010 streaming buffers textual malformed output and emits only corrected tool events',async()=>{
+  let calls=0;
+  const rejectedSecret='CC010_STREAM_TEXTUAL_SECRET';
+  const result=await toolRetryProxyCase({
+    path:'/v1/messages',
+    body:{
+      model:'deepseek-chat',stream:true,max_tokens:64,messages:[{role:'user',content:'read'}],
+      tools:[{name:'Read',input_schema:{type:'object'}}],
+    },
+    logger:()=>{},
+    completeImpl:async({onDelta})=>{
+      calls+=1;
+      const content=calls===1
+        ? textualToolTranscript('Read',{file_path:rejectedSecret})
+        : jsonToolCall('Read',{file_path:'safe.txt'});
+      onDelta?.({content});
+      return {content,reasoning:'',parentMessageId:String(calls)};
+    },
+  });
+  assert.equal(calls,2);
+  assert.match(result.contentType,/^text\/event-stream/);
+  assert.match(result.text,/"type":"tool_use"/);
+  assert.doesNotMatch(result.text,/CC010_STREAM_TEXTUAL_SECRET|\[Tool Call\]|"tool_call"/);
+  assert.equal((result.text.match(/event: message_stop/g)||[]).length,1);
+});
+
+test('CC-010 multi-tool-like recovery uses existing OpenAI and Responses adapters without extraction',async()=>{
+  const cases=[
+    {
+      path:'/v1/chat/completions',
+      body:{model:'deepseek-chat',messages:[{role:'user',content:'inspect'}],tools:[{type:'function',function:{name:'Read'}},{type:'function',function:{name:'Glob'}}]},
+      assertResponse:response=>assert.equal(response.choices[0].message.tool_calls[0].function.name,'Read'),
+    },
+    {
+      path:'/v1/responses',
+      body:{model:'deepseek-chat',input:'inspect',tools:[{type:'function',name:'Read',parameters:{type:'object'}},{type:'function',name:'Glob',parameters:{type:'object'}}]},
+      assertResponse:response=>assert.equal(response.output[0].name,'Read'),
+    },
+  ];
+  for(const item of cases){
+    let calls=0;
+    const result=await toolRetryProxyCase({path:item.path,body:item.body,logger:()=>{},completeImpl:async()=>{
+      calls+=1;
+      return calls===1
+        ? {content:multipleToolLikeText(),reasoning:'',parentMessageId:'one'}
+        : {content:jsonToolCall('Read',{file_path:'safe.txt'}),reasoning:'',parentMessageId:'two'};
+    }});
+    assert.equal(calls,2,item.path);
+    item.assertResponse(JSON.parse(result.text));
+  }
+});
+
+test('CC-010 malformed argument matrix corrects through the strict parser without local repair',async()=>{
+  const malformed=[
+    '{"tool_call":{"name":"Read","arguments":"X"}}',
+    '{"tool_call":{"name":"Read","arguments":null}}',
+    '{"tool_call":{"name":"Read","arguments":{}},"extra":true}',
+    '{"tool_call":{"name":"Read","args":{"file_path":"X"}}}',
+    '{"tool_call":{"name":"Read","arguments":{},"file_path":"X"}}',
+    '{"tool_call":{"name":"Read","argumentsfile_path":"X"}}',
+    '{"tool_call":{"name":"Read","arguments":{"file_path":"X"',
+  ];
+  for(const content of malformed){
+    let calls=0;
+    const result=await toolRetryProxyCase({
+      body:{model:'deepseek-chat',messages:[{role:'user',content:'read'}],tools:[{type:'function',function:{name:'Read'}}]},
+      logger:()=>{},
+      completeImpl:async()=>{
+        calls+=1;
+        return calls===1
+          ? {content,reasoning:'',parentMessageId:'one'}
+          : {content:jsonToolCall('Read',{file_path:'safe.txt'}),reasoning:'',parentMessageId:'two'};
+      },
+    });
+    assert.equal(calls,2,content);
+    const response=JSON.parse(result.text);
+    assert.equal(response.choices[0].finish_reason,'tool_calls',content);
+    assert.equal(response.choices[0].message.tool_calls[0].function.arguments,'{"file_path":"safe.txt"}',content);
+  }
+});
+
+test('CC-010 unknown tool intent is safely rejected without a correction or raw exposure',async()=>{
+  const lines=[];
+  let calls=0;
+  const rawSecret='UNKNOWN_TOOL_RAW_SECRET';
+  let responseText='';
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>{
+    calls+=1;
+    return {content:jsonToolCall('UnavailableTool',{path:rawSecret}),reasoning:'UNKNOWN_PRIVATE_REASONING',parentMessageId:'one'};
+  }},async post=>{
+    responseText=(await post('/v1/chat/completions',{
+      model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}],tools:[{type:'function',function:{name:'Read'}}],
+    })).text;
+  });
+  assert.equal(calls,1);
+  assert.equal(JSON.parse(responseText).choices[0].message.content,TOOL_RETRY_FAILURE_MESSAGE);
+  assert.doesNotMatch(`${responseText}\n${lines.join('\n')}`,/UnavailableTool|UNKNOWN_TOOL_RAW_SECRET|UNKNOWN_PRIVATE_REASONING/);
+  const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+  assert.equal(diagnostic.tool_retry_reason,'malformed_tool_envelope');
+  assert.equal(diagnostic.tool_correction_attempted,false);
+  assert.equal(diagnostic.tool_structural_class,'malformed_tool_envelope');
+  assert.equal(diagnostic.mentioned_tool_name,'none');
+  assert.equal(diagnostic.completion_count,1);
+  assert.equal(diagnostic.outcome,'safe_failure');
+});
+
+test('CC-010 explicit file guidance improves selection instructions without forcing every request',async()=>{
+  const calls=[];
+  const fixturePath='C:\\synthetic-cc010-fixture\\marker.txt';
+  const result=await toolRetryProxyCase({
+    body:{
+      model:'deepseek-chat',
+      messages:[{role:'user',content:`Read exactly ${fixturePath} and report its marker.`}],
+      tools:[{type:'function',function:{name:'Read',description:'Read a file',parameters:{type:'object'}}}],
+    },
+    logger:()=>{},
+    completeImpl:async options=>{calls.push(options);return {content:'ordinary model-selected final text',reasoning:'',parentMessageId:'one'};},
+  });
+  assert.equal(calls.length,1);
+  assert.match(calls[0].prompt,/If the task depends on information available only through an appropriate available tool, request that tool before answering\./);
+  assert.match(calls[0].prompt,/Do not claim that a file, project, or data is unavailable before attempting the appropriate available tool\./);
+  assert.match(calls[0].prompt,/synthetic-cc010-fixture/);
+  const response=JSON.parse(result.text);
+  assert.equal(response.choices[0].finish_reason,'stop');
+  assert.equal(response.choices[0].message.tool_calls,undefined);
 });

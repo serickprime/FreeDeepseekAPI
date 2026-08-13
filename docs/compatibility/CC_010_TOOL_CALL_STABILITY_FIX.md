@@ -10,7 +10,7 @@ Baseline main: `94f935527bfa8a2ba91fcabcfd7f3ad0fcd3b677`
 
 Branch: `fix/cc-010-tool-call-stability`
 
-Status: `DOCUMENTED_BEFORE_IMPLEMENTATION`
+Status: `IMPLEMENTED_OFFLINE_VERIFIED; CONTROLLED_LIVE_PENDING`
 
 Baseline validation: `npm.cmd test` 202/202 PASS; the required five
 `node --check` commands and `git diff --check` PASS.
@@ -319,12 +319,85 @@ run for a better result.
 
 ## Implemented changes
 
-Not implemented yet. This section will be updated in the production
-implementation commit.
+### Neutral historical action records
+
+OpenAI `tool_calls`, Anthropic `tool_use`, and Responses `function_call`
+history now use one neutral non-output transcript:
+
+```text
+[Historical Action Record: already requested by the assistant]
+tool_name_data: "Read"
+correlation_id_data: "call_..."
+arguments_data: {"file_path":"X"}
+[End Historical Action Record]
+```
+
+The historical representation contains neither `[Tool Call]` nor a canonical
+`"tool_call"` output envelope. Valid string arguments are parsed only for
+safe historical serialization; they are not parsed into an executable call.
+Tool name, arguments, correlation ID, and adjacent tool-result data remain in
+the normalized prompt. Stored `session.toolCalls`, call-ID binding,
+continuation, and exact-repeat protection are unchanged.
+
+### Narrow rejected-output classification
+
+`lib/tool_retry.js` now classifies only selected model `content` rejected by
+the existing strict parser:
+
+- `textual_tool_transcript` recognizes the exact standalone `[Tool Call]`,
+  bounded `name:`, optional bounded `call_id:`, and single-line
+  `arguments:` transcript;
+- `multi_tool_like` recognizes at least two standalone exact canonical
+  envelope lines with allowed bounded names, including the observed prose and
+  suffix fixture;
+- `malformed_tool_envelope` recognizes one standalone envelope with
+  surrounding non-documentation text, an exact whole-response `tool_call`
+  envelope rejected for a narrow strict-shape reason, or a narrowly anchored
+  truncated canonical prefix.
+
+These classifiers return only a structural class, an action, and at most one
+safe allowed tool name. They do not return arguments and do not create a tool
+call. Allowed classes receive one static correction prompt. A corrective tool
+request must pass the unchanged `inspectToolCallFromOutput()` path; a
+marker-free ordinary final text answer is also allowed. A second malformed or
+tool-like response is replaced with the generic safe failure. Unknown names
+and recognized unsafe/non-correctable envelope failures receive the generic
+safe failure without execution.
+
+The pre-existing CC-001 prefixed predicate was narrowed just enough to exclude
+code/quote/documentation/example contexts and unavailable names while
+preserving the confirmed arbitrary-prefix and `[调用 Name]` fixtures.
+
+### Shared completion budget and anti-leak behavior
+
+`server.js` now enforces `MAX_COMPLETIONS = 2` around every upstream
+completion. Existing fenced, prefixed, brace, reasoning-only, repeated-tool,
+and all CC-010 classes share the same `correctionAttempted` state. A failed
+CC-010 correction is replaced with the existing generic safe failure; neither
+the first nor second malformed output is returned. Buffered streaming emits
+only the corrected protocol event or safe final failure.
+
+### Guidance and diagnostics
+
+`toolPrompt()` now tells the model to request an appropriate available tool
+when the task depends on tool-only information and not to claim that a file,
+project, or data is unavailable before attempting that tool. This remains
+guidance and does not force tool selection.
+
+Opt-in bounded response diagnostics now add:
+
+- `tool_correction_attempted`;
+- `tool_structural_class`;
+- `mentioned_tool_name` (only a safe allowed name or `none` from the server);
+- `completion_count`, capped at two.
+
+The safe retry reasons include `textual_tool_transcript`, `multi_tool_like`,
+and `malformed_tool_envelope`. Raw output, arguments, paths, prompts, and
+reasoning are not added to diagnostics.
 
 ## Rejected alternatives
 
-Provisionally rejected before implementation:
+Rejected for this implementation:
 
 - arbitrary JSON extraction;
 - JSON5 or `jsonrepair`;
@@ -333,14 +406,41 @@ Provisionally rejected before implementation:
 - DSML migration;
 - direct execution of multiple textual tool calls.
 
-The final implementation document will record any additional rejected design
-alternatives and the test evidence supporting the selected history format.
+Canonical executable-looking history was also rejected in favor of the
+neutral record because it would retain imitation pressure. Arbitrary regular
+expression extraction and permissive alias parsing were rejected because they
+could turn documentation or unrelated JSON into executable intent. Direct
+conversion of `[Tool Call]` was rejected because only a fresh strict model
+completion may create a Claude tool event.
 
 ## Regression coverage
 
-Pending implementation. The existing 202-test baseline includes strict parser,
-CC-001 fenced/prefixed/brace recovery, shared-budget, continuation,
-exact-repeat, adapters, streaming, diagnostics, and payload-isolation tests.
+The offline suite increased from 202 to 215 top-level tests. Added coverage
+proves:
+
+- neutral historical serialization with preserved name, arguments, ID, and
+  result semantics for OpenAI, Anthropic, and Responses;
+- strict rejection plus narrow classification of exact textual `[Tool Call]`;
+- prose, multiple envelopes, one-envelope suffixes, and arbitrary suffixes;
+- string/null arguments, unexpected envelope keys, `args`, spilled
+  parameters, merged fields, truncated JSON, and unknown names;
+- one corrective completion through the strict parser, generic failure after
+  a failed correction, safe marker-free final text, and no local repair or
+  multi-call extraction;
+- negative controls for fences, inline code, documentation, README content,
+  Markdown quotations, `[Tool Call]` discussion, quoted failures, normal
+  prose, arbitrary JSON, tutorials, wrong top-level aliases, unavailable
+  tools, and already-valid canonical calls;
+- safe diagnostics, payload/path/reasoning suppression, and a hard maximum of
+  two completions;
+- buffered streaming suppression for textual malformed output;
+- recovery through Anthropic, OpenAI, and Responses adapters;
+- explicit-file guidance without forcing tool selection.
+
+All pre-existing CC-001 fenced/prefixed/brace, correction-order, raw-payload
+suppression, continuation, exact-repeat, adapter, and streaming regressions
+remain passing. Existing CC-005 semantics remain unchanged: ordinary model
+final text is not converted into a forced tool call.
 
 ## Remaining limitations
 
@@ -354,5 +454,11 @@ exact-repeat, adapters, streaming, diagnostics, and payload-isolation tests.
 
 ## Final status
 
-Pending implementation, offline validation, controlled live verification,
-PR review, and merge decision.
+Implementation and offline verification: PASS (`npm.cmd test` 215/215; all
+required syntax and diff checks PASS).
+
+The confirmed history/output inconsistency and bounded Bridge recovery gaps
+are fixed offline. The causal claim that historical `[Tool Call]` imitation
+pressure changes live model behavior remains a hypothesis. Controlled live
+verification, PR review, and merge decision are still pending. No CC-006 or
+CC-008 work has started.

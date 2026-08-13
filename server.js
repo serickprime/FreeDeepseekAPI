@@ -10,14 +10,18 @@ const { SessionResolver } = require('./lib/session_resolver');
 const { inspectToolCallFromOutput, toolPrompt } = require('./lib/tool_parser');
 const {
   braceToolFailure,
+  classifyMalformedToolIntent,
   createFencedToolRetryPrompt,
   createToolRetryPrompt,
   fencedToolFailure,
   hideRetryReasoning,
+  isSafeCorrectionFinalText,
   logBraceToolRetry,
   logFencedToolRetry,
+  logMalformedToolRetry,
   logPrefixedToolRetry,
   logToolRetry,
+  malformedToolFailure,
   prefixedToolFailure,
   shouldRetryBraceDelimitedToolLikeResponse,
   shouldRetryFencedToolResponse,
@@ -38,6 +42,8 @@ const { estimateTokenCount, validateCountTokensBody } = require('./lib/token_cou
 const { createSetupController } = require('./lib/setup');
 const { MODELS } = require('./lib/models');
 const { complete } = require('./client');
+
+const MAX_COMPLETIONS = 2;
 
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...headers });
@@ -125,8 +131,15 @@ function forgetCompletedToolCalls(session, callIds) {
   for (const callId of Array.isArray(callIds) ? callIds : []) session.toolCalls.delete(callId);
 }
 
-function toolCallText(name, callId, argumentsValue) {
-  return `[Tool Call]\nname: ${name || 'unknown'}\ncall_id: ${callId || 'unknown'}\narguments: ${structuredText(argumentsValue)}`;
+function historicalToolInvocationText(name, callId, argumentsValue) {
+  let serializedArguments;
+  if (typeof argumentsValue === 'string') {
+    try { serializedArguments = structuredText(JSON.parse(argumentsValue)); }
+    catch { serializedArguments = JSON.stringify(argumentsValue); }
+  } else {
+    serializedArguments = structuredText(argumentsValue);
+  }
+  return `[Historical Action Record: already requested by the assistant]\ntool_name_data: ${JSON.stringify(String(name || 'unknown'))}\ncorrelation_id_data: ${JSON.stringify(String(callId || 'unknown'))}\narguments_data: ${serializedArguments}\n[End Historical Action Record]`;
 }
 
 function toolResultText(name, callId, result) {
@@ -144,7 +157,7 @@ function openAIMessageText(message, session) {
   if (content) parts.push(`${role}: ${content}`);
   for (const call of Array.isArray(message?.tool_calls) ? message.tool_calls : []) {
     const callId = call?.id || '';
-    parts.push(`${role}: ${toolCallText(call?.function?.name || sessionToolName(session, callId), callId, call?.function?.arguments)}`);
+    parts.push(`${role}: ${historicalToolInvocationText(call?.function?.name || sessionToolName(session, callId), callId, call?.function?.arguments)}`);
   }
   return parts.join('\n');
 }
@@ -154,7 +167,7 @@ function anthropicMessageText(message, session) {
   return message.content.map(block => {
     if (!block || typeof block !== 'object') return '';
     if (block.type === 'text' || block.type === 'thinking') return text(block.text || block.thinking);
-    if (block.type === 'tool_use') return toolCallText(block.name, block.id, block.input);
+    if (block.type === 'tool_use') return historicalToolInvocationText(block.name, block.id, block.input);
     if (block.type === 'tool_result') return toolResultText(sessionToolName(session, block.tool_use_id), block.tool_use_id, text(block.content));
     return '';
   }).filter(Boolean).join('\n');
@@ -170,7 +183,7 @@ function responsesInputText(input, session) {
   return input.map(item => {
     if (typeof item === 'string') return item;
     if (!item || typeof item !== 'object') return '';
-    if (item.type === 'function_call') return toolCallText(item.name, item.call_id || item.id, item.arguments);
+    if (item.type === 'function_call') return historicalToolInvocationText(item.name, item.call_id || item.id, item.arguments);
     if (item.type === 'function_call_output') return toolResultText(item.name || names.get(item.call_id) || '', item.call_id, item.output);
     if (item.type === 'message') return `${item.role || 'user'}: ${text(item.content)}`;
     if (item.type === 'input_text' || item.type === 'output_text') return item.text || '';
@@ -273,6 +286,19 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
     let braceToolRetryAttempted = false;
     let repeatedToolRetryAttempted = false;
     let toolRetryReason = 'none';
+    let correctionAttempted = false;
+    let toolStructuralClass = 'none';
+    let mentionedToolName = '';
+    let completionCount = 0;
+    const runCompletion = async options => {
+      if (completionCount >= MAX_COMPLETIONS) {
+        const error = new Error('Tool correction completion budget exhausted.');
+        error.name = 'ToolCorrectionBudgetError';
+        throw error;
+      }
+      completionCount += 1;
+      return completeImpl(options);
+    };
     try {
       const url = new URL(req.url, 'http://localhost');
       requestPath = url.pathname;
@@ -400,7 +426,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         stream = createProtocolStream(res, { kind, ...streamIdentity, bufferForTools: hasTools });
       }
 
-      let output = await completeImpl({
+      let output = await runCompletion({
         prompt: upstreamPrompt,
         session,
         model,
@@ -411,14 +437,14 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       });
       let toolParseResult = inspectToolCallFromOutput(output, allowedTools);
       let toolCall = toolParseResult.toolCall;
-      let correctiveAttempted = false;
       let safeFailure = false;
       if (shouldRetryFencedToolResponse({ hasTools, toolCall, retryCount: 0, inspection: toolParseResult })) {
-        correctiveAttempted = true;
+        correctionAttempted = true;
         fencedToolRetryAttempted = true;
         toolRetryReason = 'code_fence';
+        toolStructuralClass = 'code_fence';
         logFencedToolRetry(logger);
-        output = await completeImpl({
+        output = await runCompletion({
           prompt: createFencedToolRetryPrompt(allowedTools),
           session,
           model: MODELS['deepseek-chat'],
@@ -437,14 +463,17 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       if (shouldRetryPrefixedToolResponse({
         hasTools,
         toolCall,
-        retryCount: correctiveAttempted ? 1 : 0,
+        retryCount: correctionAttempted ? 1 : 0,
         inspection: toolParseResult,
+        output,
+        allowedNames: allowedTools,
       })) {
-        correctiveAttempted = true;
+        correctionAttempted = true;
         prefixedToolRetryAttempted = true;
         toolRetryReason = 'prefixed_tool';
+        toolStructuralClass = 'prefixed_tool';
         logPrefixedToolRetry(logger);
-        output = await completeImpl({
+        output = await runCompletion({
           prompt: createFencedToolRetryPrompt(allowedTools),
           session,
           model: MODELS['deepseek-chat'],
@@ -463,14 +492,15 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       if (shouldRetryBraceDelimitedToolLikeResponse({
         hasTools,
         toolCall,
-        retryCount: correctiveAttempted ? 1 : 0,
+        retryCount: correctionAttempted ? 1 : 0,
         inspection: toolParseResult,
       })) {
-        correctiveAttempted = true;
+        correctionAttempted = true;
         braceToolRetryAttempted = true;
         toolRetryReason = 'brace_tool';
+        toolStructuralClass = 'brace_tool';
         logBraceToolRetry(logger);
-        output = await completeImpl({
+        output = await runCompletion({
           prompt: createFencedToolRetryPrompt(allowedTools),
           session,
           model: MODELS['deepseek-chat'],
@@ -486,12 +516,50 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
           output = braceToolFailure(output);
         }
       }
-      if (!correctiveAttempted && shouldRetryToolResponse({ hasTools, output, toolCall, retryCount: 0 })) {
-        correctiveAttempted = true;
+      const malformedIntent = classifyMalformedToolIntent({
+        hasTools,
+        toolCall,
+        retryCount: correctionAttempted ? 1 : 0,
+        inspection: toolParseResult,
+        output,
+        allowedNames: allowedTools,
+      });
+      if (malformedIntent.action !== 'none') {
+        toolRetryReason = malformedIntent.structuralClass;
+        toolStructuralClass = malformedIntent.structuralClass;
+        mentionedToolName = malformedIntent.mentionedToolName;
+        if (malformedIntent.action === 'correct') {
+          correctionAttempted = true;
+          logMalformedToolRetry(logger, malformedIntent.structuralClass);
+          output = await runCompletion({
+            prompt: createToolRetryPrompt(allowedTools),
+            session,
+            model: MODELS['deepseek-chat'],
+            timeoutMs: config.timeoutMs,
+            onDelta: input.stream ? delta => stream.delta(delta) : undefined,
+            onStage: onUpstreamStage,
+            onError: onUpstreamError,
+          });
+          toolParseResult = inspectToolCallFromOutput(output, allowedTools);
+          toolCall = toolParseResult.toolCall;
+          if (!toolCall && !isSafeCorrectionFinalText(output, toolParseResult)) {
+            safeFailure = true;
+            output = malformedToolFailure(output);
+          } else if (!toolCall) {
+            output = { ...output, reasoning: '' };
+          }
+        } else {
+          safeFailure = true;
+          output = malformedToolFailure(output);
+        }
+      }
+      if (!correctionAttempted && shouldRetryToolResponse({ hasTools, output, toolCall, retryCount: 0 })) {
+        correctionAttempted = true;
         reasoningRetryAttempted = true;
         toolRetryReason = 'reasoning_only';
+        toolStructuralClass = 'reasoning_only';
         logToolRetry(logger);
-        output = await completeImpl({
+        output = await runCompletion({
           prompt: createToolRetryPrompt(allowedTools),
           session,
           model: MODELS['deepseek-chat'],
@@ -506,12 +574,13 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         output = hideRetryReasoning(output, toolCall);
       }
       if (isToolContinuation && isExactCompletedToolCall(toolCall, toolResults)) {
-        if (!correctiveAttempted) {
-          correctiveAttempted = true;
+        if (!correctionAttempted) {
+          correctionAttempted = true;
           repeatedToolRetryAttempted = true;
           toolRetryReason = 'repeated_tool';
+          toolStructuralClass = 'repeated_tool';
           logRepeatedToolRetry(logger);
-          output = await completeImpl({
+          output = await runCompletion({
             prompt: createRepeatedToolCorrectionPrompt(toolResults, input.tools),
             session,
             model: MODELS['deepseek-chat'],
@@ -555,6 +624,10 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         braceToolRetryAttempted,
         repeatedToolRetryAttempted,
         toolRetryReason,
+        correctionAttempted,
+        structuralClass: toolStructuralClass,
+        mentionedToolName,
+        completionCount,
         toolParseResult,
         outcome: toolCall ? 'tool_call' : safeFailure || !String(output?.content || '').trim() ? 'safe_failure' : 'final_text',
       });
@@ -562,7 +635,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       return send(res, 200, finalResponse);
     } catch (error) {
       diagnosticResponse?.upstreamError(error, latestUpstream);
-      diagnosticResponse?.response({ reasoningRetryAttempted, fencedToolRetryAttempted, prefixedToolRetryAttempted, braceToolRetryAttempted, repeatedToolRetryAttempted, toolRetryReason, outcome: 'upstream_error' });
+      diagnosticResponse?.response({ reasoningRetryAttempted, fencedToolRetryAttempted, prefixedToolRetryAttempted, braceToolRetryAttempted, repeatedToolRetryAttempted, toolRetryReason, correctionAttempted, structuralClass: toolStructuralClass, mentionedToolName, completionCount, outcome: 'upstream_error' });
       logSafeError(error, logger);
       if (stream) return stream.fail('DeepSeek streaming request failed. Run npm run doctor or re-authenticate.');
       const status = error.status || (error.name === 'TimeoutError' ? 504 : 502);
@@ -586,4 +659,4 @@ if (require.main === module) {
   server.listen(config.port, config.host, () => console.log(`DeepSeek Web local proxy: http://${config.host}:${config.port}`));
 }
 
-module.exports = { MODELS, createProxyServer, normalize, toAnthropic, toOpenAI, toResponses };
+module.exports = { MAX_COMPLETIONS, MODELS, createProxyServer, normalize, toAnthropic, toOpenAI, toResponses };
