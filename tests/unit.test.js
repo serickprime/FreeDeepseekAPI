@@ -5,7 +5,7 @@ const {TOOL_RETRY_FAILURE_MESSAGE,classifyMalformedToolIntent,createFencedToolRe
 const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
 const {MAX_TOOL_NAMES,MAX_TOOL_NAME_CHARS,classifyUpstreamError,createToolDiagnostics}=require('../lib/tool_diagnostics');
 const {solvePOW}=require('../lib/pow');
-const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory,readAuthStatus}=require('../lib/setup');
+const {DOCTOR_PROCESS_TIMEOUT_MS,createSetupController,existingDirectory,listDirectories,readAuthStatus,windowsDirectoryRoots}=require('../lib/setup');
 const {runDiagnostics,boundedTimeout}=require('../scripts/doctor');
 test('loopback and external bind security',()=>{assert.equal(isLoopback('127.0.0.1'),true);assert.equal(isLoopback('0.0.0.0'),false);assert.throws(()=>assertConfig({HOST:'0.0.0.0'}));assert.equal(assertConfig({HOST:'0.0.0.0',PROXY_API_KEY:'x'.repeat(24)}).host,'0.0.0.0');});
 test('localhost browser origins allow explicit ports but reject deceptive hosts',()=>{assert.equal(isLocalOrigin('http://127.0.0.1:9655'),true);assert.equal(isLocalOrigin('http://localhost:3000'),true);assert.equal(isLocalOrigin('https://localhost.evil.example'),false);});
@@ -1867,7 +1867,9 @@ test('setup UI is served with CSP and actions require the in-memory setup token'
     bootstrap:()=>({token:'setup-test-token',status:{auth:{valid:true}}}),
     status:()=>({auth:{valid:true}}),
     authorized:value=>value==='setup-test-token',
-    action:async(name,options)=>({ok:name==='doctor'&&options.model==='deepseek-chat-search'&&options.workingDirectory==='C:\\project',message:'checked'}),
+    action:async(name,options)=>name==='validate-folder'
+      ? {ok:false,message:'synthetic invalid folder'}
+      : {ok:name==='doctor'&&options.model==='deepseek-chat-search'&&options.workingDirectory==='C:\\project',message:'checked'},
   };
   const server=createProxyServer({config,setupController,completeImpl:async()=>({content:'',reasoning:''})});
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
@@ -1877,11 +1879,18 @@ test('setup UI is served with CSP and actions require the in-memory setup token'
     assert.equal(page.status,200);
     assert.match(page.headers.get('content-security-policy'),/default-src 'self'/);
     assert.match(await page.text(),/DeepSeek Bridge/);
+    const hero=await fetch(base+'/setup/assets/bridge-network-map.png');
+    assert.equal(hero.status,200);
+    assert.equal(hero.headers.get('content-type'),'image/png');
+    assert.ok((await hero.arrayBuffer()).byteLength>1000);
     const denied=await fetch(base+'/api/setup/action',{method:'POST',headers:{'content-type':'application/json'},body:'{"action":"doctor"}'});
     assert.equal(denied.status,403);
     const allowed=await fetch(base+'/api/setup/action',{method:'POST',headers:{'content-type':'application/json','x-setup-token':'setup-test-token'},body:'{"action":"doctor","model":"deepseek-chat-search","workingDirectory":"C:\\\\project"}'});
     assert.equal(allowed.status,200);
     assert.equal((await allowed.json()).ok,true);
+    const validation=await fetch(base+'/api/setup/action',{method:'POST',headers:{'content-type':'application/json','x-setup-token':'setup-test-token'},body:'{"action":"validate-folder","workingDirectory":"Z:\\\\missing"}'});
+    assert.equal(validation.status,200);
+    assert.deepEqual(await validation.json(),{ok:false,message:'synthetic invalid folder'});
     const models=await (await fetch(base+'/v1/models')).json();
     assert.deepEqual(models.data.map(model=>model.id),['deepseek-chat','deepseek-reasoner','deepseek-chat-search','deepseek-reasoner-search']);
     const unavailable=await fetch(base+'/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json'},body:'{"model":"deepseek-expert","messages":[{"role":"user","content":"test"}]}'});
@@ -1946,6 +1955,85 @@ test('setup folder selection and working-directory validation are bounded',async
   const invalid=await noLaunch.action('claude',{model:'deepseek-reasoner',workingDirectory:'Z:\\missing-deepseek-bridge-folder'});
   assert.equal(invalid.ok,false);
   assert.match(invalid.message,/Папка проекта/);
+});
+
+test('setup directory validation rejects empty, missing, and file paths',t=>{
+  const fixture=fs.mkdtempSync(path.join(os.tmpdir(),'deepseek-bridge-folder-validation-'));
+  const file=path.join(fixture,'not-a-directory.txt');
+  fs.writeFileSync(file,'synthetic');
+  t.after(()=>fs.rmSync(fixture,{recursive:true,force:true}));
+
+  assert.equal(existingDirectory(''),null);
+  assert.equal(existingDirectory('   '),null);
+  assert.equal(existingDirectory('.'),null);
+  assert.equal(existingDirectory(file),null);
+  assert.equal(existingDirectory(path.join(fixture,'missing')),null);
+  assert.equal(existingDirectory(` ${fixture}${path.sep} `),fixture);
+});
+
+test('setup folder browser returns directory metadata without files or file contents',async t=>{
+  const fixture=fs.mkdtempSync(path.join(os.tmpdir(),'deepseek-bridge-folder-browser-'));
+  const child=path.join(fixture,'Папка с пробелами');
+  fs.mkdirSync(child);
+  fs.writeFileSync(path.join(fixture,'PRIVATE_MARKER.txt'),'MUST_NOT_BE_RETURNED');
+  t.after(()=>fs.rmSync(fixture,{recursive:true,force:true}));
+
+  const listing=listDirectories(fixture);
+  assert.equal(listing.currentPath,fixture);
+  assert.deepEqual(listing.directories,[{name:'Папка с пробелами',path:child}]);
+  assert.equal(JSON.stringify(listing).includes('PRIVATE_MARKER'),false);
+  assert.equal(JSON.stringify(listing).includes('MUST_NOT_BE_RETURNED'),false);
+
+  const controller=createSetupController({root:fixture});
+  const response=await controller.action('browse-folders',{workingDirectory:fixture});
+  assert.equal(response.ok,true);
+  assert.equal(response.currentPath,fixture);
+  assert.deepEqual(response.directories,[{name:'Папка с пробелами',path:child}]);
+});
+
+test('setup folder browser preserves Windows drive roots without shell parsing',()=>{
+  const fakeFileSystem={statSync:drive=>({isDirectory:()=>drive==='C:\\'||drive==='D:\\'})};
+  assert.deepEqual(windowsDirectoryRoots(fakeFileSystem),['C:\\','D:\\']);
+});
+
+test('setup validates paths with Cyrillic and spaces and passes the exact cwd to Claude',async t=>{
+  const fixtureRoot=fs.mkdtempSync(path.join(os.tmpdir(),'deepseek-bridge-cwd-'));
+  const selected=path.join(fixtureRoot,'Проект с пробелами');
+  fs.mkdirSync(selected);
+  t.after(()=>fs.rmSync(fixtureRoot,{recursive:true,force:true}));
+  const calls=[];
+  const controller=createSetupController({
+    root:fixtureRoot,
+    hasCommand:()=>true,
+    launchTerminal:async(cwd,command)=>{calls.push({cwd,command});return 2468;},
+  });
+
+  const validation=await controller.action('validate-folder',{workingDirectory:selected});
+  assert.deepEqual(validation,{ok:true,path:selected});
+  const result=await controller.action('claude',{model:'deepseek-chat',workingDirectory:selected});
+  assert.equal(result.ok,true);
+  assert.equal(result.workingDirectory,selected);
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].cwd,selected);
+});
+
+test('setup never substitutes an implicit cwd when launch path is empty or invalid',async t=>{
+  const fixture=fs.mkdtempSync(path.join(os.tmpdir(),'deepseek-bridge-no-cwd-fallback-'));
+  const file=path.join(fixture,'file.txt');
+  fs.writeFileSync(file,'synthetic');
+  t.after(()=>fs.rmSync(fixture,{recursive:true,force:true}));
+  let launches=0;
+  const controller=createSetupController({
+    root:fixture,
+    hasCommand:()=>true,
+    launchTerminal:async()=>{launches+=1;return 1;},
+  });
+
+  for(const workingDirectory of ['',file,'Z:\\missing-deepseek-bridge-folder']){
+    const result=await controller.action('claude',{model:'deepseek-chat',workingDirectory});
+    assert.equal(result.ok,false);
+  }
+  assert.equal(launches,0);
 });
 
 const diagnosticConfig={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
