@@ -2,7 +2,7 @@
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,clientSessionKey,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,inspectToolCall,inspectToolCallFromOutput,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { checked, complete, loadAuth, parseRetryAfter, parseStream }=client; const {MAX_COMPLETIONS,createProxyServer,normalize,toAnthropic,toOpenAI,toResponses}=require('../server');
 const {TOOL_RETRY_FAILURE_MESSAGE,classifyMalformedToolIntent,createFencedToolRetryPrompt,createToolRetryPrompt,hideRetryReasoning,isSafeCorrectionFinalText,shouldRetryBraceDelimitedToolLikeResponse,shouldRetryFencedToolResponse,shouldRetryPrefixedToolResponse,shouldRetryToolResponse}=require('../lib/tool_retry');
-const {classifyToolProtocolOutput,containsStreamProtocolMarker}=require('../lib/tool_containment');
+const {classifyToolProtocolOutput,containsStreamProtocolMarker,decideToolProtocolOutput,findStreamProtocolMarkerIndex,streamProtocolMarkerSuffixLength}=require('../lib/tool_containment');
 const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
 const {MAX_TOOL_NAMES,MAX_TOOL_NAME_CHARS,classifyUpstreamError,createToolDiagnostics}=require('../lib/tool_diagnostics');
 const {solvePOW}=require('../lib/pow');
@@ -4658,4 +4658,240 @@ test('CC-012 final correctable protocol intent receives one strict correction in
   assert.equal(response.choices[0].finish_reason,'tool_calls');
   assert.equal(response.choices[0].message.tool_calls[0].function.name,'Glob');
   assert.doesNotMatch(result.text,/Сейчас посмотрю структуру|\\u200b/);
+});
+
+test('CC-012 deterministic structural fuzz matrix closes every recognized final decision',async t=>{
+  const glob=jsonToolCall('Glob',{pattern:'*'});
+  const read=jsonToolCall('Read',{file_path:'D:\\Тест\\Проект с пробелом\\package.json'});
+  const cases=[
+    ['exact strict JSON',{content:glob,reasoning:''},['Glob'],'tool_use'],
+    ['prose newline JSON',{content:`Проверяю.\n${glob}`,reasoning:''},['Glob'],'correct'],
+    ['prose space JSON',{content:`Проверяю. ${glob}`,reasoning:''},['Glob'],'correct'],
+    ['prose directly before brace',{content:`Проверяю.${glob}`,reasoning:''},['Glob'],'correct'],
+    ['JSON trailing prose',{content:`${glob} продолжение`,reasoning:''},['Glob'],'correct'],
+    ['prose JSON trailing prose',{content:`Проверяю.\n${glob}\nГотово.`,reasoning:''},['Glob'],'correct'],
+    ['two newlines',{content:`Проверяю.\n\n${glob}`,reasoning:''},['Glob'],'correct'],
+    ['CRLF',{content:`Проверяю.\r\n${glob}`,reasoning:''},['Glob'],'correct'],
+    ['tabs around envelope',{content:`Проверяю.\t${glob}\tтекст`,reasoning:''},['Glob'],'correct'],
+    ['leading spaces strict',{content:`  ${glob}`,reasoning:''},['Glob'],'tool_use'],
+    ['trailing spaces strict',{content:`${glob}  `,reasoning:''},['Glob'],'tool_use'],
+    ['NBSP prefix',{content:`\u00a0${glob}`,reasoning:''},['Glob'],'tool_use'],
+    ['zero-width before envelope',{content:`\u200b${glob}`,reasoning:''},['Glob'],'correct'],
+    ['zero-width inside marker',{content:glob.replace('tool_call','tool_\u200bcall'),reasoning:''},['Glob'],'correct'],
+    ['documentation fenced JSON',{content:`Example tool protocol:\n\`\`\`json\n${glob}\n\`\`\``,reasoning:''},['Glob'],'final_text'],
+    ['inline backticks',{content:`Example tool protocol: \`${glob}\``,reasoning:''},['Glob'],'final_text'],
+    ['textual transcript',{content:textualToolTranscript('Glob',{pattern:'*'}),reasoning:''},['Glob'],'correct'],
+    ['XML strict tool call',{content:'<tool_call>{"name":"Glob","arguments":{"pattern":"*"}}</tool_call>',reasoning:''},['Glob'],'tool_use'],
+    ['two envelopes',{content:`${glob}\n${read}`,reasoning:''},['Glob','Read'],'correct'],
+    ['truncated envelope',{content:'{"tool_call":{"name":"Glob","arguments":',reasoning:''},['Glob'],'correct'],
+    ['arguments string',{content:'{"tool_call":{"name":"Glob","arguments":"*"}}',reasoning:''},['Glob'],'correct'],
+    ['arguments array',{content:'{"tool_call":{"name":"Glob","arguments":[]}}',reasoning:''},['Glob'],'correct'],
+    ['empty arguments object',{content:jsonToolCall('Glob',{}),reasoning:''},['Glob'],'tool_use'],
+    ['unknown tool',{content:jsonToolCall('OldGlob',{pattern:'*'}),reasoning:''},['Glob'],'contain'],
+    ['valid allowed Read',{content:read,reasoning:''},['Read'],'tool_use'],
+    ['wrong case name',{content:jsonToolCall('glob',{pattern:'*'}),reasoning:''},['Glob'],'contain'],
+    ['JSON reasoning only',{content:'',reasoning:glob},['Glob'],'tool_use'],
+    ['JSON content only',{content:glob,reasoning:''},['Glob'],'tool_use'],
+    ['prose content JSON reasoning',{content:'Сейчас проверю.',reasoning:glob},['Glob'],'final_text'],
+    ['JSON content prose reasoning',{content:glob,reasoning:'Сейчас проверю.'},['Glob'],'tool_use'],
+    ['marker reconstructed from chunks',{content:['{"tool_','call":{"name":"Glob","arguments":{}}}'].join(''),reasoning:''},['Glob'],'tool_use'],
+    ['name marker reconstructed from chunks',{content:['{"tool_call":{"na','me":"Glob","arguments":{}}}'].join(''),reasoning:''},['Glob'],'tool_use'],
+    ['brace reconstructed from chunks',{content:['{','"tool_call":{"name":"Glob","arguments":{}}}'].join(''),reasoning:''},['Glob'],'tool_use'],
+    ['very large prose prefix',{content:`${'x'.repeat(60*1024)}\n${glob}`,reasoning:''},['Glob'],'correct'],
+    ['very large suffix',{content:`${glob}\n${'x'.repeat(60*1024)}`,reasoning:''},['Glob'],'correct'],
+    ['full private prompt echo',{content:cc011PrivateEcho(),reasoning:''},['Glob'],'contain'],
+    ['partial private marker',{content:'--- TOOL REQUEST SYS',reasoning:''},['Glob'],'contain'],
+    ['ordinary JSON',{content:'Для JSON используйте объект {"name":"test"}',reasoning:''},['Glob'],'final_text'],
+    ['documentation example',{content:`Example tool protocol:\n${glob}`,reasoning:''},['Glob'],'final_text'],
+    ['quoted previous error',{content:`Quoted previous error:\n${glob}`,reasoning:''},['Glob'],'final_text'],
+    ['Markdown quotation',{content:`> Previous failure:\n> ${glob}`,reasoning:''},['Glob'],'final_text'],
+    ['README documentation',{content:`README documentation tool protocol:\n${glob}`,reasoning:''},['Glob'],'final_text'],
+    ['private echo in reasoning',{content:'safe prose',reasoning:cc011PrivateEcho()},['Glob'],'contain'],
+    ['allowed content unknown reasoning',{content:glob,reasoning:jsonToolCall('OldGlob',{})},['Glob'],'tool_use'],
+    ['different allowed names across channels',{content:`План.\n${glob}`,reasoning:read},['Glob','Read'],'correct'],
+    ['multiple same allowed names',{content:`${glob}\n${glob}`,reasoning:''},['Glob'],'correct'],
+    ['multiple with unknown name',{content:`${glob}\n${jsonToolCall('OldGlob',{})}`,reasoning:''},['Glob'],'contain'],
+    ['literal invalid Cyrillic Windows escape',{content:String.raw`{"tool_call":{"name":"Read","arguments":{"file_path":"D:\Тест\Проект\package.json"}}}`,reasoning:''},['Read'],'correct'],
+    ['literal invalid Latin Windows escape',{content:String.raw`{"tool_call":{"name":"Read","arguments":{"file_path":"D:\Folder\Project\package.json"}}}`,reasoning:''},['Read'],'correct'],
+    ['allowed envelope after correction used',{content:`Проверяю.\n${glob}`,reasoning:''},['Glob'],'correct'],
+  ];
+  for(const [label,output,allowed,expected] of cases){
+    await t.test(label,()=>{
+      const inspection=inspectToolCallFromOutput(output,allowed);
+      const decision=decideToolProtocolOutput({output,allowedNames:allowed,toolCall:inspection.toolCall,correctionAttempted:false});
+      assert.equal(decision.action,expected,label);
+      if(expected==='correct'){
+        const exhausted=decideToolProtocolOutput({output,allowedNames:allowed,toolCall:null,correctionAttempted:true});
+        assert.equal(exhausted.action,'contain',label);
+      }
+      if(['correct','contain'].includes(expected)) assert.notEqual(decision.intent.action,'none',label);
+    });
+  }
+  assert.ok(cases.length>=40);
+});
+
+test('CC-012 Glob Read and Bash intents correct once and never expose rejected arguments',async t=>{
+  const cases=[
+    ['Glob',`Сейчас посмотрю структуру.\n${jsonToolCall('Glob',{pattern:'*'})}\u200b`,{pattern:'*'}],
+    ['Read',`${String.raw`Продолжаю.\n{"tool_call":{"name":"Read","arguments":{"file_path":"D:\Тест\Проект с пробелом\package.json"}}}`}\u200b`,{file_path:'D:\\safe\\package.json'}],
+    ['Bash',`Проверю командой.\n${jsonToolCall('Bash',{command:'node --version',description:'safe'})}\u200b`,{command:'node --version',description:'safe'}],
+  ];
+  for(const [name,rejected,correctedArguments] of cases){
+    await t.test(name,async()=>{
+      let calls=0;
+      const result=await toolRetryProxyCase({
+        body:{model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}],tools:[{type:'function',function:{name,parameters:{type:'object'}}}]},
+        logger:()=>{},
+        completeImpl:async()=>{
+          calls+=1;
+          return calls===1
+            ? {content:rejected,reasoning:'PRIVATE_REJECTED_REASONING',parentMessageId:'one'}
+            : {content:jsonToolCall(name,correctedArguments),reasoning:'',parentMessageId:'two'};
+        },
+      });
+      const response=JSON.parse(result.text);
+      assert.equal(calls,MAX_COMPLETIONS);
+      assert.equal(response.choices[0].message.tool_calls[0].function.name,name);
+      assert.doesNotMatch(result.text,/PRIVATE_REJECTED_REASONING|Сейчас посмотрю|Продолжаю|Проверю командой/);
+    });
+  }
+});
+
+test('CC-012 protocol decision is consistent across non-streaming and streaming adapters',async t=>{
+  const adapters=[
+    ['/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'inspect'}],tools:[{type:'function',function:{name:'Glob'}}]},/tool_calls/],
+    ['/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'inspect'}],tools:[{name:'Glob',input_schema:{type:'object'}}]},/tool_use/],
+    ['/v1/responses',{model:'deepseek-chat',input:'inspect',tools:[{type:'function',name:'Glob',parameters:{type:'object'}}]},/function_call/],
+  ];
+  for(const [pathName,body,expected] of adapters){
+    for(const stream of [false,true]){
+      await t.test(`${pathName} stream=${stream}`,async()=>{
+        let calls=0;
+        const rejected=`Сейчас посмотрю структуру.\n${jsonToolCall('Glob',{pattern:'*'})}\u200b`;
+        const result=await toolRetryProxyCase({
+          path:pathName,body:{...body,stream},logger:()=>{},
+          completeImpl:async({onDelta})=>{
+            calls+=1;
+            const content=calls===1?rejected:jsonToolCall('Glob',{pattern:'*'});
+            if(stream){
+              for(const fragment of [content.slice(0,3),content.slice(3,11),content.slice(11)]) onDelta?.({content:fragment});
+            }
+            return {content,reasoning:'',parentMessageId:String(calls)};
+          },
+        });
+        assert.equal(calls,MAX_COMPLETIONS);
+        assert.match(result.text,expected);
+        assert.doesNotMatch(result.text,/Сейчас посмотрю структуру|"tool_call"|\\u200b/);
+      });
+    }
+  }
+});
+
+test('CC-012 corrected Glob continues through Read and final without dropped intent',async()=>{
+  const outputs=[
+    {content:`Сейчас посмотрю структуру.\n${jsonToolCall('Glob',{pattern:'*'})}\u200b`,reasoning:'',parentMessageId:'one'},
+    {content:jsonToolCall('Glob',{pattern:'*'}),reasoning:'',parentMessageId:'two'},
+    {content:jsonToolCall('Read',{file_path:'README.md'}),reasoning:'',parentMessageId:'three'},
+    {content:'Synthetic project confirmed from real results.',reasoning:'',parentMessageId:'four'},
+  ];
+  let completions=0;
+  await withAgenticCycleServer(async()=>outputs[completions++],async({post})=>{
+    const tools=[
+      {name:'Glob',input_schema:{type:'object'}},
+      {name:'Read',input_schema:{type:'object'}},
+    ];
+    const messages=[{role:'user',content:'inspect project'}];
+    const first=(await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages,tools},'cc012-agentic')).json();
+    const glob=first.content[0];
+    assert.equal(glob.type,'tool_use');
+    assert.equal(glob.name,'Glob');
+    const secondMessages=[...messages,{role:'assistant',content:[glob]},{role:'user',content:[{type:'tool_result',tool_use_id:glob.id,content:'README.md\npackage.json'}]}];
+    const second=(await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:secondMessages,tools},'cc012-agentic')).json();
+    const read=second.content[0];
+    assert.equal(read.type,'tool_use');
+    assert.equal(read.name,'Read');
+    const finalMessages=[...secondMessages,{role:'assistant',content:[read]},{role:'user',content:[{type:'tool_result',tool_use_id:read.id,content:'Synthetic project README'}]}];
+    const final=(await post('/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:finalMessages,tools},'cc012-agentic')).json();
+    assert.equal(final.stop_reason,'end_turn');
+    assert.equal(final.content[0].text,'Synthetic project confirmed from real results.');
+    assert.doesNotMatch(JSON.stringify([first,second,final]),/"tool_call"|Сейчас посмотрю структуру/);
+  });
+  assert.equal(completions,4);
+});
+
+test('CC-012 private prompt containment overrides an otherwise strict allowed call',async()=>{
+  const strict=jsonToolCall('Read',{file_path:'safe.txt'});
+  const output={content:strict,reasoning:cc011PrivateEcho()};
+  const inspection=inspectToolCallFromOutput(output,['Read']);
+  assert.equal(inspection.reason,'accepted');
+  const decision=decideToolProtocolOutput({output,allowedNames:['Read'],toolCall:inspection.toolCall});
+  assert.equal(decision.action,'contain');
+  assert.equal(decision.intent.structuralClass,'internal_tool_prompt');
+
+  let calls=0;
+  const result=await toolRetryProxyCase({
+    path:'/v1/messages',
+    body:{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'synthetic'}],tools:[{name:'Read',input_schema:{type:'object'}}]},
+    logger:()=>{},
+    completeImpl:async()=>{calls+=1;return {...output,parentMessageId:'one'};},
+  });
+  assert.equal(calls,1);
+  const response=JSON.parse(result.text);
+  assert.equal(response.stop_reason,'end_turn');
+  assert.equal(response.content[0].text,TOOL_RETRY_FAILURE_MESSAGE);
+  assert.doesNotMatch(result.text,/tool_use|tool_call|TOOL REQUEST SYSTEM|safe\.txt/);
+});
+
+test('CC-012 fresh no-tool streaming quarantines zero-width and split protocol markers',async t=>{
+  const marker='{"tool_\u200bcall":{"name":"Read","arguments":{}}}';
+  assert.equal(containsStreamProtocolMarker(marker),true);
+  assert.equal(findStreamProtocolMarkerIndex(`prefix ${marker}`),7);
+  assert.ok(streamProtocolMarkerSuffixLength('safe {"tool_\u200b')>0);
+
+  for(const item of [
+    ['/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}]}],
+    ['/v1/messages',{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'synthetic'}]}],
+    ['/v1/responses',{model:'deepseek-chat',input:'synthetic'}],
+  ]){
+    await t.test(item[0],async()=>{
+      const content=`План.\n${marker}`;
+      const result=await toolRetryProxyCase({
+        path:item[0],body:{...item[1],stream:true},logger:()=>{},
+        completeImpl:async({onDelta})=>{
+          for(const fragment of ['План.\n{"to','ol_\u200b','call":{"na','me":"Read","arguments":{}}}']) onDelta?.({content:fragment});
+          return {content,reasoning:'',parentMessageId:'one'};
+        },
+      });
+      assert.match(result.text,/The model could not produce a valid tool call/);
+      assert.doesNotMatch(result.text,/tool_|tool_call|Read/);
+    });
+  }
+});
+
+test('CC-012 final containment diagnostics expose only bounded decisions',async()=>{
+  const lines=[];
+  const privatePath='D:\\PRIVATE_CC012_PATH\\secret.txt';
+  const outputs=[
+    {content:'',reasoning:'PRIVATE_CC012_REASONING',parentMessageId:'one'},
+    {content:`План.\n${jsonToolCall('Read',{file_path:privatePath})}`,reasoning:'',parentMessageId:'two'},
+  ];
+  let calls=0;
+  let responseText='';
+  await withDiagnosticsServer({logger:line=>lines.push(line),completeImpl:async()=>outputs[calls++]},async post=>{
+    responseText=(await post('/v1/messages',{
+      model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'synthetic'}],
+      tools:[{name:'Read',input_schema:{type:'object'}}],
+    })).text;
+  });
+  assert.equal(calls,MAX_COMPLETIONS);
+  const response=JSON.parse(responseText);
+  assert.equal(response.content[0].text,TOOL_RETRY_FAILURE_MESSAGE);
+  const diagnostic=diagnosticRecords(lines).find(record=>record.event==='tool_response');
+  assert.equal(diagnostic.tool_retry_reason,'reasoning_only');
+  assert.equal(diagnostic.tool_structural_class,'tool_protocol_envelope');
+  assert.equal(diagnostic.mentioned_tool_name,'Read');
+  assert.equal(diagnostic.tool_correction_attempted,true);
+  assert.equal(diagnostic.completion_count,MAX_COMPLETIONS);
+  assert.equal(diagnostic.outcome,'safe_failure');
+  assert.doesNotMatch(`${responseText}\n${lines.join('\n')}`,/PRIVATE_CC012_PATH|PRIVATE_CC012_REASONING|secret\.txt|"tool_call"/);
 });

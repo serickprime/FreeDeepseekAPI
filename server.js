@@ -37,7 +37,7 @@ const {
   repeatedToolFailure,
 } = require('./lib/tool_continuation');
 const { createProtocolStream } = require('./lib/api_stream');
-const { classifyToolProtocolOutput } = require('./lib/tool_containment');
+const { decideToolProtocolOutput } = require('./lib/tool_containment');
 const { createToolDiagnostics } = require('./lib/tool_diagnostics');
 const { estimateTokenCount, validateCountTokensBody } = require('./lib/token_count');
 const { createSetupController } = require('./lib/setup');
@@ -292,6 +292,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
     let toolStructuralClass = 'none';
     let mentionedToolName = '';
     let completionCount = 0;
+    let latestCompletionOutput = null;
     const runCompletion = async options => {
       if (completionCount >= MAX_COMPLETIONS) {
         const error = new Error('Tool correction completion budget exhausted.');
@@ -299,7 +300,9 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         throw error;
       }
       completionCount += 1;
-      return completeImpl(options);
+      const result = await completeImpl(options);
+      latestCompletionOutput = result;
+      return result;
     };
     try {
       const url = new URL(req.url, 'http://localhost');
@@ -610,12 +613,50 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
           toolCall = null;
         }
       }
-      const protocolIntent = classifyToolProtocolOutput({ output, allowedNames: allowedTools });
-      const protocolContained = !toolCall && protocolIntent.action === 'contain_only';
-      if (protocolContained) {
-        safeFailure = true;
-        output = malformedToolFailure(output);
+      let protocolDecision = decideToolProtocolOutput({
+        output: latestCompletionOutput || output,
+        allowedNames: allowedTools,
+        toolCall,
+        correctionAttempted,
+      });
+      let protocolContained = false;
+      if (protocolDecision.action === 'correct') {
+        correctionAttempted = true;
+        toolRetryReason = protocolDecision.intent.structuralClass;
+        toolStructuralClass = protocolDecision.intent.structuralClass;
+        mentionedToolName = protocolDecision.intent.mentionedToolName;
+        logMalformedToolRetry(logger, protocolDecision.intent.structuralClass);
+        output = await runCompletion({
+          prompt: createToolRetryPrompt(allowedTools),
+          session,
+          model: MODELS['deepseek-chat'],
+          timeoutMs: config.timeoutMs,
+          onDelta: input.stream ? delta => stream.delta(delta) : undefined,
+          onStage: onUpstreamStage,
+          onError: onUpstreamError,
+        });
+        toolParseResult = inspectToolCallFromOutput(output, allowedTools);
+        toolCall = toolParseResult.toolCall;
+        protocolDecision = decideToolProtocolOutput({
+          output: latestCompletionOutput || output,
+          allowedNames: allowedTools,
+          toolCall,
+          correctionAttempted,
+        });
       }
+      if (protocolDecision.action === 'contain') {
+        protocolContained = true;
+        if (!safeFailure || toolStructuralClass === 'none') {
+          toolStructuralClass = protocolDecision.intent.structuralClass;
+        }
+        if (protocolDecision.intent.mentionedToolName) mentionedToolName = protocolDecision.intent.mentionedToolName;
+        if (!safeFailure) output = malformedToolFailure(output);
+        safeFailure = true;
+        toolCall = null;
+      } else if (!toolCall && correctionAttempted && isSafeCorrectionFinalText(output, toolParseResult)) {
+        output = { ...output, reasoning: '' };
+      }
+      if (protocolDecision.suppressReasoning && output.reasoning) output = { ...output, reasoning: '' };
       if (isToolContinuation && !toolCall && output.reasoning) output = { ...output, reasoning: '' };
       resolver.release(resolution.callIds, upstreamKey);
       forgetCompletedToolCalls(session, resolution.callIds);
