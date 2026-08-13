@@ -5,184 +5,166 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#020101">
-  <title>FreeDeepseekAPI — локальный мост для AI-агентов</title>
+  <title>FreeDeepseekAPI — DeepSeek Bridge Console</title>
   <link rel="stylesheet" href="/setup/styles.css">
   <link rel="stylesheet" href="/setup/model-picker.css">
 </head>
 <body>
-  <a class="skip-link" href="#workspace">Перейти к настройке</a>
-  <div class="page-shell">
-    <header class="site-header">
-      <nav class="topbar" aria-label="Основная навигация">
-        <a class="brand" href="#top" aria-label="FreeDeepseekAPI — начало страницы">
-          <span class="brand-mark" aria-hidden="true">F</span>
-          <span>FreeDeepseekAPI</span>
-        </a>
-        <div class="nav-links">
-          <a href="#status">Статус</a>
-          <a href="#workspace">Настройка</a>
-          <a href="#launch">Запуск</a>
-        </div>
-        <span id="apiBadge" class="status-pill waiting"><span class="status-dot"></span>Проверка API</span>
-      </nav>
+  <a class="skip-link" href="#workspace">Перейти к консоли</a>
 
-      <section id="top" class="hero" aria-labelledby="heroTitle">
-        <div class="hero-copy">
-          <p class="eyebrow"><span></span> Локальный AI-инфраструктурный слой</p>
-          <h1 id="heroTitle">DeepSeek для ваших <em>рабочих инструментов</em></h1>
-          <p class="hero-lead">Подключайте Claude Code и OpenCode к DeepSeek через локальный Bridge — с контролем модели, рабочей директории и состояния соединения.</p>
-          <div class="hero-actions">
-            <a class="button primary" href="#workspace">Настроить запуск</a>
-            <a class="button ghost" href="#status">Проверить соединение</a>
-          </div>
-          <dl class="hero-facts">
-            <div><dt>Локально</dt><dd>127.0.0.1</dd></div>
-            <div><dt>Совместимо</dt><dd>OpenAI · Anthropic</dd></div>
-            <div><dt>Приватно</dt><dd>Без телеметрии</dd></div>
-          </dl>
-        </div>
-        <figure class="hero-visual">
-          <img src="/setup/assets/bridge-network-map.png" width="1660" height="948" alt="Стилизованная карта сети DeepSeek Bridge" fetchpriority="high">
-          <figcaption><span class="live-indicator"></span> Bridge работает на вашем устройстве</figcaption>
-        </figure>
-      </section>
+  <div class="page-shell">
+    <header class="console-header">
+      <a class="brand" href="#top" aria-label="FreeDeepseekAPI — начало консоли">
+        <span class="brand-prompt" aria-hidden="true">&gt;_</span>
+        <span class="brand-copy">
+          <strong>FreeDeepseekAPI</strong>
+          <small>LOCAL BRIDGE CONSOLE</small>
+        </span>
+      </a>
+      <div class="header-node" aria-label="Локальный адрес Bridge">
+        <span>LOCAL://127.0.0.1</span>
+        <small>BRIDGE::9655</small>
+      </div>
+      <span id="apiBadge" class="status-pill waiting"><span class="status-dot"></span>Проверка API</span>
     </header>
 
-    <main>
-      <section id="status" class="section status-section" aria-labelledby="statusTitle">
-        <div class="section-heading">
+    <figure id="top" class="network-strip">
+      <img src="/setup/assets/bridge-network-map.png" width="1660" height="948" alt="ASCII-карта локальной Bridge-сети" fetchpriority="high">
+      <div class="network-shade" aria-hidden="true"></div>
+      <figcaption>
+        <span>NODE_MAP_01</span>
+        <span class="map-center">AI INFRASTRUCTURE / LOCAL GATEWAY</span>
+        <span>[ 02:01:01 ]</span>
+      </figcaption>
+    </figure>
+
+    <main id="workspace" class="console-main">
+      <section id="status" class="module connection-module" aria-labelledby="connectionTitle">
+        <div class="module-heading">
           <div>
-            <p class="section-kicker">01 / Подключение</p>
-            <h2 id="statusTitle">Состояние сервисов</h2>
+            <p class="section-kicker">01 / CONNECTION</p>
+            <h1 id="connectionTitle">Состояние системы</h1>
           </div>
-          <p>Два коротких шага подтверждают, что локальный Bridge готов перед запуском агента.</p>
+          <span class="module-code">SYS_A</span>
         </div>
 
-        <div class="status-grid">
-          <article class="panel status-card">
-            <div class="card-index">01</div>
-            <div class="card-heading">
-              <div>
-                <p class="overline">Авторизация DeepSeek</p>
-                <h3>Подключите аккаунт</h3>
-              </div>
-              <span id="authState" class="state waiting"><span></span>Не проверено</span>
+        <div class="service-stack">
+          <div class="service-row">
+            <div>
+              <span class="overline">DEEPSEEK WEB</span>
+              <strong>Авторизация</strong>
             </div>
-            <p>Откроется изолированный профиль Chrome. CAPTCHA и 2FA всегда остаются под вашим контролем.</p>
-            <button id="authButton" class="button secondary" type="button" disabled>Войти в DeepSeek</button>
-          </article>
+            <span id="authState" class="state waiting"><span></span>Не проверено</span>
+          </div>
+          <div class="service-row">
+            <div>
+              <span class="overline">LOCAL BRIDGE</span>
+              <strong>Диагностика</strong>
+            </div>
+            <span id="doctorState" class="state waiting"><span></span>Ожидает</span>
+          </div>
+        </div>
 
-          <article class="panel status-card">
-            <div class="card-index">02</div>
-            <div class="card-heading">
-              <div>
-                <p class="overline">Диагностика Bridge</p>
-                <h3>Проверьте соединение</h3>
-              </div>
-              <span id="doctorState" class="state waiting"><span></span>Ожидает</span>
-            </div>
-            <p>Проверяет auth-файл, текущую сессию и внутренний PoW endpoint без вывода секретов.</p>
-            <button id="doctorButton" class="button secondary" type="button" disabled>Запустить диагностику</button>
-            <pre id="doctorOutput" class="console" hidden tabindex="0"></pre>
-          </article>
+        <div class="connection-actions">
+          <button id="authButton" class="button secondary" type="button" disabled><span aria-hidden="true">+</span> Войти</button>
+          <button id="doctorButton" class="button secondary" type="button" disabled><span aria-hidden="true">::</span> Диагностика</button>
+        </div>
+
+        <pre id="doctorOutput" class="console" hidden tabindex="0"></pre>
+
+        <div class="connection-foot" aria-hidden="true">
+          <span>AUTH::LOCAL</span>
+          <span>NO TELEMETRY</span>
         </div>
       </section>
 
-      <section id="workspace" class="section workspace-section" aria-labelledby="workspaceTitle">
-        <div class="section-heading">
+      <section class="module session-module" aria-labelledby="sessionTitle">
+        <div class="module-heading">
           <div>
-            <p class="section-kicker">02 / Рабочая среда</p>
-            <h2 id="workspaceTitle">Настройте сессию</h2>
+            <p class="section-kicker">02 / SESSION</p>
+            <h2 id="sessionTitle">Параметры запуска</h2>
           </div>
-          <p>Модель и папка применяются к новому окну CLI. Bridge повторно проверяет путь непосредственно перед запуском.</p>
+          <span class="module-code">SESSION_01</span>
         </div>
 
-        <div class="workspace-grid">
-          <article class="panel settings-card">
-            <div class="setting-icon" aria-hidden="true">M</div>
-            <div class="setting-content model-picker">
-              <div class="field-heading">
-                <div>
-                  <label for="modelSelect">Модель DeepSeek</label>
-                  <p>Выберите режим для следующей CLI-сессии.</p>
-                </div>
-                <span class="field-tag">Model</span>
-              </div>
-              <select id="modelSelect" aria-describedby="modelDescription" disabled></select>
-              <p id="modelDescription" class="field-help">Загрузка доступных режимов…</p>
+        <div class="session-fields">
+          <div class="field-block model-picker">
+            <div class="field-heading">
+              <label for="modelSelect">MODEL</label>
+              <span class="field-tag">DeepSeek</span>
             </div>
-          </article>
+            <select id="modelSelect" aria-describedby="modelDescription" disabled></select>
+            <p id="modelDescription" class="field-help">Загрузка доступных режимов…</p>
+          </div>
 
-          <article class="panel settings-card folder-card">
-            <div class="setting-icon" aria-hidden="true">⌂</div>
-            <div class="setting-content folder-picker">
-              <div class="field-heading">
-                <div>
-                  <label for="workingDirectory">Рабочая папка</label>
-                  <p>Именно этот каталог станет <code>cwd</code> нового процесса.</p>
-                </div>
-                <span id="folderState" class="folder-state empty">Не выбрана</span>
-              </div>
-              <div class="folder-control">
-                <input id="workingDirectory" type="text" spellcheck="false" autocomplete="off" placeholder="Выберите или вставьте абсолютный путь" aria-describedby="folderDescription" aria-invalid="false" disabled>
-                <button id="chooseFolder" class="button secondary folder-button" type="button" disabled>Выбрать папку</button>
-              </div>
-              <p id="folderDescription" class="field-help">Путь не подставляется автоматически. Поддерживаются диски Windows, пробелы и кириллица.</p>
+          <div class="field-block folder-picker">
+            <div class="field-heading">
+              <label for="workingDirectory">WORKING DIRECTORY</label>
+              <span id="folderState" class="folder-state empty">Не выбрана</span>
             </div>
-          </article>
+            <div class="folder-control">
+              <input id="workingDirectory" type="text" spellcheck="false" autocomplete="off" placeholder="D:\Projects\Workspace" aria-describedby="folderDescription" aria-invalid="false" disabled>
+              <button id="chooseFolder" class="button secondary folder-button" type="button" aria-label="Выбрать рабочую папку" disabled><span aria-hidden="true">...</span><span class="folder-button-label">Выбрать</span></button>
+            </div>
+            <p id="folderDescription" class="field-help">Выберите подтверждённый локальный каталог для нового CLI-процесса.</p>
+          </div>
         </div>
-      </section>
 
-      <section id="launch" class="section launch-section" aria-labelledby="launchTitle">
-        <div class="section-heading">
+        <div id="launch" class="launch-block" aria-labelledby="launchTitle">
+          <div class="launch-heading">
+            <div>
+              <p class="section-kicker">03 / LAUNCH</p>
+              <h2 id="launchTitle">Запустить клиент</h2>
+            </div>
+            <span class="cursor" aria-hidden="true">█</span>
+          </div>
+
+          <div class="launch-grid">
+            <div class="launch-client primary-client">
+              <div class="client-meta">
+                <strong>CLAUDE CODE</strong>
+                <span id="claudeAvailability" class="availability">Проверка установки…</span>
+              </div>
+              <button class="button primary launch" data-action="claude" type="button" disabled><span aria-hidden="true">&gt;</span> Run Claude</button>
+            </div>
+            <div class="launch-client">
+              <div class="client-meta">
+                <strong>OPENCODE</strong>
+                <span id="opencodeAvailability" class="availability">Проверка установки…</span>
+              </div>
+              <button class="button secondary launch" data-action="opencode" type="button" disabled><span aria-hidden="true">&gt;</span> Run OpenCode</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="endpoint-row">
           <div>
-            <p class="section-kicker">03 / Запуск</p>
-            <h2 id="launchTitle">Выберите клиент</h2>
+            <span class="overline">OPENAI-COMPATIBLE ENDPOINT</span>
+            <code>LOCAL GATEWAY</code>
           </div>
-          <p>Все текущие интеграции сохранены. Терминал откроется только после успешной проверки выбранной папки.</p>
+          <button id="copyUrl" class="api-copy" data-value="http://127.0.0.1:9655/v1" type="button"><code>127.0.0.1:9655/v1</code><span>COPY</span></button>
         </div>
-
-        <div class="agent-grid">
-          <article class="agent-card featured">
-            <div class="agent-topline"><span class="agent-glyph">C</span><span class="recommended-tag">Рекомендуется</span></div>
-            <div><h3>Claude Code</h3><p>Agentic workflow с инструментами, контекстом проекта и DeepSeek-моделями.</p></div>
-            <div id="claudeAvailability" class="availability">Проверка установки…</div>
-            <button class="button primary launch" data-action="claude" type="button" disabled>Запустить Claude Code</button>
-          </article>
-
-          <article class="agent-card">
-            <div class="agent-topline"><span class="agent-glyph muted">O</span><span class="client-type">CLI</span></div>
-            <div><h3>OpenCode</h3><p>Использует конфигурацию Bridge, не копируя её в выбранный проект.</p></div>
-            <div id="opencodeAvailability" class="availability">Проверка установки…</div>
-            <button class="button secondary launch" data-action="opencode" type="button" disabled>Запустить OpenCode</button>
-          </article>
-
-          <article class="agent-card api-card">
-            <div class="agent-topline"><span class="agent-glyph outline">API</span><span class="client-type">Local</span></div>
-            <div><h3>Другой клиент</h3><p>Подключите любой OpenAI-совместимый инструмент к локальному endpoint.</p></div>
-            <button id="copyUrl" class="api-copy" data-value="http://127.0.0.1:9655/v1" type="button"><code>127.0.0.1:9655/v1</code><span>Копировать</span></button>
-          </article>
-        </div>
-      </section>
-
-      <section class="section support-section" aria-label="Справка">
-        <details class="support-panel">
-          <summary><span>Нужна помощь с запуском?</span><span class="summary-icon" aria-hidden="true">+</span></summary>
-          <ul>
-            <li>Сессия закончилась — снова нажмите «Войти в DeepSeek».</li>
-            <li>CLI не найден — установите его и обновите страницу.</li>
-            <li>Папка недоступна — выберите другой каталог или проверьте права.</li>
-            <li>Порт 9655 занят — закройте старое окно Bridge и запустите лаунчер снова.</li>
-            <li>Не публикуйте <code>deepseek-auth.json</code>: он предоставляет доступ к аккаунту.</li>
-          </ul>
-        </details>
       </section>
     </main>
 
+    <section class="utility-bar" aria-label="Состояние и справка">
+      <div class="runtime-line"><span class="runtime-dot"></span><span>STATUS // READY // LOCAL // NO TELEMETRY</span></div>
+      <details class="support-panel">
+        <summary><span>HELP / TROUBLESHOOTING</span><span class="summary-icon" aria-hidden="true">+</span></summary>
+        <ul>
+          <li>Сессия закончилась — снова нажмите «Войти».</li>
+          <li>CLI не найден — установите его и обновите страницу.</li>
+          <li>Папка недоступна — выберите другой каталог или проверьте права.</li>
+          <li>Порт 9655 занят — закройте старое окно Bridge.</li>
+          <li>Не публикуйте <code>deepseek-auth.json</code>.</li>
+        </ul>
+      </details>
+    </section>
+
     <footer class="site-footer">
-      <div class="brand footer-brand"><span class="brand-mark">F</span><span>FreeDeepseekAPI</span></div>
-      <p>Работает локально · Без телеметрии · Секреты не отображаются</p>
-      <span>Local bridge / v0.1</span>
+      <span>FREEDEEPSEEK / LOCAL BRIDGE</span>
+      <span>OPENAI + ANTHROPIC</span>
+      <span>BUILD::0.1</span>
     </footer>
   </div>
 
@@ -190,8 +172,8 @@
     <form method="dialog" class="dialog-panel">
       <div class="dialog-header">
         <div>
-          <p class="section-kicker">Локальная файловая система</p>
-          <h2 id="folderDialogTitle">Выберите рабочую папку</h2>
+          <p class="section-kicker">LOCAL FILESYSTEM / DIRECTORY MODE</p>
+          <h2 id="folderDialogTitle">Select working directory</h2>
         </div>
         <button id="closeFolderDialog" class="icon-button" value="cancel" aria-label="Закрыть выбор папки" type="submit">×</button>
       </div>
@@ -200,12 +182,15 @@
         <select id="folderRoot" aria-label="Диск или корневая папка"></select>
         <button id="folderRefresh" class="icon-button" type="button" aria-label="Обновить список">↻</button>
       </div>
-      <div id="folderCurrentPath" class="current-path" title="">Загрузка…</div>
+      <div class="path-block">
+        <span>PATH</span>
+        <div id="folderCurrentPath" class="current-path" title="">Загрузка…</div>
+      </div>
       <div id="folderList" class="folder-list" aria-live="polite" aria-busy="false"></div>
       <p id="folderBrowserState" class="browser-state" role="status">Выберите каталог из списка.</p>
       <div class="dialog-actions">
-        <button class="button ghost" value="cancel" type="submit">Отмена</button>
-        <button id="selectCurrentFolder" class="button primary" type="button">Выбрать текущую</button>
+        <button class="button ghost" value="cancel" type="submit">Cancel</button>
+        <button id="selectCurrentFolder" class="button primary" type="button">Select directory</button>
       </div>
     </form>
   </dialog>
