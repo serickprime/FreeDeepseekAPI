@@ -2,6 +2,7 @@
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const test=require('node:test'),assert=require('node:assert/strict'); const {isLoopback,isLocalOrigin,assertConfig,safeError,logSafeError}=require('../lib/security'); const {SessionStore}=require('../lib/session'); const {SessionResolver,clientSessionKey,explicitSessionKey,extractToolResultCallIds,normalizeCallId}=require('../lib/session_resolver'); const {IMAGE_BLOCK_TOKENS,MAX_DEPTH:MAX_TOKEN_DEPTH,UNKNOWN_BLOCK_TOKENS,estimateTextTokens,estimateTokenCount,validateCountTokensBody}=require('../lib/token_count'); const {MAX_TOOL_BYTES,MAX_NESTING_DEPTH,inspectToolCall,inspectToolCallFromOutput,parseToolCall,parseToolCallFromOutput,toolPrompt}=require('../lib/tool_parser'); const client=require('../client'); const { checked, complete, loadAuth, parseRetryAfter, parseStream }=client; const {MAX_COMPLETIONS,createProxyServer,normalize,toAnthropic,toOpenAI,toResponses}=require('../server');
 const {TOOL_RETRY_FAILURE_MESSAGE,classifyMalformedToolIntent,createFencedToolRetryPrompt,createToolRetryPrompt,hideRetryReasoning,isSafeCorrectionFinalText,shouldRetryBraceDelimitedToolLikeResponse,shouldRetryFencedToolResponse,shouldRetryPrefixedToolResponse,shouldRetryToolResponse}=require('../lib/tool_retry');
+const {classifyToolProtocolOutput,containsStreamProtocolMarker}=require('../lib/tool_containment');
 const {REPEATED_TOOL_FAILURE_MESSAGE,extractToolResults,isExactCompletedToolCall}=require('../lib/tool_continuation');
 const {MAX_TOOL_NAMES,MAX_TOOL_NAME_CHARS,classifyUpstreamError,createToolDiagnostics}=require('../lib/tool_diagnostics');
 const {solvePOW}=require('../lib/pow');
@@ -3697,7 +3698,7 @@ test('long session diagnostics show tool presence, continuation, retry and safe 
     await post('/v1/chat/completions',{...base,messages:[...base.messages,{role:'assistant',content:null,tool_calls:[call]},{role:'tool',name:'Read',tool_call_id:call.id,content:secret.result}],tools},headers);
     const recap=(await post('/v1/chat/completions',{...base,messages:[{role:'user',content:'recap request'}]},headers)).json();
     assert.equal(recap.choices[0].message.tool_calls,undefined);
-    assert.match(recap.choices[0].message.content,/^\{"tool_call"/);
+    assert.equal(recap.choices[0].message.content,TOOL_RETRY_FAILURE_MESSAGE);
     await post('/v1/chat/completions',{...base,messages:[{role:'user',content:'retry request'}],tools},headers);
     await post('/v1/chat/completions',{model:'deepseek-chat',messages:[{role:'user',content:'other'}],tools},{'x-agent-session':'OTHER_SESSION_SECRET'});
   });
@@ -3721,7 +3722,7 @@ test('long session diagnostics show tool presence, continuation, retry and safe 
   assert.equal(responses[1].strict_tool_call_detected,true);
   assert.equal(responses[1].outcome,'tool_call');
   assert.equal(responses[3].strict_tool_call_detected,false);
-  assert.equal(responses[3].outcome,'final_text');
+  assert.equal(responses[3].outcome,'safe_failure');
   assert.equal(responses[4].reasoning_retry_attempted,true);
   assert.equal(responses[4].fenced_tool_retry_attempted,false);
   assert.equal(responses[4].tool_retry_reason,'reasoning_only');
@@ -4422,4 +4423,184 @@ test('CC-010 explicit file guidance improves selection instructions without forc
   const response=JSON.parse(result.text);
   assert.equal(response.choices[0].finish_reason,'stop');
   assert.equal(response.choices[0].message.tool_calls,undefined);
+});
+
+const cc011PrivateEcho=()=>[
+  '--- TOOL REQUEST SYSTEM ---',
+  'You only reason and REQUEST tool execution.',
+  '{"tool_call":{"name":"tool_name","arguments":{}}}',
+  '--- END TOOL REQUEST SYSTEM ---',
+].join('\n');
+
+test('CC-011 containment classifier separates executable correction from contain-only output',()=>{
+  const valid=jsonToolCall('Read',{file_path:'safe.txt'});
+  const prose=`Continue.\n\n${valid}`;
+  const truncated='{"tool_call":{"name":"Read","arguments":';
+  const transcript=textualToolTranscript('Read',{file_path:'safe.txt'});
+  for(const content of [valid,prose,truncated,transcript]){
+    const allowed=classifyToolProtocolOutput({output:{content},allowedNames:['Read']});
+    assert.equal(allowed.action,'correctable',content);
+    assert.equal(allowed.mentionedToolName,'Read',content);
+    const absent=classifyToolProtocolOutput({output:{content},allowedNames:[]});
+    assert.equal(absent.action,'contain_only',content);
+    assert.equal(absent.mentionedToolName,'',content);
+  }
+  const unknown=classifyToolProtocolOutput({output:{content:jsonToolCall('OldRead',{})},allowedNames:['Read']});
+  assert.equal(unknown.action,'contain_only');
+  const privateEcho=classifyToolProtocolOutput({output:{content:cc011PrivateEcho()},allowedNames:['tool_name']});
+  assert.deepEqual(privateEcho,{structuralClass:'internal_tool_prompt',action:'contain_only',mentionedToolName:''});
+  assert.equal(classifyToolProtocolOutput({output:{content:'safe final',reasoning:cc011PrivateEcho()},allowedNames:[]}).action,'contain_only');
+  assert.equal(containsStreamProtocolMarker('prefix --- TOOL REQUEST SYSTEM --- suffix'),true);
+});
+
+test('CC-011 containment negative controls preserve ordinary and documented JSON',()=>{
+  const cases=[
+    'Для JSON используйте объект {"name":"example"}',
+    `Example:\n${jsonToolCall('Read',{})}`,
+    `Пример:\n${jsonToolCall('Read',{})}`,
+    `\`\`\`json\n${jsonToolCall('Read',{})}\n\`\`\``,
+    `> Previous error:\n> ${jsonToolCall('Read',{})}`,
+    `README documentation:\n${jsonToolCall('Read',{})}`,
+    `Quoted previous error:\n${textualToolTranscript('Read',{})}`,
+  ];
+  for(const content of cases){
+    assert.deepEqual(classifyToolProtocolOutput({output:{content},allowedNames:[]}),{structuralClass:'none',action:'none',mentionedToolName:''},content);
+  }
+  assert.equal(classifyToolProtocolOutput({output:{content:`Example\n${cc011PrivateEcho()}`},allowedNames:[]}).action,'contain_only');
+});
+
+async function cc011Post({path='/v1/messages',body,outputs,stream=false,sessionStore}={}){
+  let calls=0;
+  const result=await toolRetryProxyCase({path,body:{...body,stream},sessionStore,logger:()=>{},completeImpl:async({onDelta})=>{
+    const output=outputs[Math.min(calls,outputs.length-1)];
+    calls+=1;
+    if(stream){
+      const content=String(output.content||'');
+      const midpoint=Math.max(1,Math.floor(content.length/2));
+      onDelta?.({content:content.slice(0,midpoint)});
+      onDelta?.({content:content.slice(midpoint)});
+    }
+    return output;
+  }});
+  return {...result,calls};
+}
+
+test('CC-011 no-tool protocol matrix returns only generic failure and never executes',async()=>{
+  const privateLarge=`${cc011PrivateEcho()}\n${'X'.repeat(MAX_TOOL_BYTES+1024)}`;
+  const windowsMalformed=String.raw`Продолжаю.
+{"tool_call":{"name":"Read","arguments":{"file_path":"D:\Тест\Проект\package.json"}}}`;
+  const cases=[
+    jsonToolCall('Read',{file_path:'safe.txt'}),
+    `Continue.\n${jsonToolCall('Read',{file_path:'safe.txt'})}`,
+    '{"tool_call":{"name":"Read","arguments":',
+    textualToolTranscript('Read',{file_path:'safe.txt'}),
+    cc011PrivateEcho(),
+    privateLarge,
+    windowsMalformed,
+  ];
+  for(const content of cases){
+    const result=await cc011Post({
+      body:{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'synthetic'}]},
+      outputs:[{content,reasoning:'PRIVATE_REASONING',parentMessageId:'one'}],
+    });
+    assert.equal(result.calls,1,content.slice(0,64));
+    const response=JSON.parse(result.text);
+    assert.equal(response.content[0].text,TOOL_RETRY_FAILURE_MESSAGE);
+    assert.equal(response.stop_reason,'end_turn');
+    assert.doesNotMatch(result.text,/tool_call|TOOL REQUEST SYSTEM|PRIVATE_REASONING|safe\.txt|package\.json/);
+  }
+});
+
+test('CC-011 current allowlist remains execution-only and preserves CC-010 correction budget',async()=>{
+  const malformed=String.raw`Продолжаю.
+{"tool_call":{"name":"Read","arguments":{"file_path":"D:\Тест\Проект\package.json"}}}`;
+  const corrected=await cc011Post({
+    path:'/v1/chat/completions',
+    body:{model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}],tools:[{type:'function',function:{name:'Read'}}]},
+    outputs:[
+      {content:malformed,reasoning:'PRIVATE',parentMessageId:'one'},
+      {content:jsonToolCall('Read',{file_path:'safe.txt'}),reasoning:'',parentMessageId:'two'},
+    ],
+  });
+  assert.equal(corrected.calls,MAX_COMPLETIONS);
+  assert.equal(JSON.parse(corrected.text).choices[0].message.tool_calls[0].function.name,'Read');
+  assert.doesNotMatch(corrected.text,/package\.json|PRIVATE/);
+
+  const unknown=await cc011Post({
+    path:'/v1/chat/completions',
+    body:{model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}],tools:[{type:'function',function:{name:'Read'}}]},
+    outputs:[{content:jsonToolCall('OldRead',{file_path:'old.txt'}),reasoning:'PRIVATE',parentMessageId:'one'}],
+  });
+  assert.equal(unknown.calls,1);
+  assert.equal(JSON.parse(unknown.text).choices[0].message.content,TOOL_RETRY_FAILURE_MESSAGE);
+  assert.doesNotMatch(unknown.text,/OldRead|old\.txt|PRIVATE/);
+});
+
+test('CC-011 containment is protocol-neutral for non-streaming adapters',async()=>{
+  const cases=[
+    {path:'/v1/chat/completions',body:{model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}]},text:value=>value.choices[0].message.content},
+    {path:'/v1/messages',body:{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'synthetic'}]},text:value=>value.content[0].text},
+    {path:'/v1/responses',body:{model:'deepseek-chat',input:'synthetic'},text:value=>value.output[0].content[0].text},
+  ];
+  for(const item of cases){
+    const result=await cc011Post({path:item.path,body:item.body,outputs:[{content:cc011PrivateEcho(),reasoning:'',parentMessageId:'one'}]});
+    assert.equal(item.text(JSON.parse(result.text)),TOOL_RETRY_FAILURE_MESSAGE,item.path);
+    assert.doesNotMatch(result.text,/TOOL REQUEST SYSTEM|tool_call/);
+  }
+});
+
+test('CC-011 no-tool documentation and ordinary JSON remain client-visible',async()=>{
+  const visible=[
+    'Для JSON используйте объект {"name":"example"}',
+    `Example:\n${jsonToolCall('Read',{})}`,
+    `\`\`\`json\n${jsonToolCall('Read',{})}\n\`\`\``,
+    `Quoted previous error:\n${textualToolTranscript('Read',{})}`,
+  ];
+  for(const content of visible){
+    const result=await cc011Post({body:{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'synthetic'}]},outputs:[{content,reasoning:'',parentMessageId:'one'}]});
+    assert.equal(JSON.parse(result.text).content[0].text,content);
+  }
+});
+
+test('CC-011 normal no-tool streaming stays incremental while protocol markers are quarantined',async()=>{
+  for(const item of [
+    {path:'/v1/chat/completions',body:{model:'deepseek-chat',messages:[{role:'user',content:'synthetic'}]}},
+    {path:'/v1/messages',body:{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'synthetic'}]}},
+    {path:'/v1/responses',body:{model:'deepseek-chat',input:'synthetic'}},
+  ]){
+    const ordinary=await cc011Post({path:item.path,body:item.body,stream:true,outputs:[{content:'ordinary streaming answer',reasoning:'',parentMessageId:'one'}]});
+    assert.match(ordinary.text,/ordinary str/,item.path);
+    assert.match(ordinary.text,/eaming answer/,item.path);
+    assert.doesNotMatch(ordinary.text,/The model could not produce a valid tool call/);
+
+    const leaked=await cc011Post({path:item.path,body:item.body,stream:true,outputs:[{content:cc011PrivateEcho(),reasoning:'',parentMessageId:'one'}]});
+    assert.match(leaked.text,/The model could not produce a valid tool call/,item.path);
+    assert.doesNotMatch(leaked.text,/TOOL REQUEST SYSTEM|tool_call/,item.path);
+  }
+});
+
+test('CC-011 protocol-sensitive session buffers later no-tool output without restoring tools',async()=>{
+  const sessions=new SessionStore();
+  const outputs=[
+    {content:'initial ordinary answer',reasoning:'',parentMessageId:'one'},
+    {content:jsonToolCall('Read',{file_path:'old.txt'}),reasoning:'PRIVATE',parentMessageId:'two'},
+  ];
+  const config={host:'127.0.0.1',port:0,key:'',maxBytes:1024*1024,timeoutMs:5000,origins:new Set()};
+  let calls=0;
+  const server=createProxyServer({config,sessionStore:sessions,logger:()=>{},completeImpl:async({onDelta})=>{
+    const output=outputs[calls++];
+    onDelta?.({content:output.content.slice(0,8)});
+    onDelta?.({content:output.content.slice(8)});
+    return output;
+  }});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const url=`http://127.0.0.1:${server.address().port}/v1/messages`;
+    const headers={'content-type':'application/json','x-agent-session':'cc011-sensitive'};
+    await (await fetch(url,{method:'POST',headers,body:JSON.stringify({model:'deepseek-chat',stream:true,max_tokens:64,messages:[{role:'user',content:'first'}],tools:[{name:'Read',input_schema:{type:'object'}}]})})).text();
+    const second=await (await fetch(url,{method:'POST',headers,body:JSON.stringify({model:'deepseek-chat',stream:true,max_tokens:64,messages:[{role:'user',content:'second'}],tools:[]})})).text();
+    assert.equal(calls,2);
+    assert.match(second,/The model could not produce a valid tool call/);
+    assert.doesNotMatch(second,/tool_call|old\.txt|PRIVATE|"type":"tool_use"/);
+  }finally{server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
 });

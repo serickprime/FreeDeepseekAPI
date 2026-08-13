@@ -37,6 +37,7 @@ const {
   repeatedToolFailure,
 } = require('./lib/tool_continuation');
 const { createProtocolStream } = require('./lib/api_stream');
+const { classifyToolProtocolOutput } = require('./lib/tool_containment');
 const { createToolDiagnostics } = require('./lib/tool_diagnostics');
 const { estimateTokenCount, validateCountTokensBody } = require('./lib/token_count');
 const { createSetupController } = require('./lib/setup');
@@ -414,7 +415,9 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       }
 
       const allowedTools = input.tools.map(tool => tool?.function?.name).filter(Boolean);
-      const hasTools = allowedTools.length > 0;
+      const hasExecutableTools = allowedTools.length > 0;
+      const protocolContextSeen = session.protocolContextSeen === true;
+      if (hasExecutableTools) session.protocolContextSeen = true;
       const upstreamPrompt = isToolContinuation
         ? createToolContinuationPrompt(toolResults, input.tools)
         : input.prompt + toolPrompt(input.tools);
@@ -425,7 +428,12 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
           model: modelName,
           created: Math.floor(Date.now() / 1000),
         };
-        stream = createProtocolStream(res, { kind, ...streamIdentity, bufferForTools: hasTools });
+        stream = createProtocolStream(res, {
+          kind,
+          ...streamIdentity,
+          bufferForTools: hasExecutableTools || protocolContextSeen,
+          quarantineToolProtocol: !hasExecutableTools && !protocolContextSeen,
+        });
       }
 
       let output = await runCompletion({
@@ -440,7 +448,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
       let toolParseResult = inspectToolCallFromOutput(output, allowedTools);
       let toolCall = toolParseResult.toolCall;
       let safeFailure = false;
-      if (shouldRetryFencedToolResponse({ hasTools, toolCall, retryCount: 0, inspection: toolParseResult })) {
+      if (shouldRetryFencedToolResponse({ hasTools: hasExecutableTools, toolCall, retryCount: 0, inspection: toolParseResult })) {
         correctionAttempted = true;
         fencedToolRetryAttempted = true;
         toolRetryReason = 'code_fence';
@@ -463,7 +471,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         }
       }
       if (shouldRetryPrefixedToolResponse({
-        hasTools,
+        hasTools: hasExecutableTools,
         toolCall,
         retryCount: correctionAttempted ? 1 : 0,
         inspection: toolParseResult,
@@ -492,7 +500,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         }
       }
       if (shouldRetryBraceDelimitedToolLikeResponse({
-        hasTools,
+        hasTools: hasExecutableTools,
         toolCall,
         retryCount: correctionAttempted ? 1 : 0,
         inspection: toolParseResult,
@@ -519,7 +527,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         }
       }
       const malformedIntent = classifyMalformedToolIntent({
-        hasTools,
+        hasTools: hasExecutableTools,
         toolCall,
         retryCount: correctionAttempted ? 1 : 0,
         inspection: toolParseResult,
@@ -555,7 +563,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
           output = malformedToolFailure(output);
         }
       }
-      if (!correctionAttempted && shouldRetryToolResponse({ hasTools, output, toolCall, retryCount: 0 })) {
+      if (!correctionAttempted && shouldRetryToolResponse({ hasTools: hasExecutableTools, output, toolCall, retryCount: 0 })) {
         correctionAttempted = true;
         reasoningRetryAttempted = true;
         toolRetryReason = 'reasoning_only';
@@ -602,6 +610,12 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
           toolCall = null;
         }
       }
+      const protocolIntent = classifyToolProtocolOutput({ output, allowedNames: allowedTools });
+      const protocolContained = !toolCall && protocolIntent.action === 'contain_only';
+      if (protocolContained) {
+        safeFailure = true;
+        output = malformedToolFailure(output);
+      }
       if (isToolContinuation && !toolCall && output.reasoning) output = { ...output, reasoning: '' };
       resolver.release(resolution.callIds, upstreamKey);
       forgetCompletedToolCalls(session, resolution.callIds);
@@ -633,7 +647,7 @@ function createProxyServer({ config = assertConfig(), completeImpl = complete, s
         toolParseResult,
         outcome: toolCall ? 'tool_call' : safeFailure || !String(output?.content || '').trim() ? 'safe_failure' : 'final_text',
       });
-      if (stream) return stream.finish({ output, toolCall, finalResponse });
+      if (stream) return stream.finish({ output, toolCall, finalResponse, protocolContained });
       return send(res, 200, finalResponse);
     } catch (error) {
       diagnosticResponse?.upstreamError(error, latestUpstream);
