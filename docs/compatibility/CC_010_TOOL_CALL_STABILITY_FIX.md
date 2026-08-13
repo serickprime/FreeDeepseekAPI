@@ -1,0 +1,358 @@
+# CC-010 Tool Call Stability Fix
+
+Date: 2026-08-13
+
+Finding: `CC-010`
+
+Working title: `TOOL_OUTPUT_FORMAT_CONSISTENCY_AND_RECOVERY`
+
+Baseline main: `94f935527bfa8a2ba91fcabcfd7f3ad0fcd3b677`
+
+Branch: `fix/cc-010-tool-call-stability`
+
+Status: `DOCUMENTED_BEFORE_IMPLEMENTATION`
+
+Baseline validation: `npm.cmd test` 202/202 PASS; the required five
+`node --check` commands and `git diff --check` PASS.
+
+## Scope and root-cause policy
+
+CC-010 is a production fix for Claude Code tool-call format consistency and
+bounded recovery. It does not start CC-006 or CC-008 and does not change the
+documented CC-005 model-selection boundary.
+
+The following facts are confirmed by the current implementation and manual
+live evidence:
+
+- the active DeepSeek output protocol requires exactly one strict JSON
+  envelope, `{"tool_call":{"name":"tool_name","arguments":{}}}`, and no
+  other text;
+- historical client tool invocations are currently rendered into the
+  upstream prompt with the output-like marker `[Tool Call]`;
+- `[Tool Call]` and the canonical `tool_call` envelope are different formats;
+- current structural diagnostics and recovery predicates look for the
+  `tool_call` marker and do not recognize the exact `[Tool Call]` transcript;
+- current recovery predicates do not cover every observed textual shape.
+
+The following remains a hypothesis:
+
+> Showing historical tool invocations as `[Tool Call]` may encourage the model
+> to imitate that textual format on later turns.
+
+This hypothesis is plausible but is not `ROOT_CAUSE_CONFIRMED`. It may only be
+upgraded after controlled tests compare behavior after removing the format
+inconsistency. The confirmed defect is the protocol-format inconsistency and
+the missing bounded handling of observed malformed intent classes.
+
+## Observed failures
+
+- A textual transcript instead of a real call:
+
+  ```text
+  [Tool Call]
+  name: Read
+  arguments: {"file_path":"X"}
+  ```
+
+- Prose followed by a strict-looking JSON tool envelope.
+- Multiple textual tool envelopes in one completion.
+- Markdown or ordinary text suffixes after tool envelopes.
+- Malformed tool arguments, including string/null arguments and broken JSON.
+- An explicit local file path with `Read` available, followed by a claim that
+  the file is unavailable instead of a `Read` request.
+
+The first five items can provide structural malformed-output evidence. The
+last item is also affected by model selection: prompt guidance can improve the
+decision boundary but cannot guarantee that the model selects `Read`.
+
+## Confirmed implementation gaps
+
+### History/output format inconsistency
+
+`server.js` currently serializes OpenAI, Anthropic, and Responses historical
+assistant tool invocations as:
+
+```text
+[Tool Call]
+name: Read
+call_id: ...
+arguments: {...}
+```
+
+At the same time, `toolPrompt()` and all correction prompts require:
+
+```json
+{"tool_call":{"name":"tool_name","arguments":{}}}
+```
+
+The model therefore sees two incompatible tool-request representations.
+Tool-result continuation itself already uses a separate
+`[Completed Tool Result]` data block and does not replay the full transcript.
+
+### Missing `[Tool Call]` recognition
+
+The current structural signals contain only a case-insensitive `tool_call`
+substring marker. The exact historical marker `[Tool Call]` has a space and is
+not recognized by the fenced, prefixed, or brace-delimited predicates.
+
+### Suffix and multiple-envelope gap
+
+The prefixed predicate requires malformed selected content to end with `}`.
+It therefore does not cover the observed class containing prose, two or more
+standalone strict-looking envelopes, and an arbitrary suffix.
+
+### CC-001 is a different class
+
+CC-001 brace recovery requires selected `content`, parser reason
+`invalid_json`, a non-fenced response that starts and ends with braces, and a
+`tool_call` marker. It does not cover textual `[Tool Call]`, multiple
+standalone envelopes with surrounding text, or valid JSON rejected for a
+strict shape reason.
+
+### Valid-JSON malformed envelopes
+
+Some structurally obvious tool envelopes are valid JSON but fail with parser
+reasons other than `invalid_json`, for example `arguments_not_object`,
+`invalid_tool_shape`, or `unexpected_envelope_keys`. The current format retry
+predicates do not include those reasons. Truncated argument JSON remains an
+`invalid_json` case but may not match the current fence/prefix/brace shapes.
+
+## Non-Bridge observations
+
+- language drift;
+- stale Claude Code recap.
+
+These observations remain outside CC-010 unless separate evidence identifies
+a Bridge-controlled boundary.
+
+## Fix strategy
+
+### A. Remove format contamination without deleting history
+
+The preferred implementation candidate is Option B: translate historical
+assistant tool invocations into a neutral, explicitly historical data record
+that cannot be mistaken for a new executable output. The record must retain
+the tool name, call ID, and arguments, while avoiding both `[Tool Call]` and a
+standalone canonical output envelope. A representative shape is:
+
+```text
+[Historical Assistant Action Data]
+kind: tool_invocation_already_requested
+name: Read
+call_id: ...
+arguments_data: {...}
+[/Historical Assistant Action Data]
+```
+
+The exact label will be selected by regression tests. Stored
+`SessionStore`/`session.toolCalls` semantics should remain unchanged.
+Continuation must keep correlating real results by call ID, and exact-repeat
+protection must keep using stored name/arguments rather than parsing this
+display representation.
+
+Option A, a canonical but explicitly historical representation, remains a
+fallback only if tests show the neutral transcript loses required semantics.
+It is less preferred because placing an executable-looking canonical envelope
+in history can still create imitation pressure.
+
+### B. Add narrow recovery classification around the strict parser
+
+The strict acceptance path in `inspectToolCall()` will not be made
+permissive. New classification belongs around the rejected parser result and
+may trigger only one model correction.
+
+Planned narrow classes:
+
+- `textual_tool_transcript`: the selected output is the exact standalone
+  `[Tool Call]` transcript shape, contains a bounded safe name present in the
+  current allowlist, and is not fenced, inline-code, quoted, or documentation
+  prose;
+- `multi_tool_like`: selected output contains two or more standalone exact
+  canonical envelope markers outside fenced/inline/quoted regions, with
+  bounded allowed names, but no accepted strict call;
+- `malformed_tool_envelope`: a whole-response JSON envelope, or a narrowly
+  anchored truncated envelope, makes canonical tool intent structurally
+  unambiguous, contains a bounded currently allowed name, and failed only a
+  selected set of strict shape/argument reasons.
+
+Classification will not extract executable objects, repair arguments, or
+convert text directly into a tool call. The only path is:
+
+```text
+rejected malformed intent
+-> one static correction prompt
+-> strict inspectToolCallFromOutput()
+-> one normal protocol tool event or final text
+```
+
+If the correction is invalid, the response becomes the existing generic safe
+failure. The initial or corrective malformed payload, arguments, paths, and
+reasoning must not be returned or logged.
+
+### C. Preserve one-tool lifecycle
+
+One completion may produce at most one executable tool request. A task needing
+`Read A`, `Read B`, and `Glob C` must continue through three real client tool
+cycles. Multiple malformed textual envelopes are only a correction trigger;
+they are never locally expanded or executed.
+
+### D. Add narrow tool-required guidance
+
+`toolPrompt()` will say, in substance: when a task depends on information that
+can only be obtained with an available tool, request the appropriate tool
+first; do not claim that a file, project, or data is unavailable before trying
+an appropriate available tool.
+
+This is guidance, not deterministic forcing. CC-010 will not implement
+Anthropic `tool_choice`, global `required`, prompt-derived forcing, or a
+synthetic `ExitTool`.
+
+### E. Keep one shared correction budget
+
+All existing and new correction classes must share the current
+`correctiveAttempted` budget:
+
+```text
+MAX_COMPLETIONS = 2
+initial completion + at most one corrective completion
+```
+
+No request may chain brace, textual, multi-envelope, malformed-envelope,
+reasoning-only, or repeated-tool corrections.
+
+### External design references
+
+The following repositories were reviewed only for architectural reference:
+
+- <https://github.com/musistudio/llms>
+- <https://github.com/musistudio/claude-code-router>
+- <https://github.com/CJackHwang/ds2api>
+- <https://github.com/NIyueeE/ds-free-api>
+- <https://github.com/zenyxx-xd/FreeDeepseek-CC>
+
+Useful ideas are canonical structured history, protocol-specific adapters,
+tool-output anti-leak behavior, malformed fixtures, and bounded streaming
+argument accumulation. Their permissive extraction/repair behavior is not a
+design precedent for this Bridge.
+
+## Safety invariants
+
+- The Bridge never executes model tool calls; it only returns validated
+  protocol tool events to the calling client.
+- `inspectToolCall()` accepts only the existing canonical whole-response
+  structure. Parser acceptance is not relaxed for CC-010.
+- Textual `[Tool Call]`, multiple envelopes, and malformed envelopes are never
+  converted directly into executable calls.
+- No arbitrary JSON substring extraction, fuzzy extraction, regex-based
+  execution, JSON5, `jsonrepair`, or local argument repair is added.
+- Every name used by a correction classification is a bounded identifier and
+  an exact member of the current request's allowed tool names.
+- Unknown/unavailable names never become executable calls. Any safe rejection
+  or correction must expose only the current safe allowlist.
+- Code fences, inline-code examples, Markdown quotations, README/tutorial
+  content, user quotations, ordinary prose, arbitrary JSON, and discussions
+  of `[Tool Call]` must not trigger recovery.
+- Historical tool semantics are retained: name, arguments, call/result
+  correlation, continuation, and repeated-tool protection remain available.
+- A completion yields at most one executable tool call; malformed multi-call
+  text cannot bypass the client-owned tool lifecycle.
+- All correction classes share one budget; maximum completions per Bridge
+  request remains two.
+- After an attempted malformed-intent correction fails, raw content,
+  reasoning, arguments, paths, prompts, and results are suppressed in favor
+  of the generic safe failure.
+- Diagnostics remain opt-in and bounded. They may record a safe class/reason,
+  correction-attempt boolean, safe allowed name, and completion count, but not
+  raw model output, raw arguments, paths, prompts, reasoning, results, tokens,
+  cookies, or authorization data.
+- Existing OpenAI, Anthropic, Responses, streaming, session, call-ID,
+  continuation, and exact-repeat semantics remain intact.
+- CC-010 does not add `tool_choice`, `ExitTool`, DSML, direct parallel/multi
+  tool execution, account rotation, or any CAPTCHA/2FA/limit bypass.
+
+## Verification plan
+
+### Unit tests
+
+- Prove strict parser rejection for textual, multiple, suffixed, malformed,
+  truncated, wrong-field, spilled-field, merged-field, and unknown-name
+  fixtures.
+- Prove the exact positive gates for each new recovery class.
+- Prove negative controls for fenced examples, inline code, Markdown quotes,
+  README/tutorial text, discussions, user quotations, arbitrary JSON, normal
+  prose, unavailable names, and valid strict calls.
+- Prove safe allowlist/name bounds, no local argument repair, generic failure,
+  payload isolation, diagnostics-off behavior, and logger failure safety.
+- Prove all correction orderings consume one shared budget and never exceed
+  two completions.
+
+### Integration tests
+
+- Prove historical OpenAI, Anthropic, and Responses tool calls no longer use
+  `[Tool Call]` while preserving names, arguments, IDs, and results.
+- Prove continuation and exact-repeat protection after the representation
+  change.
+- Prove successful and failed recovery through all three adapters and buffered
+  streaming without raw textual leakage.
+- Prove an explicit synthetic local file path plus an advertised `Read`
+  receives the new guidance, without claiming deterministic selection.
+- Preserve all CC-001 regressions and CC-005 no-forcing semantics.
+
+### Offline validation
+
+Run `npm.cmd test`, the five required `node --check` commands, and
+`git diff --check`. The test count must exceed the 202-test baseline.
+
+### Controlled Claude live verification
+
+Only after offline PASS and separate explicit user approval, run at most three
+foreground Claude Code invocations against a disposable synthetic fixture:
+
+1. `deepseek-chat` basic project read;
+2. `deepseek-chat` explicit file read;
+3. `deepseek-reasoner` Glob then Read.
+
+Record the actual Claude Code and Node versions, strict tool lifecycle,
+correction class/attempt, maximum completions, raw malformed exposure, and
+model-selection failures separately from formatting failures. Do not repeat a
+run for a better result.
+
+## Implemented changes
+
+Not implemented yet. This section will be updated in the production
+implementation commit.
+
+## Rejected alternatives
+
+Provisionally rejected before implementation:
+
+- arbitrary JSON extraction;
+- JSON5 or `jsonrepair`;
+- global `tool_choice = required`;
+- synthetic `ExitTool`;
+- DSML migration;
+- direct execution of multiple textual tool calls.
+
+The final implementation document will record any additional rejected design
+alternatives and the test evidence supporting the selected history format.
+
+## Regression coverage
+
+Pending implementation. The existing 202-test baseline includes strict parser,
+CC-001 fenced/prefixed/brace recovery, shared-budget, continuation,
+exact-repeat, adapters, streaming, diagnostics, and payload-isolation tests.
+
+## Remaining limitations
+
+- The model may still choose no tool.
+- `deepseek-reasoner` may still produce malformed output after the single
+  correction.
+- The Bridge corrects at most once and then fails safely.
+- Prompt guidance cannot guarantee explicit-file `Read` selection.
+- Language drift is unrelated to this fix.
+- Stale Claude Code recap is unrelated to this fix.
+
+## Final status
+
+Pending implementation, offline validation, controlled live verification,
+PR review, and merge decision.
