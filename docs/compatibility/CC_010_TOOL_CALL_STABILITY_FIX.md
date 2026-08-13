@@ -10,7 +10,7 @@ Baseline main: `94f935527bfa8a2ba91fcabcfd7f3ad0fcd3b677`
 
 Branch: `fix/cc-010-tool-call-stability`
 
-Status: `IMPLEMENTED_OFFLINE_VERIFIED; CONTROLLED_LIVE_PENDING`
+Status: `CC_010_FIXED; CONTROLLED_LIVE_COMPLETE; PR_PENDING`
 
 Baseline validation: `npm.cmd test` 202/202 PASS; the required five
 `node --check` commands and `git diff --check` PASS.
@@ -442,6 +442,145 @@ suppression, continuation, exact-repeat, adapter, and streaming regressions
 remain passing. Existing CC-005 semantics remain unchanged: ordinary model
 final text is not converted into a forced tool call.
 
+## Controlled live results
+
+The separately authorized controlled verification ran on 2026-08-13 against
+implementation commit `9682cc0c2f08f7f93951d8c455927a950c14e0e7`.
+
+### Environment and invocation boundary
+
+- Node.js: `v24.12.0`.
+- Claude Code immediately before the run: `2.1.228`.
+- Claude Code immediately after the run: `2.1.231`.
+- Exact version for each child process: not retained; the installed CLI
+  changed across the test boundary, so both observed versions are recorded.
+- Foreground Claude model invocations: 3.
+- Harness retries: 0.
+- Fresh session/config state: yes, independently for every invocation.
+- Bridge diagnostics: enabled and reduced to bounded structural fields.
+- Controlled Bridge: owned loopback listener on port 19655.
+- Existing unrelated loopback listener on port 9655: left untouched.
+- Fixture: `FreeDeepseekAPI-cc010-fix-fixture`, outside the production
+  repository, containing synthetic data only.
+
+The Claude stream was reduced in memory to tool-use names, tool-result count,
+marker-presence booleans, result/error flags, and malformed-text flags. Raw
+assistant text, prompts, arguments, tool results, and marker values were not
+written to a log or retained in this report.
+
+### Aggregate Bridge evidence
+
+- `/v1/messages` requests: 6.
+- Tool-capable requests: 6.
+- Tool-result continuation requests: 3.
+- Strict executable tool calls: 3, all `Read`.
+- Claude tool-result events: 3.
+- Requests reaching both `completion_completed` and `stream_parsed`: 6/6.
+- Maximum upstream completions per Bridge request: 1.
+- Corrections attempted: 0.
+- CC-010 structural classes observed: 0.
+- Safe failures: 0.
+- Upstream/network errors: 0.
+- Raw textual `[Tool Call]` visible: no.
+- Raw `tool_call` JSON or other detected tool-like text visible: no.
+- Neutral historical action record visible in the UI: no.
+
+No malformed class occurred naturally, so live correction status is
+`NOT_TRIGGERED`. The deterministic evidence for successful correction and
+failed-correction suppression remains the 215-test offline suite. The live
+run proves no raw exposure in these three outputs and no regression of direct
+strict `Read -> tool_result` lifecycle.
+
+### Run A — deepseek-chat basic project read
+
+Requested lifecycle: `Read package.json -> Read README.md -> final text`.
+
+Observed Bridge lifecycle:
+
+```text
+Read (content/accepted, strict, completion_count=1)
+-> one real tool_result continuation
+-> ordinary final text (content/invalid_json, no marker, completion_count=1)
+```
+
+- Claude exit: 0, terminal result non-error.
+- Real `Read -> tool_result`: yes, once.
+- Second requested `Read`: not selected.
+- Requested marker values visible in final answer: no.
+- Claim of file unavailability before a tool attempt: no.
+- Formatting failure: no.
+- Raw malformed exposure: no.
+- Classification: `MODEL_SELECTION_PARTIAL`, not a formatting failure.
+
+This run confirms one normal strict tool lifecycle but does not claim full
+task completion because the model stopped before the second requested Read.
+
+### Run B — deepseek-chat explicit file Read
+
+The prompt contained the exact disposable fixture file path and advertised
+`Read`.
+
+Observed Bridge lifecycle:
+
+```text
+Read (content/accepted, strict, completion_count=1)
+-> tool_result continuation
+-> Read (content/accepted, strict, completion_count=1)
+-> tool_result continuation
+-> ordinary final text (content/invalid_json, no marker, completion_count=1)
+```
+
+- Claude exit: 0, terminal result non-error.
+- `Read` selected: yes.
+- Real tool-use/tool-result cycles: 2.
+- False file-unavailable claim before attempting Read: no.
+- Exact synthetic marker visible in the final answer: no.
+- Formatting failure: no.
+- Raw malformed exposure: no.
+- Classification: `READ_SELECTED; FINAL_MARKER_NOT_OBSERVED`.
+
+The exact-file selection improvement succeeded at the selection/protocol
+boundary. Because the safe harness retained neither arguments nor result
+payloads and the marker did not appear in final text, it does not claim that
+the requested marker answer was semantically correct.
+
+### Run C — deepseek-reasoner Glob then Read
+
+Requested lifecycle: `Glob -> tool_result -> Read -> tool_result -> final`.
+
+Observed Bridge lifecycle:
+
+```text
+ordinary final text (content/invalid_json, no tool-call marker,
+completion_count=1)
+```
+
+- Claude exit: 0, terminal result non-error.
+- `Glob` selected: no.
+- `Read` selected: no.
+- Tool result: none.
+- Synthetic marker visible: no.
+- Formatting failure: no.
+- Raw textual or JSON tool output: no.
+- Correction attempted: no, because no structural malformed intent existed.
+- Classification: `MODEL_SELECTION_FAILURE`, not a formatting failure.
+
+This is consistent with the documented CC-005/model-selection limitation and
+does not establish a CC-010 recovery regression. The test was not repeated for
+a better stochastic result.
+
+### Live safety and cleanup
+
+- Fixture source hashes unchanged after all invocations: yes.
+- Fixture removed: yes.
+- Temporary Claude config directories removed: yes.
+- Owned Claude process roots closed: yes.
+- Owned controlled Bridge stopped: yes.
+- Controlled port 19655 free after cleanup: yes.
+- Claude processes remaining after cleanup: 0.
+- Production repository accessed by model tools: no.
+- Foreground invocation count remained exactly 3: yes.
+
 ## Remaining limitations
 
 - The model may still choose no tool.
@@ -451,14 +590,34 @@ final text is not converted into a forced tool call.
 - Prompt guidance cannot guarantee explicit-file `Read` selection.
 - Language drift is unrelated to this fix.
 - Stale Claude Code recap is unrelated to this fix.
+- The live run did not naturally produce a recognized malformed class, so
+  bounded correction remains directly demonstrated offline rather than by a
+  stochastic live trigger.
+- The basic chat run stopped after one of two requested Reads; the reasoner
+  run selected no tool; and the explicit-file run did not surface the expected
+  marker in final text. These are recorded separately from formatting and raw
+  exposure evidence.
 
 ## Final status
 
-Implementation and offline verification: PASS (`npm.cmd test` 215/215; all
-required syntax and diff checks PASS).
+Implementation and offline verification: PASS. Post-live `npm.cmd test` is
+215/215 PASS; all five required `node --check` commands and
+`git diff --check` PASS.
 
-The confirmed history/output inconsistency and bounded Bridge recovery gaps
-are fixed offline. The causal claim that historical `[Tool Call]` imitation
-pressure changes live model behavior remains a hypothesis. Controlled live
-verification, PR review, and merge decision are still pending. No CC-006 or
-CC-008 work has started.
+Controlled live success bar: PASS for CC-010. No raw textual malformed output
+was exposed; all observed valid tool requests used the strict Claude
+tool-use/tool-result lifecycle; all Bridge requests used one completion; and
+there was no formatting failure. A recognized malformed class did not occur
+naturally, so neither a live correction nor live generic failure was needed.
+
+`BRIDGE_DEFECT_FIXED = YES`
+
+`CC010_CLASSIFICATION = CC_010_FIXED`
+
+Further CC-010 production change required before PR: NO.
+
+The hypothesis that historical `[Tool Call]` representation caused imitation
+pressure remains unconfirmed because this was not an A/B model experiment and
+no malformed class recurred. Model-selection failures remain a separate
+limitation. PR review and merge decision are pending. No CC-006 or CC-008 work
+has started.
