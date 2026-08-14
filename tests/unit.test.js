@@ -2369,6 +2369,13 @@ function upstreamChallengeResponse(){return new Response(JSON.stringify(doctorCh
 function upstreamStreamResponse(content='ok'){
   return new Response(`data: ${JSON.stringify({p:'response/content',v:content})}\n`,{status:200,headers:{'content-type':'text/event-stream'}});
 }
+function upstreamMetadataOnlyResponse(parentMessageId='metadata-only-parent'){
+  return new Response([
+    `data: ${JSON.stringify({response_message_id:parentMessageId})}`,
+    `data: ${JSON.stringify({p:'response/status',v:'FINISHED'})}`,
+    '',
+  ].join('\n'),{status:200,headers:{'content-type':'text/event-stream'}});
+}
 function requestDiagnostics(lines,requestRef='0011223344556677'){
   const diagnostics=createToolDiagnostics({enabled:true,logger:line=>lines.push(line)});
   const request=diagnostics.request({
@@ -2491,6 +2498,28 @@ test('existing retry can recover under one request_ref without policy changes',a
   assert.equal(records.at(-1).event,'tool_response');
   assert.equal(records.at(-1).request_ref,'2233445566778899');
   assert.doesNotMatch(lines.join('\n'),/RETRY_BODY_SECRET/);
+});
+
+test('CC-014 metadata-only HTTP 200 retries instead of becoming an empty assistant turn',async()=>{
+  const responses=[
+    upstreamSessionResponse('empty-session-1'),upstreamChallengeResponse(),upstreamMetadataOnlyResponse(),
+    upstreamSessionResponse('empty-session-2'),upstreamChallengeResponse(),upstreamStreamResponse('empty retry recovered'),
+  ];
+  const errors=[];
+  const session={id:null,parentMessageId:null,history:[]};
+  const result=await complete({
+    prompt:'offline',session,
+    model:{model_type:'default',reasoning:false,search:false},auth:{token:'synthetic',cookie:'synthetic'},
+    fetchImpl:async()=>responses.shift(),solvePow:async()=>7,sleep:async()=>{},
+    onError:(error,metadata)=>errors.push({error,metadata}),
+  });
+  assert.equal(result.content,'empty retry recovered');
+  assert.equal(session.id,'empty-session-2');
+  assert.equal(session.parentMessageId,null);
+  assert.equal(errors.length,1);
+  assert.equal(errors[0].error.name,'DeepSeekEmptyResponseError');
+  assert.equal(errors[0].error.retryable,true);
+  assert.equal(errors[0].metadata.stage,'empty_response');
 });
 
 test('retry exhaustion reports every existing attempt and preserves the safe final error',async()=>{
