@@ -668,7 +668,7 @@ test('DeepSeek stream parser keeps content, reasoning and final unterminated lin
     controller.close();
   }});
   const result=await parseStream(stream,delta=>deltas.push(delta));
-  assert.deepEqual(result,{content:'hello',reasoning:'why',parentMessageId:null});
+  assert.deepEqual(result,{content:'hello',reasoning:'why',parentMessageId:null,modelPayloadSeen:true,contentBytes:5,reasoningBytes:3});
   assert.deepEqual(deltas,[{reasoning:'why'},{content:'hel'},{content:'lo'}]);
 });
 
@@ -683,7 +683,7 @@ test('DeepSeek stream parser applies fragment append patches used by the live We
   const deltas=[];
   const stream=new ReadableStream({start(controller){for(const line of source)controller.enqueue(new TextEncoder().encode(line));controller.close();}});
   const result=await parseStream(stream,delta=>deltas.push(delta));
-  assert.deepEqual(result,{content:'CHECK_4826',reasoning:'because...',parentMessageId:'message-1'});
+  assert.deepEqual(result,{content:'CHECK_4826',reasoning:'because...',parentMessageId:'message-1',modelPayloadSeen:true,contentBytes:10,reasoningBytes:10});
   assert.deepEqual(deltas,[{content:'CHECK'},{content:'_4826'},{reasoning:'because'},{reasoning:'...'}]);
 });
 
@@ -986,7 +986,7 @@ test('doctor identifies WASM download errors without leaking secrets',async()=>{
 test('doctor identifies WASM compilation errors',async()=>{const {result}=await doctorCase({solvePow:doctorPow({failureStage:'compile'})});assert.equal(result.stage,'wasm_compile');});
 test('doctor identifies PoW solve errors',async()=>{const {result}=await doctorCase({solvePow:doctorPow({failureStage:'solve'})});assert.equal(result.stage,'pow');});
 test('doctor identifies completion HTTP errors',async()=>{const {result}=await doctorCase({fetchOptions:{completionStatus:403}});assert.equal(result.stage,'completion');assert.match(result.error,/HTTP 403/);});
-test('doctor rejects an empty parsed streaming response',async()=>{const {result}=await doctorCase({fetchOptions:{completionText:''}});assert.equal(result.stage,'answer');assert.match(result.error,/пустой/);});
+test('doctor reports an exhausted empty upstream response as an answer-stage HTTP error',async()=>{const {result}=await doctorCase({fetchOptions:{completionText:''}});assert.equal(result.stage,'answer');assert.equal(result.error,'HTTP 502');});
 test('doctor rejects a response without its expected marker',async()=>{const {result}=await doctorCase({fetchOptions:{completionText:'data: {"p":"response/content","v":"OTHER"}\n'}});assert.equal(result.stage,'answer');assert.match(result.error,/маркер/);});
 test('doctor redacts credentials from arbitrary stage errors',async()=>{const {result,lines}=await doctorCase({overrides:{createSessionImpl:async()=>{throw new Error('Bearer bearer-secret token=token-secret cookie=cookie-secret authorization=auth-secret');}}});assert.equal(result.stage,'session');assert.doesNotMatch(lines.join('\n'),/bearer-secret|token-secret|cookie-secret|auth-secret/);});
 test('doctor enforces a bounded overall timeout',async()=>{const lines=[];const result=await runDiagnostics({readFile:()=>doctorAuth(),reachabilityImpl:()=>new Promise(()=>{}),timeoutMs:25,output:line=>lines.push(line),errorOutput:line=>lines.push(line)});assert.equal(result.stage,'timeout');assert.ok(lines.some(line=>line.includes('Общее время диагностики')));assert.equal(boundedTimeout(Infinity),150_000);assert.equal(boundedTimeout(999_999),180_000);});
@@ -2369,6 +2369,63 @@ function upstreamChallengeResponse(){return new Response(JSON.stringify(doctorCh
 function upstreamStreamResponse(content='ok'){
   return new Response(`data: ${JSON.stringify({p:'response/content',v:content})}\n`,{status:200,headers:{'content-type':'text/event-stream'}});
 }
+function upstreamMetadataOnlyResponse(parentMessageId='metadata-only-parent'){
+  return new Response([
+    `data: ${JSON.stringify({response_message_id:parentMessageId})}`,
+    `data: ${JSON.stringify({p:'response/status',v:'FINISHED'})}`,
+    '',
+  ].join('\n'),{status:200,headers:{'content-type':'text/event-stream'}});
+}
+function upstreamReasoningResponse(reasoning='reasoning only'){
+  return new Response(`data: ${JSON.stringify({p:'response/reasoning_content',v:reasoning})}\n`,{status:200,headers:{'content-type':'text/event-stream'}});
+}
+function upstreamSearchResponse(content='search payload'){
+  return new Response(`data: ${JSON.stringify({p:'response/fragments',v:{type:'SEARCH',content}})}\n`,{status:200,headers:{'content-type':'text/event-stream'}});
+}
+function cc014Upstream(completions){
+  const state={sessions:0,challenges:0,completions:0,urls:[]};
+  const fetchImpl=async url=>{
+    state.urls.push(String(url));
+    if(String(url).includes('chat_session/create'))return upstreamSessionResponse(`cc014-session-${++state.sessions}`);
+    if(String(url).includes('create_pow_challenge')){state.challenges+=1;return upstreamChallengeResponse();}
+    if(String(url).includes('/chat/completion')){
+      const response=completions[state.completions++];
+      if(!response)throw new Error('unexpected CC-014 completion attempt');
+      return response;
+    }
+    throw new Error('unexpected CC-014 upstream URL');
+  };
+  return {fetchImpl,state};
+}
+function cc014CompleteOptions(completions,overrides={}){
+  const upstream=cc014Upstream(completions);
+  return {
+    upstream,
+    options:{
+      prompt:'offline',session:{id:null,parentMessageId:null,history:[]},
+      model:{model_type:'default',reasoning:false,search:false},auth:{token:'synthetic',cookie:'synthetic'},
+      fetchImpl:upstream.fetchImpl,solvePow:async()=>7,sleep:async()=>{},...overrides,
+    },
+  };
+}
+async function cc014ApiCase({route,body,completions}){
+  const upstream=cc014Upstream(completions);
+  const completeImpl=options=>complete({
+    ...options,auth:{token:'synthetic',cookie:'synthetic'},fetchImpl:upstream.fetchImpl,
+    solvePow:async()=>7,sleep:async()=>{},
+  });
+  const server=createProxyServer({config:diagnosticConfig,completeImpl,logger:()=>{}});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const response=await fetch(`http://127.0.0.1:${server.address().port}${route}`,{
+      method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body),
+    });
+    return {status:response.status,contentType:response.headers.get('content-type'),text:await response.text(),upstream:upstream.state};
+  }finally{
+    server.closeAllConnections?.();
+    await new Promise(resolve=>server.close(resolve));
+  }
+}
 function requestDiagnostics(lines,requestRef='0011223344556677'){
   const diagnostics=createToolDiagnostics({enabled:true,logger:line=>lines.push(line)});
   const request=diagnostics.request({
@@ -2491,6 +2548,239 @@ test('existing retry can recover under one request_ref without policy changes',a
   assert.equal(records.at(-1).event,'tool_response');
   assert.equal(records.at(-1).request_ref,'2233445566778899');
   assert.doesNotMatch(lines.join('\n'),/RETRY_BODY_SECRET/);
+});
+
+test('CC-014 metadata-only HTTP 200 retries instead of becoming an empty assistant turn',async()=>{
+  const responses=[
+    upstreamSessionResponse('empty-session-1'),upstreamChallengeResponse(),upstreamMetadataOnlyResponse(),
+    upstreamSessionResponse('empty-session-2'),upstreamChallengeResponse(),upstreamStreamResponse('empty retry recovered'),
+  ];
+  const errors=[];
+  const session={id:null,parentMessageId:null,history:[]};
+  const result=await complete({
+    prompt:'offline',session,
+    model:{model_type:'default',reasoning:false,search:false},auth:{token:'synthetic',cookie:'synthetic'},
+    fetchImpl:async()=>responses.shift(),solvePow:async()=>7,sleep:async()=>{},
+    onError:(error,metadata)=>errors.push({error,metadata}),
+  });
+  assert.equal(result.content,'empty retry recovered');
+  assert.equal(session.id,'empty-session-2');
+  assert.equal(session.parentMessageId,null);
+  assert.equal(errors.length,1);
+  assert.equal(errors[0].error.name,'DeepSeekEmptyResponseError');
+  assert.equal(errors[0].error.retryable,true);
+  assert.equal(errors[0].metadata.stage,'empty_response');
+});
+
+test('CC-014 parser reports only bounded structural payload metadata',async()=>{
+  const result=await parseStream(upstreamMetadataOnlyResponse('parent-must-not-be-committed').body);
+  assert.deepEqual(result,{
+    content:'',reasoning:'',parentMessageId:'parent-must-not-be-committed',
+    modelPayloadSeen:false,contentBytes:0,reasoningBytes:0,
+  });
+});
+
+test('CC-014 content, reasoning and search payloads are never false empty',async t=>{
+  const cases=[
+    {name:'content',response:upstreamStreamResponse('normal content'),field:'content',value:'normal content'},
+    {name:'reasoning',response:upstreamReasoningResponse('normal reasoning'),field:'reasoning',value:'normal reasoning'},
+    {name:'search',response:upstreamSearchResponse('normal search'),field:'content',value:'normal search'},
+  ];
+  for(const item of cases)await t.test(item.name,async()=>{
+    const {options,upstream}=cc014CompleteOptions([item.response]);
+    const result=await complete({...options,maxRetries:0});
+    assert.equal(result[item.field],item.value);
+    assert.equal(result.modelPayloadSeen,true);
+    assert.equal(upstream.state.completions,1);
+    assert.equal(upstream.state.sessions,1);
+  });
+});
+
+test('CC-014 two empty attempts can recover on the existing third attempt',async()=>{
+  const {options,upstream}=cc014CompleteOptions([
+    upstreamMetadataOnlyResponse('empty-parent-one'),
+    upstreamMetadataOnlyResponse('empty-parent-two'),
+    upstreamStreamResponse('third attempt recovered'),
+  ]);
+  const waits=[];
+  const errors=[];
+  const result=await complete({...options,sleep:async ms=>waits.push(ms),onError:(error,metadata)=>errors.push({error,metadata})});
+  assert.equal(result.content,'third attempt recovered');
+  assert.deepEqual(waits,[500,1000]);
+  assert.equal(upstream.state.sessions,3);
+  assert.equal(upstream.state.completions,3);
+  assert.deepEqual(errors.map(item=>item.metadata.attempt),[1,2]);
+  assert.ok(errors.every(item=>item.error.name==='DeepSeekEmptyResponseError'&&item.error.status===502&&item.error.retryable===true));
+  assert.equal(options.session.id,'cc014-session-3');
+  assert.equal(options.session.parentMessageId,null);
+});
+
+test('CC-014 retry exhaustion is an explicit retryable upstream error, never empty success',async()=>{
+  const {options,upstream}=cc014CompleteOptions([
+    upstreamMetadataOnlyResponse('empty-parent-one'),
+    upstreamMetadataOnlyResponse('empty-parent-two'),
+    upstreamMetadataOnlyResponse('empty-parent-three'),
+  ]);
+  const errors=[];
+  await assert.rejects(()=>complete({...options,onError:(error,metadata)=>errors.push({error,metadata})}),error=>{
+    assert.equal(error.name,'DeepSeekEmptyResponseError');
+    assert.equal(error.message,'DeepSeek returned an empty model response.');
+    assert.equal(error.status,502);
+    assert.equal(error.retryable,true);
+    assert.equal(error.upstreamStage,'empty_response');
+    return true;
+  });
+  assert.equal(upstream.state.completions,3);
+  assert.equal(upstream.state.sessions,3);
+  assert.deepEqual(errors.map(item=>item.metadata),[
+    {stage:'empty_response',attempt:1,maxAttempts:3},
+    {stage:'empty_response',attempt:2,maxAttempts:3},
+    {stage:'empty_response',attempt:3,maxAttempts:3},
+  ]);
+  assert.equal(options.session.parentMessageId,null);
+});
+
+test('CC-014 metadata-only parent is never committed before an exhausted attempt',async()=>{
+  const session={id:'existing-session',parentMessageId:'existing-parent',history:[]};
+  const {options}=cc014CompleteOptions([upstreamMetadataOnlyResponse('empty-parent')],{session,maxRetries:0});
+  await assert.rejects(()=>complete(options),{name:'DeepSeekEmptyResponseError'});
+  assert.equal(session.id,'existing-session');
+  assert.equal(session.parentMessageId,'existing-parent');
+});
+
+test('CC-014 malformed SSE remains ignored structurally and cannot become empty success',async()=>{
+  const malformed=new Response('data: {not-json}\ndata: [DONE]\n',{status:200,headers:{'content-type':'text/event-stream'}});
+  const parsed=await parseStream(malformed.body);
+  assert.equal(parsed.modelPayloadSeen,false);
+  assert.equal(parsed.contentBytes,0);
+  assert.equal(parsed.reasoningBytes,0);
+
+  const {options}=cc014CompleteOptions([
+    new Response('data: {not-json}\ndata: [DONE]\n',{status:200,headers:{'content-type':'text/event-stream'}}),
+  ],{maxRetries:0});
+  await assert.rejects(()=>complete(options),{name:'DeepSeekEmptyResponseError',upstreamStage:'empty_response'});
+});
+
+test('CC-014 diagnostics identify empty retries without retaining upstream metadata',async()=>{
+  const lines=[];
+  const callbacks=requestDiagnostics(lines,'445566778899aabb');
+  const secretParent='PARENT_METADATA_MUST_NOT_LEAK';
+  const {options}=cc014CompleteOptions([
+    upstreamMetadataOnlyResponse(secretParent),
+    upstreamStreamResponse('diagnostic recovery'),
+  ],{onStage:callbacks.onStage,onError:callbacks.onError});
+  const result=await complete(options);
+  callbacks.request.response({outcome:'final_text',contentNonempty:true});
+  assert.equal(result.content,'diagnostic recovery');
+  const error=diagnosticRecords(lines).find(record=>record.event==='upstream_error');
+  assert.deepEqual(error,{
+    event:'upstream_error',request_ref:'445566778899aabb',stage:'empty_response',
+    error_name:'DeepSeekEmptyResponseError',error_category:'empty_response',status:502,cause_code:null,
+    retryable:true,timeout:false,attempt:1,max_attempts:3,
+    upstream_empty_response:true,empty_retry_attempt:1,
+  });
+  assert.ok(diagnosticRecords(lines).some(record=>record.event==='upstream_stage'&&record.stage==='empty_response'));
+  assert.equal(lines.join('\n').includes(secretParent),false);
+});
+
+test('CC-014 Anthropic streaming retries metadata-only upstream before emitting model content',async()=>{
+  const result=await cc014ApiCase({
+    route:'/v1/messages',
+    body:{model:'deepseek-chat',max_tokens:64,stream:true,messages:[{role:'user',content:'offline'}]},
+    completions:[upstreamMetadataOnlyResponse(),upstreamStreamResponse('anthropic recovered')],
+  });
+  assert.equal(result.status,200);
+  assert.match(result.contentType,/^text\/event-stream/);
+  assert.match(result.text,/anthropic recovered/);
+  assert.match(result.text,/event: message_stop/);
+  assert.doesNotMatch(result.text,/event: error/);
+  assert.equal(result.upstream.completions,2);
+  assert.equal(result.upstream.sessions,2);
+});
+
+test('CC-014 Anthropic streaming exhaustion emits an explicit error without successful stop',async()=>{
+  const result=await cc014ApiCase({
+    route:'/v1/messages',
+    body:{model:'deepseek-chat',max_tokens:64,stream:true,messages:[{role:'user',content:'offline'}]},
+    completions:[upstreamMetadataOnlyResponse(),upstreamMetadataOnlyResponse(),upstreamMetadataOnlyResponse()],
+  });
+  assert.equal(result.status,200);
+  assert.match(result.text,/event: error/);
+  assert.match(result.text,/DeepSeek streaming request failed/);
+  assert.doesNotMatch(result.text,/event: message_stop/);
+  assert.equal(result.upstream.completions,3);
+  assert.equal(result.upstream.sessions,3);
+});
+
+test('CC-014 OpenAI and Responses streaming recover without an empty terminal event',async t=>{
+  const cases=[
+    {
+      name:'OpenAI',route:'/v1/chat/completions',
+      body:{model:'deepseek-chat',stream:true,messages:[{role:'user',content:'offline'}]},
+      final:/data: \[DONE\]/,forbidden:/"error"/,
+    },
+    {
+      name:'Responses',route:'/v1/responses',
+      body:{model:'deepseek-chat',stream:true,input:'offline'},
+      final:/event: response.completed/,forbidden:/event: error/,
+    },
+  ];
+  for(const item of cases)await t.test(item.name,async()=>{
+    const result=await cc014ApiCase({
+      route:item.route,body:item.body,
+      completions:[upstreamMetadataOnlyResponse(),upstreamStreamResponse(`${item.name} recovered`)],
+    });
+    assert.equal(result.status,200);
+    assert.match(result.text,new RegExp(`${item.name} recovered`));
+    assert.match(result.text,item.final);
+    assert.doesNotMatch(result.text,item.forbidden);
+    assert.equal(result.upstream.completions,2);
+  });
+});
+
+test('CC-014 non-streaming adapters recover instead of returning an empty assistant',async t=>{
+  const cases=[
+    {name:'OpenAI',route:'/v1/chat/completions',body:{model:'deepseek-chat',messages:[{role:'user',content:'offline'}]}},
+    {name:'Anthropic',route:'/v1/messages',body:{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'offline'}]}},
+    {name:'Responses',route:'/v1/responses',body:{model:'deepseek-chat',input:'offline'}},
+  ];
+  for(const item of cases)await t.test(item.name,async()=>{
+    const result=await cc014ApiCase({
+      route:item.route,body:item.body,
+      completions:[upstreamMetadataOnlyResponse(),upstreamStreamResponse(`${item.name} nonstream recovered`)],
+    });
+    assert.equal(result.status,200);
+    assert.match(result.text,new RegExp(`${item.name} nonstream recovered`));
+    assert.equal(result.upstream.completions,2);
+  });
+});
+
+test('CC-014 non-streaming adapters expose explicit 502 after empty retry exhaustion',async t=>{
+  const cases=[
+    {name:'OpenAI',route:'/v1/chat/completions',body:{model:'deepseek-chat',messages:[{role:'user',content:'offline'}]}},
+    {name:'Anthropic',route:'/v1/messages',body:{model:'deepseek-chat',max_tokens:64,messages:[{role:'user',content:'offline'}]}},
+    {name:'Responses',route:'/v1/responses',body:{model:'deepseek-chat',input:'offline'}},
+  ];
+  for(const item of cases)await t.test(item.name,async()=>{
+    const result=await cc014ApiCase({
+      route:item.route,body:item.body,
+      completions:[upstreamMetadataOnlyResponse(),upstreamMetadataOnlyResponse(),upstreamMetadataOnlyResponse()],
+    });
+    assert.equal(result.status,502);
+    assert.match(result.text,/DeepSeek request failed/);
+    assert.doesNotMatch(result.text,/metadata-only-parent|empty model response/);
+    assert.equal(result.upstream.completions,3);
+  });
+});
+
+test('CC-014 leaves Bridge tool correction budget and CC-012 execution boundary unchanged',()=>{
+  assert.equal(MAX_COMPLETIONS,2);
+  const strict=inspectToolCallFromOutput({content:jsonToolCall('Read',{file_path:'synthetic.txt'}),reasoning:''},['Read']);
+  assert.equal(strict.reason,'accepted');
+  assert.equal(strict.toolCall.function.name,'Read');
+  const unavailable=inspectToolCallFromOutput({content:jsonToolCall('Read',{file_path:'synthetic.txt'}),reasoning:''},[]);
+  assert.equal(unavailable.reason,'tool_not_allowed');
+  assert.equal(unavailable.toolCall,null);
 });
 
 test('retry exhaustion reports every existing attempt and preserves the safe final error',async()=>{

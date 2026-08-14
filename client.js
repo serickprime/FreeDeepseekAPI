@@ -53,6 +53,16 @@ function upstreamError(status, retryAfter) {
   return error;
 }
 
+class DeepSeekEmptyResponseError extends Error {
+  constructor() {
+    super('DeepSeek returned an empty model response.');
+    this.name = 'DeepSeekEmptyResponseError';
+    this.status = 502;
+    this.retryable = true;
+    this.upstreamStage = 'empty_response';
+  }
+}
+
 function sanitizedUpstreamError(error, message, upstreamStage) {
   const causeCode = error?.cause?.code ?? error?.code;
   const safe = new Error(message);
@@ -177,7 +187,16 @@ async function parseStream(stream, onDelta) {
   }
   buffer += decoder.decode();
   if (buffer) consume(buffer);
-  return { content, reasoning, parentMessageId };
+  const contentBytes = Buffer.byteLength(content, 'utf8');
+  const reasoningBytes = Buffer.byteLength(reasoning, 'utf8');
+  return {
+    content,
+    reasoning,
+    parentMessageId,
+    modelPayloadSeen: contentBytes > 0 || reasoningBytes > 0,
+    contentBytes,
+    reasoningBytes,
+  };
 }
 
 async function createRemoteSession(auth, timeoutMs, fetchImpl = fetch) {
@@ -240,6 +259,10 @@ async function completeOnce({ prompt, session, model, onDelta, onStage, timeoutM
   onStage?.('stream_read');
   const result = await parseStream(response.body, onDelta);
   onStage?.('stream_parsed');
+  if (!result.modelPayloadSeen) {
+    onStage?.('empty_response');
+    throw new DeepSeekEmptyResponseError();
+  }
   if (result.parentMessageId) session.parentMessageId = result.parentMessageId;
   return result;
 }
@@ -287,6 +310,7 @@ async function complete({
 
 module.exports = {
   BASE_URL,
+  DeepSeekEmptyResponseError,
   checked,
   complete,
   createRemoteSession,

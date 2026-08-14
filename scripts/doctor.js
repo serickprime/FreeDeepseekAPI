@@ -80,6 +80,10 @@ async function runDiagnostics({
     return value;
   };
   const onStage = name => {
+    if (name === 'empty_response') {
+      current = 'answer';
+      return;
+    }
     if (name === 'challenge_start') current = 'challenge';
     else if (name === 'challenge_received') pass('challenge', 'PoW challenge получен');
     else if (name === 'wasm_download_start') current = 'wasm_download';
